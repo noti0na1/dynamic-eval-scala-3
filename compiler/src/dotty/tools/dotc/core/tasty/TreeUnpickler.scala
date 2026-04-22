@@ -795,8 +795,17 @@ class TreeUnpickler(reader: TastyReader,
       readLater(end, reader =>
         val tp = reader.readType()
         def readAnnotTree(rdr: TreeReader)(using Context) =
-          if isCompactAnnotTypeTag(rdr.reader.nextByte) then TypeTree(rdr.readType())
-          else rdr.readTree()
+          // Annotation trees may be inspected by macros via `annot.tree`. The
+          // reflected tree must have positions (Typer.assertPositioned), so we
+          // force Mode.ReadPositions even if the enclosing unpickling didn't.
+          // Without this, when TASTY is read for incremental compilation
+          // (which does not use ReadPositions by default), macros see trees
+          // whose internal nodes are missing spans, which causes typer
+          // crashes after re-typing the macro expansion (issue #21383).
+          val ctx1 = ctx.addMode(Mode.ReadPositions)
+          inContext(rdr.sourceChangeContext()(using ctx1)):
+            if isCompactAnnotTypeTag(rdr.reader.nextByte) then TypeTree(rdr.readType())
+            else rdr.readTree()
         val lazyAnnotTree = reader.readLaterWithOwner(end, readAnnotTree(_))
         owner =>
           new DeferredSymAndTree(tp.typeSymbol, lazyAnnotTree(owner).complete):
