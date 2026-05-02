@@ -170,7 +170,7 @@ class JLineTerminal extends java.io.Closeable {
     try block
     finally {
       userInput.signalClosed()
-      reader.close() // ensure the reader isn't stuck waiting for further input
+      // reader.close() // ensure the reader isn't stuck waiting for further input
       Thread.interrupted() // clear interrupted flag so join below doesn't explode
       thread.join()
       monitoringThread = null
@@ -293,7 +293,7 @@ private final class UserInputStream(
   private var bytes = new Array[Byte](16)
   private var byteCount = 0
   private var state = InputState.ForegroundRead
- 
+
   /** Blocks until the state is no longer ForegroundRead. Returns the active state. */
   def waitUntilActive(): InputState = synchronized {
     while state == InputState.ForegroundRead do wait()

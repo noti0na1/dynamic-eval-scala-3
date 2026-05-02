@@ -23,10 +23,17 @@ class CollectTopLevelImports extends Phase {
   protected def run(using Context): Unit = {
     def topLevelImports(tree: Tree) = {
       val PackageDef(_, _ :: TypeDef(_, rhs: Template) :: _) = tree: @unchecked
-      rhs.body.collect { case tree: Import => tree }
+      rhs.body.collect {
+        // Skip the synthetic `eval` import the REPL injects into every
+        // wrapper. It's an implementation detail, not a user-visible import.
+        case tree: Import if !isSyntheticEvalImport(tree) => tree
+      }
     }
 
     val tree = ctx.compilationUnit.tpdTree
     myImports = topLevelImports(tree)
   }
+
+  private def isSyntheticEvalImport(imp: Import)(using Context): Boolean =
+    imp.expr.symbol.fullName.toString == "dotty.tools.repl.Eval"
 }

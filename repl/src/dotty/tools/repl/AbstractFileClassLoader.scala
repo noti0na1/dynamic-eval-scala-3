@@ -87,6 +87,28 @@ class AbstractFileClassLoader(root: AbstractFile, parent: ClassLoader, interrupt
       case s"org.xml.sax.$_" => super.loadClass(name) // XML SAX API (part of java.xml module)
       case s"org.w3c.dom.$_" => super.loadClass(name) // W3C DOM API (part of java.xml module)
       case s"com.sun.org.apache.$_" => super.loadClass(name) // Internal Xerces implementation
+      // Don't instrument REPL infrastructure classes. User wrappers
+      // reference them (e.g. `dotty.tools.repl.Eval` for the runtime
+      // `eval` callback) and need the *same* Class instance the driver
+      // itself uses; otherwise object-level mutable state like
+      // `Eval.active` (a ThreadLocal) splits into independent copies.
+      // Loading via this loader's parent isn't sufficient because the
+      // compiler-classpath URLClassLoader can carry its own copy of the
+      // REPL jar. Routing through the classloader that loaded
+      // `AbstractFileClassLoader` itself is necessarily the same one
+      // the running ReplDriver uses.
+      case s"dotty.tools.repl.$_" =>
+        classOf[AbstractFileClassLoader].getClassLoader.loadClass(name)
+      // Don't instrument the Scala or Dotty standard libraries. Values
+      // produced by `eval` are passed back across classloader boundaries
+      // (e.g. a lambda returned from eval as `Int => Int` must be a
+      // `scala.Function1` that the REPL also recognises), so these types
+      // need to be loaded by a single shared classloader. Instrumenting
+      // each AbstractFileClassLoader instance would mint its own copy and
+      // break the cross-loader exchange with `LinkageError` or
+      // `ClassCastException`.
+      case s"scala.$_" => super.loadClass(name)
+      case s"dotty.$_" => super.loadClass(name)
       // Don't instrument StopRepl, which would otherwise cause infinite recursion
       case "dotty.tools.repl.StopRepl" =>
         // Load StopRepl bytecode from parent but ensure each classloader gets its own copy

@@ -272,7 +272,60 @@ class ReplDriver(settings: Array[String],
     interpret(ParseResult.complete(input))
   }
 
-  protected def runBody(body: => State): State = rendering.classLoader()(using rootCtx).asContext(withRedirectedOutput(body))
+  protected def runBody(body: => State): State =
+    Eval.withAdapter(evalAdapter):
+      rendering.classLoader()(using rootCtx).asContext(withRedirectedOutput(body))
+
+  /** Latest REPL `State` observed by `interpret`. Updated as the REPL
+   *  progresses so the `Eval.eval` runtime callback can compile new code in
+   *  the most up-to-date session context.
+   */
+  @volatile private var currentState: State | Null = null
+
+  /** Adapter installed via `Eval.withAdapter` for the duration of any user
+   *  code this driver runs. Forwards to `evalDynamic`.
+   */
+  private val evalAdapter: Eval.Adapter = new Eval.Adapter {
+    def evalCode(code: String, bindings: Array[Eval.Binding]): Any =
+      evalDynamic(code, bindings)
+  }
+
+  /** Runtime `eval(code, bindings*)` callback. Compiles via a fresh,
+   *  standalone Driver because dotc isn't re-entrant: we can't recursively
+   *  invoke this driver's compile flow while it's mid-run. To make REPL
+   *  session state visible, we add the REPL's output dir to the eval
+   *  driver's classpath and prepend `import rs$line$N.{given, *}` for
+   *  each valid wrapper that actually produced a classfile.
+   *
+   *  We also forward the REPL session's CLI settings (`-language:...`,
+   *  `-explain`, etc.) so language features enabled at the REPL prompt
+   *  (e.g. `experimental.captureChecking`) apply inside eval bodies too.
+   */
+  private def evalDynamic(code: String, bindings: Array[Eval.Binding]): Any =
+    val state = currentState
+    if state == null then
+      throw new IllegalStateException("Eval.eval has no current REPL state")
+    val ctx = state.context
+    val classLoader = rendering.classLoader()(using ctx)
+    val replOutDir = ctx.settings.outputDir.value(using ctx)
+
+    // Skip indexes whose compile failed before bytecode was emitted.
+    // Their classfile isn't on the classpath, so importing them would
+    // error before the user's actual error can surface.
+    def hasClassfile(idx: Int): Boolean =
+      ReplCompiler.objectNames.get(idx).exists { wrapperName =>
+        replOutDir.lookupName(s"$wrapperName$$.class", directory = false) != null
+      }
+    val replWrapperImports = state.validObjectIndexes
+      .filter(hasClassfile)
+      .map(i => s"import ${ReplCompiler.objectNames(i)}.{given, *}")
+      .toArray
+
+    // Forward CLI settings from the live session (minus those incompatible
+    // with the eval driver's standalone setup).
+    val forwardedSettings = settings.filterNot(incompatibleOptions.contains)
+    Eval.evalIsolated(code, classLoader, bindings, replOutDir, replWrapperImports, forwardedSettings)
+  end evalDynamic
 
   // TODO: i5069
   final def bind(name: String, value: Any)(using state: State): State = state
@@ -360,7 +413,8 @@ class ReplDriver(settings: Array[String],
   end completions
 
   protected def interpret(res: ParseResult)(using state: State): State = {
-    res match {
+    currentState = state
+    val newState = res match {
       case parsed: Parsed if parsed.source.content().mkString.startsWith("//>") =>
         // Check for magic comments specifying dependencies
         println("Please use `:dep com.example::artifact:version` to add dependencies in the REPL")
@@ -368,7 +422,12 @@ class ReplDriver(settings: Array[String],
 
       case parsed: Parsed if parsed.trees.nonEmpty =>
         propagateLanguageImports(parsed.trees)
-        compile(parsed, state)
+        // Rewriter injects `Eval.bind(...)` for each lambda parameter
+        // and block-local val/var syntactically in scope at every
+        // `eval(...)` call.
+        val rewrittenTrees = EvalRewriter.rewrite(parsed.trees)(using state.context)
+        val rewritten = parsed.copy(trees = rewrittenTrees)
+        compile(rewritten, state)
 
       case SyntaxErrors(_, errs, _) =>
         displayErrors(errs, state)
@@ -382,6 +441,8 @@ class ReplDriver(settings: Array[String],
       case _ => // new line, empty tree
         state
     }
+    currentState = newState
+    newState
   }
 
   /** Compile `parsed` trees and evolve `state` in accordance */
@@ -424,6 +485,13 @@ class ReplDriver(settings: Array[String],
               .removeBufferedMessages(using newState.context)
 
             inContext(newState.context) {
+              // Make the post-compile state visible to runtime callbacks
+              // (notably `Eval.eval`) before user code runs in rendering,
+              // so an `eval(...)` call from within the very line just
+              // compiled can also import that line's wrapper. This is
+              // safe because the runtime evaluator uses a *separate*
+              // Driver, so there's no re-entrancy on the in-progress Run.
+              currentState = newStateWithImports
               val (updatedState, definitions) =
                 if (!ctx.settings.XreplDisableDisplay.value)
                   renderDefinitions(unit.tpdTree, newestWrapper)(using newStateWithImports)

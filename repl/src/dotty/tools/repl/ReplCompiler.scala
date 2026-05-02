@@ -234,6 +234,17 @@ class ReplCompiler extends Compiler:
 object ReplCompiler:
   val ReplState: Property.StickyKey[State] = Property.StickyKey()
   val objectNames = mutable.Map.empty[Int, TermName]
+
+  /** Build an untyped `Select` chain for a dotted FQN (e.g.
+   *  `"dotty.tools.repl.Eval"` becomes
+   *  `Select(Select(Select(Ident(dotty), tools), repl), Eval)`).
+   */
+  private[repl] def selectFqn(fqn: String, span: Span)(using Context): untpd.Tree =
+    import untpd.*
+    val parts = fqn.split('.').toList
+    parts.tail.foldLeft[Tree](Ident(parts.head.toTermName).withSpan(span)) { (acc, part) =>
+      Select(acc, part.toTermName).withSpan(span)
+    }
 end ReplCompiler
 
 class ReplCompilationUnit(source: SourceFile) extends CompilationUnit(source, CompilationUnitInfo(source.file)):
@@ -344,7 +355,15 @@ class ReplPhase extends Phase:
     val objectTermName = objectName.toTermName
     ReplCompiler.objectNames.update(defs.state.objectIndex, objectTermName)
 
-    val tmpl = Template(emptyConstructor, Nil, Nil, EmptyValDef, defs.stats)
+    // Import the runtime `eval` sentinel so the bare name resolves in
+    // user code. CollectTopLevelImports filters this back out so it
+    // doesn't pollute `:imports`.
+    val evalImport = Import(
+      ReplCompiler.selectFqn("dotty.tools.repl.Eval", span),
+      ImportSelector(Ident("eval".toTermName)) :: Nil
+    ).withSpan(span)
+
+    val tmpl = Template(emptyConstructor, Nil, Nil, EmptyValDef, evalImport :: defs.stats)
     val module = ModuleDef(objectTermName, tmpl).withSpan(span)
 
     PackageDef(Ident(nme.EMPTY_PACKAGE), List(module))
