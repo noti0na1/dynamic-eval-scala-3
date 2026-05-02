@@ -38,6 +38,12 @@ class ReplCompiler extends Compiler:
     List(Parser()),
     List(ReplPhase()),
     List(TyperPhase(addRootImports = false)),
+    // Annotate Eval.bind calls with the typer's view of each captured
+    // value's source-level type before any later phase rewrites the
+    // tree. Must run after Typer (it reads typed `tpe`) and before
+    // CheckUnused (which would otherwise see the literal-replacement
+    // as a redundant re-binding).
+    List(EvalTypeAnnotate()),
     List(CheckUnused.PostTyper(), CheckShadowing()),
     List(CollectTopLevelImports()),
     List(PostTyper()),

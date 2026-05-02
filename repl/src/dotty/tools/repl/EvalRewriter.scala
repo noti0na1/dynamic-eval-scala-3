@@ -46,10 +46,23 @@ object EvalRewriter:
     tx.pushInitialScope(seed)
     tx.transform(tree).show
 
-  /** A captured name with its mutability. Vars are wrapped in a cell so
-   *  the eval body can mutate them and have writes propagate.
+  /** A captured local.
+   *
+   *  Most captures are vals/vars (`defParamClause = None`). The `isVar`
+   *  flag tells the bind site to wrap mutable captures in a `VarCell`.
+   *
+   *  Block-local defs are captured by eta-expansion to a `FunctionN`
+   *  (`defParamClause = Some(...)`). The recorded parameter list lets
+   *  the bind site synthesise `(p1, ..., pn) => g(p1, ..., pn)` with
+   *  the parameter type annotations preserved, so the typer can give
+   *  the lambda a precise function type.
    */
-  private final case class CapturedName(name: String, isVar: Boolean)
+  private final case class CapturedName(
+      name: String,
+      isVar: Boolean,
+      defParamClause: Option[List[untpd.ValDef]] = None
+  ):
+    def isDef: Boolean = defParamClause.isDefined
 
   private object Names:
     val EvalResult: String = "__eval_result__"
@@ -98,11 +111,13 @@ object EvalRewriter:
         // directly because the base `TreeCopier` we inherit doesn't expose it.
         untpd.cpy.Function(fn)(newArgs, newBody)
 
-      // Block: process stats in order, accumulating names from each val
-      // (or var) so subsequent stats and the trailing expression see
-      // them. Block-local `def`s are intentionally not captured: at
-      // runtime they are synthetic Lambda classes whose names
-      // (e.g. `rs$line$1$$Lambda/0x...`) aren't valid Scala source.
+      // Block: process stats in order, accumulating names from each
+      // val/var/def so subsequent stats and the trailing expression
+      // see them. Defs are captured by eta-expansion (see
+      // `buildEtaExpansion`); only "simple" defs qualify (single
+      // value paramlist, no implicits, no type params, no by-name).
+      // More exotic shapes are skipped silently and will fall through
+      // to the existing `Not found: g` failure mode at the eval body.
       case bk @ Block(stats, expr) =>
         val processed = mutable.ListBuffer.empty[Tree]
         var blockNames = List.empty[CapturedName]
@@ -113,6 +128,13 @@ object EvalRewriter:
             case vd: ValDef =>
               val isVar = vd.mods.is(Flags.Mutable)
               blockNames = CapturedName(vd.name.toString, isVar) :: blockNames
+            case dd: DefDef if isCaptureableDef(dd) =>
+              val clause = dd.paramss.headOption.toList.flatten.collect { case vd: ValDef => vd }
+              blockNames = CapturedName(
+                dd.name.toString,
+                isVar = false,
+                defParamClause = Some(clause)
+              ) :: blockNames
             case _ =>
         val newExpr = withScope(blockNames)(transform(expr))
         cpy.Block(bk)(processed.toList, newExpr)
@@ -136,7 +158,7 @@ object EvalRewriter:
         else
           val newArgs = args.mapConserve(transform)
           if !captured.exists(_.isVar) then
-            val bindArgs = captured.map(c => buildBind(c.name, app.span))
+            val bindArgs = captured.map(c => buildBind(c, app.span))
             cpy.Apply(app)(fn, newArgs :+ buildArray(bindArgs, app.span))
           else
             buildVarAwareCall(app, fn, newArgs, captured)
@@ -171,7 +193,7 @@ object EvalRewriter:
 
       // 2. the eval call (passing bind / bindVar args).
       val bindArgs: List[Tree] = captured.map { c =>
-        if c.isVar then buildBindVar(c.name, span) else buildBind(c.name, span)
+        if c.isVar then buildBindVar(c.name, span) else buildBind(c, span)
       }
       val rebuiltCall = cpy.Apply(app)(fn, newArgs :+ buildArray(bindArgs, span))
       val resultDef = ValDef(
@@ -192,6 +214,40 @@ object EvalRewriter:
       Block(cellDefs ++ (resultDef :: syncs), finalExpr).withSpan(span)
     end buildVarAwareCall
 
+    /** Whether `dd` can be eta-expanded into a `FunctionN` value for
+     *  capture. Conservative: rejects anything that would require
+     *  type-driven elaboration the typer doesn't perform under the
+     *  `Any` expected type at the bind site.
+     *
+     *  Accepted:
+     *    - parameterless defs (`def g = 42`).
+     *    - single value paramlist with concrete params.
+     *
+     *  Rejected:
+     *    - generic defs (any clause containing TypeDefs).
+     *    - multiple paramlists (would need curried lambda).
+     *    - by-name params, varargs, implicit/given/erased modifiers.
+     *    - explicit `inline` or `transparent` defs.
+     */
+    private def isCaptureableDef(dd: DefDef)(using Context): Boolean =
+      def acceptableMods(vd: ValDef): Boolean =
+        val flags = vd.mods.flags
+        !flags.isOneOf(Flags.Implicit | Flags.Given | Flags.Erased)
+      def acceptableTpt(tpt: Tree): Boolean = tpt match
+        // ByNameTypeTree marks `=> A`; PostfixOp(_, "*") marks varargs.
+        case _: ByNameTypeTree => false
+        case PostfixOp(_, op) if op.name.toString == "*" => false
+        case _ => true
+      def acceptableClause(clause: List[ValDef | TypeDef]): Boolean =
+        clause.forall {
+          case vd: ValDef => acceptableMods(vd) && acceptableTpt(vd.tpt)
+          case _: TypeDef => false
+        }
+      val mods = dd.mods.flags
+      !mods.isOneOf(Flags.Inline | Flags.Transparent)
+        && dd.paramss.length <= 1
+        && dd.paramss.forall(acceptableClause)
+
     private def isEvalCall(fn: Tree): Boolean = fn match
       case Ident(n) => n.toString == "eval"
       case Select(qual, n) => n.toString == "eval" && isEvalQualifier(qual)
@@ -204,17 +260,59 @@ object EvalRewriter:
       case Select(_, n) => n.toString == "Eval"
       case _ => false
 
-    private def buildBind(name: String, span: Span)(using Context): Tree =
+    /** Emit the 3-arg `Eval.bind(name, value, "")` form. The empty
+     *  string is a sentinel: the post-typer phase `EvalTypeAnnotate`
+     *  walks these calls and replaces the literal with the typer's
+     *  view of `value`'s source-level type. If the binding never
+     *  reaches that phase (e.g. nested-eval runtime rewriting), the
+     *  runtime falls back to `Class`-walking.
+     *
+     *  For def captures, the value is an eta-expansion lambda built
+     *  from the original def's parameter list. The typer infers a
+     *  precise `FunctionN[..., R]` type for the lambda, which the
+     *  type-annotation phase then records.
+     */
+    private def buildBind(c: CapturedName, span: Span)(using Context): Tree =
       val bindFn = makeFqn("dotty.tools.repl.Eval.bind", span)
-      val nameLit = Literal(Constant(name)).withSpan(span)
-      val valueRef = Ident(name.toTermName).withSpan(span)
-      Apply(bindFn, nameLit :: valueRef :: Nil).withSpan(span)
+      val nameLit = Literal(Constant(c.name)).withSpan(span)
+      val valueRef = c.defParamClause match
+        case Some(clause) => buildEtaExpansion(c.name, clause, span)
+        case None => Ident(c.name.toTermName).withSpan(span)
+      val tpeLit = Literal(Constant("")).withSpan(span)
+      Apply(bindFn, nameLit :: valueRef :: tpeLit :: Nil).withSpan(span)
+
+    /** Build `(p1: T1, ..., pn: Tn) => name(p1, ..., pn)` for the
+     *  given def. Re-uses each original param's `tpt` so the lambda
+     *  has explicit parameter types (otherwise the typer can't infer
+     *  them: `Eval.bind`'s `value: Any` parameter offers no expected
+     *  function type to drive eta-expansion).
+     *
+     *  Empty `clause` (for `def g = 42`, a parameterless def) yields
+     *  `() => name`, which the typer types as `Function0[R]`.
+     */
+    private def buildEtaExpansion(name: String, clause: List[ValDef], span: Span)(using Context): Tree =
+      if clause.isEmpty then
+        // Nullary def: `() => name`.
+        Function(Nil, Ident(name.toTermName).withSpan(span)).withSpan(span)
+      else
+        // Lambda parameters require the `Param` flag (see
+        // `untpd.makeParameter`), otherwise the typer rejects the
+        // ValDef as a top-level declaration.
+        val freshParams: List[ValDef] = clause.map { vd =>
+          ValDef(vd.name, vd.tpt, EmptyTree)
+            .withMods(Modifiers(Flags.Param))
+            .withSpan(span)
+        }
+        val argRefs: List[Tree] = freshParams.map(p => Ident(p.name).withSpan(span))
+        val body = Apply(Ident(name.toTermName).withSpan(span), argRefs).withSpan(span)
+        Function(freshParams, body).withSpan(span)
 
     private def buildBindVar(name: String, span: Span)(using Context): Tree =
       val bindFn = makeFqn("dotty.tools.repl.Eval.bindVar", span)
       val nameLit = Literal(Constant(name)).withSpan(span)
       val cellRef = Ident(Names.cell(name).toTermName).withSpan(span)
-      Apply(bindFn, nameLit :: cellRef :: Nil).withSpan(span)
+      val tpeLit = Literal(Constant("")).withSpan(span)
+      Apply(bindFn, nameLit :: cellRef :: tpeLit :: Nil).withSpan(span)
 
     /** Build `scala.Array(elems...)`. */
     private def buildArray(elems: List[Tree], span: Span)(using Context): Tree =

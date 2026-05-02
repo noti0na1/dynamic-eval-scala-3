@@ -32,13 +32,28 @@ import io.{AbstractFile, AbstractFileClassLoader, ClassPath, VirtualDirectory}
  */
 object Eval:
 
-  /** A captured binding: a name, a runtime value, and a flag marking
-   *  whether the binding represents a `var` capture. For vars the
-   *  `value` field holds a `VarCell` instance the eval body mutates
-   *  and the call site reads back to sync the outer var.
+  /** A captured binding.
+   *
+   *  @param name        the source-level name as it appears at the call site.
+   *  @param value       the runtime value, or for var captures the
+   *                     `VarCell` the eval body mutates and the call site
+   *                     reads back from.
+   *  @param isVar       true iff this represents a `var` capture.
+   *  @param sourceType  the source-level Scala type the typer inferred
+   *                     for this capture, e.g. `"Int"`, `"Int => Int"`,
+   *                     `"List[Int]"`. The empty string is the sentinel
+   *                     meaning "fall back to runtime `Class`-walking";
+   *                     it appears when this binding wasn't annotated
+   *                     by `EvalTypeAnnotate` (e.g. nested-eval
+   *                     captures, which never reach the typed pipeline).
    */
-  final class Binding(val name: String, val value: Any, val isVar: Boolean):
-    override def toString = s"Binding($name, $value, isVar=$isVar)"
+  final class Binding(
+      val name: String,
+      val value: Any,
+      val isVar: Boolean,
+      val sourceType: String
+  ):
+    override def toString = s"Binding($name, $value, isVar=$isVar, sourceType=$sourceType)"
 
   /** Mutable cell wrapping a captured `var`. We use the JDK's
    *  `AtomicReference` rather than a class of our own: JDK types are
@@ -54,9 +69,18 @@ object Eval:
     def apply[T](initial: T): VarCell[T] =
       new java.util.concurrent.atomic.AtomicReference[T](initial)
 
-  /** Capture an immutable binding. */
+  /** Capture an immutable binding. The 3-arg form is what the
+   *  parser-stage rewriter actually emits; the post-typer phase
+   *  `EvalTypeAnnotate` populates `sourceType` with the typer-known
+   *  Scala source type. The 2-arg overload is kept for callers who
+   *  don't care about the type-annotation pass (notably the nested-eval
+   *  rewrite, which runs at runtime against an untyped tree).
+   */
   def bind(name: String, value: Any): Binding =
-    new Binding(name, value, isVar = false)
+    new Binding(name, value, isVar = false, sourceType = "")
+
+  def bind(name: String, value: Any, sourceType: String): Binding =
+    new Binding(name, value, isVar = false, sourceType)
 
   /** Capture a mutable (`var`) binding via an `AtomicReference`. The
    *  eval body receives the cell, declares a local var initialised from
@@ -64,7 +88,10 @@ object Eval:
    *  call-site rewriter then assigns `cell.get()` to the outer var.
    */
   def bindVar(name: String, cell: VarCell[?]): Binding =
-    new Binding(name, cell, isVar = true)
+    new Binding(name, cell, isVar = true, sourceType = "")
+
+  def bindVar(name: String, cell: VarCell[?], sourceType: String): Binding =
+    new Binding(name, cell, isVar = true, sourceType)
 
   /** Adapter installed by the running REPL driver. */
   trait Adapter:
@@ -121,11 +148,15 @@ object Eval:
     val wrapperName = s"__EvalWrapper_${java.util.UUID.randomUUID.toString.replace('-', '_')}"
 
     // Pre-compute the source-level type name for each binding once.
-    // For vars this pins the cell's inner type for both the parameter
-    // signature and the body-local var declaration, so a racing write
-    // between the two reads can't desynchronise them.
+    // Prefer the typer-supplied `sourceType` (filled in by the
+    // `EvalTypeAnnotate` phase). When that's empty, fall back to
+    // walking the runtime `Class` of the captured value. For vars the
+    // fallback path also pins the cell's inner type for both the
+    // parameter signature and the body-local var declaration, so a
+    // racing write between the two reads can't desynchronise them.
     val bindingTypes: Array[String] = bindings.map { b =>
-      if b.isVar then
+      if b.sourceType.nonEmpty then b.sourceType
+      else if b.isVar then
         val v = b.value.asInstanceOf[VarCell[?]].get()
         if v == null then "Any" else classToTypeName(v.getClass)
       else if b.value == null then "Any"

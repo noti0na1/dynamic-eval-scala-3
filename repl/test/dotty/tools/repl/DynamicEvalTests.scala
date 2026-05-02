@@ -177,13 +177,32 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def lambdaCapturingComplexType = initially {
-    // `xs2` arrives at runtime as the `::` cons cell whose JVM name is
-    // `scala.collection.immutable.$colon$colon`. The runtime walks up to
-    // the first referenceable ancestor, `List`, so the synthesized
-    // parameter type is valid Scala source (`List[?]`).
+    // The post-typer `EvalTypeAnnotate` phase records `xs2`'s typer-side
+    // type, so the synthesised wrapper parameter is `xs2: List[Int]`
+    // (with the Int element preserved). If that phase is disabled the
+    // runtime would walk the cons cell up the superclass chain and
+    // synthesise the weaker `xs2: List[?]` instead.
     run("""|val xs = List(List(0, 1), List(1, 2))
            |val r: List[Int] = xs.flatMap(xs2 => xs2.map(x => eval[Int]("x + xs2.length")))""".stripMargin)
     assertContains("List(2, 3, 3, 4)", storedOutput())
+  }
+
+  @Test def capturedListElementTypePreserved = initially {
+    // Demonstrates the EvalTypeAnnotate phase keeping element types
+    // visible inside the eval body. With only the runtime fallback
+    // `xs.head` would return `?`, which can't be used in arithmetic;
+    // this body would fail to compile.
+    run("""|val xs: List[Int] = List(10, 20, 30)
+           |val r: Int = (1 to 1).toList.map(z => eval[Int]("xs.head + xs.last + z")).head""".stripMargin)
+    assertContains("val r: Int = 41", storedOutput())
+  }
+
+  @Test def capturedMapKeyValueTypesPreserved = initially {
+    // Same idea for `Map[String, Int]`. Without typed annotation the
+    // body would see `m: Map[?, ?]` and `m("a")` would type as `?`.
+    run("""|val m: Map[String, Int] = Map("a" -> 1, "b" -> 2)
+           |val r: Int = (1 to 1).toList.map(z => eval[Int]("m(\"a\") + m(\"b\") + z")).head""".stripMargin)
+    assertContains("val r: Int = 4", storedOutput())
   }
 
   // ===========================================================================
@@ -340,6 +359,80 @@ class DynamicEvalTests extends ReplTest:
     val out = storedOutput()
     assertContains("5", out)               // println side effect from the first eval
     assertContains("val r: Int = 6", out)  // value from the second eval
+  }
+
+  // ---------------------------------------------------------------------------
+  // Block-local def capture. The rewriter eta-expands a captured def
+  // into a `FunctionN` lambda at the bind site; the typer infers the
+  // function type, the type-annotation phase records it, and the eval
+  // body sees the def as a precisely-typed function value.
+  // ---------------------------------------------------------------------------
+
+  @Test def blockLocalDefCapturedUnary = initially {
+    run("""|def f(i: Int): Int =
+           |  def g(j: Int) = i * j
+           |  eval[Int]("g(2)")
+           |val r: Int = f(7)""".stripMargin)
+    assertContains("val r: Int = 14", storedOutput())
+  }
+
+  @Test def blockLocalDefCapturedMultiArg = initially {
+    run("""|def f(): Int =
+           |  def g(a: Int, b: Int) = a * 100 + b
+           |  eval[Int]("g(3, 4)")
+           |val r: Int = f()""".stripMargin)
+    assertContains("val r: Int = 304", storedOutput())
+  }
+
+  @Test def blockLocalDefCapturedNullary = initially {
+    run("""|def f(): Int =
+           |  def g = 42
+           |  eval[Int]("g()")
+           |val r: Int = f()""".stripMargin)
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def blockLocalDefAndValTogether = initially {
+    run("""|def f(i: Int): Int =
+           |  val k = 100
+           |  def g(j: Int) = i + j
+           |  eval[Int]("g(5) + k")
+           |val r: Int = f(2)""".stripMargin)
+    assertContains("val r: Int = 107", storedOutput())
+  }
+
+  @Test def blockLocalDefClosesOverEnclosing = initially {
+    // The def captures `i` from `f`'s scope. The eta-expansion the
+    // rewriter generates is just `(j) => g(j)`, which itself is a
+    // closure over `g`, which is itself a closure over `i`. So `i`
+    // doesn't need to flow into the eval body explicitly; it's
+    // already inside the captured function value.
+    run("""|def f(i: Int): Int =
+           |  def doubleIt(j: Int) = i * 2 + j
+           |  eval[Int]("doubleIt(0)")
+           |val r: Int = f(11)""".stripMargin)
+    assertContains("val r: Int = 22", storedOutput())
+  }
+
+  @Test def blockLocalDefInsideLambda = initially {
+    run("""|val r: List[Int] = List(1, 2, 3).map { z =>
+           |  def square(x: Int) = x * x
+           |  eval[Int]("square(z)")
+           |}""".stripMargin)
+    assertContains("List(1, 4, 9)", storedOutput())
+  }
+
+  @Test def genericBlockLocalDefSkipped = initially {
+    // Type-parametric defs are NOT captured: eta-expansion would
+    // need a concrete T instantiation, which the rewriter can't pick
+    // at parser stage. The eval body fails with "Not found: g" as
+    // before.
+    run("""|def f(): Int =
+           |  def g[T](x: T) = x
+           |  eval[Int]("g[Int](42)")
+           |f()""".stripMargin)
+    val out = storedOutput()
+    assertContains("Not found: g", out)
   }
 
   // ---------------------------------------------------------------------------
