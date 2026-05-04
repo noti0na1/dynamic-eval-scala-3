@@ -170,7 +170,11 @@ class JLineTerminal extends java.io.Closeable {
     try block
     finally {
       userInput.signalClosed()
-      reader.close() // ensure the reader isn't stuck waiting for further input
+      // The monitor thread's `reader.read(100L)` returns within ~100ms, after
+      // which the loop sees the Closed state and exits. Do not call
+      // `reader.close()` here — `terminal.reader()` returns the terminal's
+      // shared NonBlockingReader, and closing it closes the terminal's input
+      // side, breaking the next `readLine()` call.
       Thread.interrupted() // clear interrupted flag so join below doesn't explode
       thread.join()
       monitoringThread = null
