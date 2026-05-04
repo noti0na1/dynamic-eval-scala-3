@@ -28,17 +28,20 @@ import org.jline.utils.NonBlockingReader
 private enum InputState:
   case Monitoring, ForegroundRead, Closed
 
-class JLineTerminal extends java.io.Closeable {
-  private val terminal =
-    val builder = TerminalBuilder.builder()
-    if System.getenv("TERM") == "dumb" then
-      // Force dumb terminal if `TERM` is `"dumb"`.
-      // Note: the default value for the `dumb` option is `null`, which allows
-      // JLine to fall back to a dumb terminal. This is different than `true` or
-      // `false` and can't be set using the `dumb` setter.
-      // This option is used at https://github.com/jline/jline3/blob/894b5e72cde28a551079402add4caea7f5527806/terminal/src/main/java/org/jline/terminal/TerminalBuilder.java#L528.
-      builder.dumb(true)
-    builder.build()
+class JLineTerminal(providedTerminal: org.jline.terminal.Terminal | Null = null) extends java.io.Closeable {
+  def this() = this(null)
+  private val terminal: org.jline.terminal.Terminal =
+    if providedTerminal != null then providedTerminal
+    else
+      val builder = TerminalBuilder.builder()
+      if System.getenv("TERM") == "dumb" then
+        // Force dumb terminal if `TERM` is `"dumb"`.
+        // Note: the default value for the `dumb` option is `null`, which allows
+        // JLine to fall back to a dumb terminal. This is different than `true` or
+        // `false` and can't be set using the `dumb` setter.
+        // This option is used at https://github.com/jline/jline3/blob/894b5e72cde28a551079402add4caea7f5527806/terminal/src/main/java/org/jline/terminal/TerminalBuilder.java#L528.
+        builder.dumb(true)
+      builder.build()
 
   private val originalAttributes = terminal.getAttributes
   private val noIntrAttributes = new Attributes(originalAttributes)
@@ -132,6 +135,13 @@ class JLineTerminal extends java.io.Closeable {
   def userInputStream: InputStream =
     userInput
 
+  /** For tests: peek at the terminal's input reader with a short timeout.
+   *  Returns `NonBlockingReader.EOF` (-1) if the reader is closed, or
+   *  `NonBlockingReader.READ_EXPIRED` (-2) if it's open but has no data ready.
+   */
+  private[repl] def peekTerminalReader(timeoutMs: Long): Int =
+    terminal.reader().peek(timeoutMs)
+
   /** Execute a block while monitoring for Ctrl-C keypresses.
    *  Calls the handler when Ctrl-C is detected during block execution.
    */
@@ -170,11 +180,11 @@ class JLineTerminal extends java.io.Closeable {
     try block
     finally {
       userInput.signalClosed()
-      // The monitor thread's `reader.read(100L)` returns within ~100ms, after
-      // which the loop sees the Closed state and exits. Do not call
-      // `reader.close()` here — `terminal.reader()` returns the terminal's
-      // shared NonBlockingReader, and closing it closes the terminal's input
-      // side, breaking the next `readLine()` call.
+      // Do not call `reader.close()` here — `terminal.reader()` returns the
+      // terminal's shared NonBlockingReader, and closing it closes the
+      // terminal's input side, breaking the next `readLine()` call. The
+      // monitor thread's `reader.read(100L)` returns within ~100ms, after
+      // which the loop sees the Closed state and exits.
       Thread.interrupted() // clear interrupted flag so join below doesn't explode
       thread.join()
       monitoringThread = null
