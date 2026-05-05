@@ -796,7 +796,13 @@ class TreeUnpickler(reader: TastyReader,
         val tp = reader.readType()
         def readAnnotTree(rdr: TreeReader)(using Context) =
           if isCompactAnnotTypeTag(rdr.reader.nextByte) then TypeTree(rdr.readType())
-          else rdr.readTree()
+          // Annotation trees may be inspected by macros via `annot.tree` and
+          // spliced into a macro expansion; the re-typer of that expansion
+          // requires every untyped tree to have a span (Typer.assertPositioned).
+          // For incremental compilation the enclosing unpickling does not use
+          // Mode.ReadPositions, so without this the deserialized annotation
+          // tree has no spans and the re-typer crashes (issue #21383).
+          else rdr.readTree()(using ctx.addMode(Mode.ReadPositions))
         val lazyAnnotTree = reader.readLaterWithOwner(end, readAnnotTree(_))
         owner =>
           new DeferredSymAndTree(tp.typeSymbol, lazyAnnotTree(owner).complete):
