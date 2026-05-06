@@ -75,7 +75,6 @@ object Phases {
     final def fusePhases(phasess: List[List[Phase]],
                            phasesToSkip: List[String],
                            stopBeforePhases: List[String],
-                           stopAfterPhases: List[String],
                            YCheckAfter: List[String])(using Context): List[Phase] = {
       val fusedPhases = ListBuffer[Phase]()
       var prevPhases: Set[String] = Set.empty
@@ -90,7 +89,7 @@ object Phases {
 
       val filteredPhases = phasess.map(_.filter { p =>
         try isEnabled(p)
-        finally stop |= stopBeforePhases.contains(p.phaseName) | stopAfterPhases.contains(p.phaseName)
+        finally stop |= stopBeforePhases.contains(p.phaseName)
       })
 
       var i = 0

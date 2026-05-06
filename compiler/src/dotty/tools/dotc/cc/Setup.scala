@@ -508,9 +508,16 @@ class Setup extends PreRecheck, SymTransformer, SetupAPI:
           case t @ AppliedType(tycon, args)
           if defn.isNonRefinedFunction(t) && args.last.containsGlobalFreshDirectly =>
             // Convert to dependent function so that we have a binder for `fresh` in result type.
+            // Copy all annotations and capturing sets of the original type to the new one.
+            def copyAnnots(t: Type, from: Type): Type = from match
+              case from @ AnnotatedType(from1, ann) => from.derivedAnnotatedType(copyAnnots(t, from1), ann)
+              case _ => t
             apply(
-              depFun(args.init, args.last,
-                isContextual = defn.isContextFunctionClass(tycon.classSymbol)))
+              copyAnnots(
+                depFun(args.init, args.last,
+                  isContextual = defn.isContextFunctionClass(tycon.classSymbol)),
+                t.dealiasKeepAnnots))
+              .showing(i"convert dep $t to $result", capt)
           case t: (LazyRef | TypeVar) =>
             mapConserveSuper(t)
           case t =>
