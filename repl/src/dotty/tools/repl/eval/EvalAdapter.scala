@@ -5,6 +5,7 @@ package eval
 import java.util.UUID
 
 import dotty.tools.dotc.core.Contexts.{Context, ContextBase}
+import dotty.tools.dotc.core.StdNames.str
 import dotty.tools.dotc.util.ClasspathFromClassloader
 import dotty.tools.io.{AbstractFile, VirtualDirectory}
 
@@ -112,8 +113,36 @@ class EvalAdapter:
         case Left(failure) => return Left(failure)
         case Right(compiled) => return invokeCached(compiled, bindings)
 
-    val outputClassName = s"__EvalExpression_${UUID.randomUUID().toString.replace('-', '_')}"
-    val wrapperName = s"__EvalWrapper_${UUID.randomUUID().toString.replace('-', '_')}"
+    // When invoked from a live REPL session, prefix the synthesised
+    // class names with `rs$line$` so `NameOps.isReplWrapperName` flags
+    // them as REPL wrappers — dotty's `PlainPrinter`, `CheckCaptures`,
+    // and `CheckUnused` then treat them as user-invisible (capture
+    // errors / unused warnings that originate inside the wrapper
+    // don't leak `__EvalExpression_<uuid>` into user-facing
+    // diagnostics). Detect REPL context by looking for any
+    // `rs$line$N` import in the live session's wrapper-imports list:
+    // those are emitted only by `ReplDriver.evalDynamic`.
+    //
+    // Direct callers of the bridge (unit tests, standalone use of
+    // `EvalAdapter`) don't supply `rs$line$` imports, so we fall
+    // back to the marker-free `__EvalExpression_<uuid>` name. There
+    // diagnostics still surface the wrapper name verbatim, which is
+    // the right choice for debugging the bridge itself.
+    //
+    // Putting `rs$line$` at the front is safe because the wrapper
+    // class is loaded only through the dedicated [[WrapperLoader]]
+    // (whose `findClass` looks in `outDir` first). The session
+    // [[AbstractFileClassLoader]]'s `rs$line$<...>`-routing case
+    // applies only when the *session* loader is asked for a name,
+    // and we never go through it for our own wrapper class.
+    val inReplSession = replWrapperImports.exists(_.contains(str.REPL_SESSION_LINE))
+    val uuid = UUID.randomUUID().toString.replace('-', '_')
+    val outputClassName =
+      if inReplSession then s"${str.REPL_SESSION_LINE}${uuid}$$__EvalExpression"
+      else s"__EvalExpression_${uuid}"
+    val wrapperName =
+      if inReplSession then s"${str.REPL_SESSION_LINE}${uuid}$$__EvalWrapper"
+      else s"__EvalWrapper_${uuid}"
 
     // Always import the `Eval.{eval, evalSafe}` bridge. It's needed for
     // any nested `eval(...)` call inside the body or alongside the
@@ -166,10 +195,27 @@ class EvalAdapter:
         invokeCached(compiled, bindings)
 
   /** Load `__Expression` from the in-memory output dir and snapshot
-   *  its constructor + `evaluate` method. Uses
-   *  [[AbstractFileClassLoader]] rooted at `outDir` with the session
-   *  classloader as parent, so `Eval.Binding`/`VarRef` resolve to
-   *  the same `Class` objects on both sides of the loader boundary.
+   *  its constructor + `evaluate` method. The loader is rooted at
+   *  `outDir` (so it can find the wrapper class) and delegates
+   *  everything else to the session classloader's *1-arg* `loadClass`,
+   *  which is what the REPL [[AbstractFileClassLoader]] override
+   *  implements its `dotty.tools.repl.*` → app-loader routing on. A
+   *  vanilla `AbstractFileClassLoader` (in either Enabled or Disabled
+   *  mode) ends up delegating via the JVM's protected
+   *  `loadClass(name, resolve)` machinery, which bypasses that
+   *  override and lets `Eval.Binding` get redefined by the
+   *  compiler-classpath URLClassLoader — producing
+   *  `LinkageError: loader constraint violation`. With `Enabled`
+   *  there's a second symptom: every user-defined type referenced by
+   *  the wrapper (e.g. an `IOCap` capability flowing through bindings)
+   *  gets re-read from the parent's bytes and re-defined locally with
+   *  bytecode instrumentation, minting a fresh `Class` identity. The
+   *  binding instance — created against the parent loader's `IOCap` —
+   *  then fails the wrapper's `asInstanceOf[IOCap]` check with
+   *  "cannot be cast to IOCap (different loaders)". This dedicated
+   *  loader sidesteps both: the wrapper class itself is defined here,
+   *  every other lookup goes through `parent.loadClass(name)`, and
+   *  the parent's existing special-cases handle the rest.
    *
    *  The returned [[EvalAdapter.CompiledExpression]] is cacheable:
    *  it pins the classloader (so the class can't be unloaded) and
@@ -180,7 +226,7 @@ class EvalAdapter:
       parent: ClassLoader,
       outputClassName: String
   ): EvalAdapter.CompiledExpression =
-    val cl = new AbstractFileClassLoader(outDir, parent)
+    val cl = new EvalAdapter.WrapperLoader(outDir, parent)
     val cls = cl.loadClass(outputClassName)
     val ctor = cls.getDeclaredConstructor(classOf[Object], classOf[Array[Eval.Binding]])
     val evaluate = cls.getMethod("evaluate")
@@ -273,6 +319,45 @@ class EvalAdapter:
 end EvalAdapter
 
 object EvalAdapter:
+
+  /** Class loader for one compiled eval wrapper. Holds the wrapper
+   *  class file in `outDir` and routes everything else to the parent's
+   *  *1-arg* `loadClass`. The 1-arg form is what the REPL
+   *  [[AbstractFileClassLoader]] override consults — the one that
+   *  routes `dotty.tools.repl.*` to the dotty-loaded copy and
+   *  delegates user/library classes to its own already-loaded
+   *  instances. Going through `parent.loadClass(name, false)` (the
+   *  JVM's standard delegation primitive) bypasses that override and
+   *  ends up redefining classes via the compiler-classpath
+   *  URLClassLoader, breaking cross-loader identity.
+   *
+   *  The wrapper class is defined locally without bytecode
+   *  instrumentation. Eval bodies aren't independently interruptable —
+   *  a Ctrl-C reaches them indirectly via the surrounding REPL
+   *  command, which still gets instrumented through the session
+   *  loader.
+   */
+  private[eval] class WrapperLoader(outDir: AbstractFile, parent: ClassLoader)
+      extends ClassLoader(parent):
+
+    override def findClass(name: String): Class[?] =
+      import scala.language.unsafeNulls
+      val pathParts = name.split("[./]").toList
+      var file: AbstractFile = outDir
+      for dirPart <- pathParts.init do
+        file = file.lookupName(dirPart, true)
+        if file == null then throw new ClassNotFoundException(name)
+      val classFile = file.lookupName(pathParts.last + ".class", false)
+      if classFile == null then throw new ClassNotFoundException(name)
+      val bytes = classFile.toByteArray
+      defineClass(name, bytes, 0, bytes.length)
+
+    override def loadClass(name: String): Class[?] =
+      val loaded = findLoadedClass(name)
+      if loaded != null then loaded
+      else
+        try findClass(name)
+        catch case _: ClassNotFoundException => parent.loadClass(name)
 
   /** Names that trigger nested-eval parsing. The textual fast path
    *  in [[mightContainNestedEval]] only parses bodies that contain

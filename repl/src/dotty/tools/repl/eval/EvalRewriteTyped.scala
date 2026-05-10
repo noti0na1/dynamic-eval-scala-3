@@ -197,12 +197,16 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
           // in the same block). We seed them into the scope before
           // processing any stat so mutual recursion captures the
           // sibling correctly.
+          // Every block-local non-synthetic named def gets captured
+          // as an eta-expanded function value. Given-flagged defs
+          // (`given foo(using Bar): Foo = ...`) flow through the same
+          // path — the body's implicit search may resolve `summon[Foo]`
+          // through the def, and the typer's `foo(<given-Bar>)` call
+          // lowers via the captured eta-expansion.
           val forwardDefs: List[CapturedSym] = stats.collect {
             case dd: DefDef
                 if !dd.symbol.is(Flags.Synthetic)
-                && !dd.name.isEmpty
-                && !dd.symbol.is(Flags.Given)
-                && isCaptureableDef(dd.symbol) =>
+                && !dd.name.isEmpty =>
               CapturedSym(dd.symbol, dd.name.toString, isVar = false, isDef = true)
           }
           val processed = mutable.ListBuffer.empty[Tree]
@@ -213,24 +217,39 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
             stat match
               case vd: ValDef
                   if !vd.symbol.is(Flags.Synthetic)
-                  && !vd.name.isEmpty
-                  && !vd.symbol.is(Flags.Given) =>
+                  && !vd.name.isEmpty =>
                 val isVar = vd.symbol.is(Flags.Mutable)
+                val isGiven = vd.symbol.is(Flags.Given)
+                // Block-local `given x: T = ...` reaches the body two
+                // ways. When the marker is the block's trailing expr,
+                // SpliceEvalBody hoists the given into the body and
+                // the binding is unused (a dead capture). Otherwise
+                // (e.g. `val r = eval[T](...)` after the given), the
+                // typer resolves bare-name and `summon[T]` references
+                // through the outer-scope given val, and ExtractEvalBody
+                // lowers them to `getValue(name)` — which only works
+                // when the rewriter actually emitted a binding.
                 blockCaps = blockCaps ++ List(
-                  CapturedSym(vd.symbol, vd.name.toString, isVar)
+                  CapturedSym(vd.symbol, vd.name.toString, isVar, isGiven = isGiven)
                 )
               case _ => // defs already in `forwardDefs`
           val newExpr = withScope(blockCaps)(transform(expr))
           cpy.Block(tree)(processed.toList, newExpr)
 
         case dd: DefDef =>
+          // Using params (incl. context-function lambda params named
+          // `contextual$<n>`) are captured the same as regular params:
+          // the typer binds the body's implicit lookup directly to the
+          // param symbol, so an `Eval.bind(name, value)` under that
+          // exact name lets `getValue` resolve it at runtime. We tag
+          // them `isGiven` for cache-key clarity; the lookup mechanism
+          // is otherwise the same as a regular bind.
           val paramCaps: List[CapturedSym] = dd.paramss.flatMap { clause =>
             clause.collect {
-              case vd: ValDef
-                  if !vd.name.isEmpty
-                  && !vd.symbol.is(Flags.Given) =>
+              case vd: ValDef if !vd.name.isEmpty =>
                 val byName = vd.symbol.info.isInstanceOf[ExprType]
-                CapturedSym(vd.symbol, vd.name.toString, isVar = false, isByName = byName)
+                val isGiven = vd.symbol.is(Flags.Given)
+                CapturedSym(vd.symbol, vd.name.toString, isVar = false, isGiven = isGiven, isByName = byName)
             }
           }
           // Switch ctx.owner to the def's symbol so any new symbols
@@ -317,25 +336,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
         case _ =>
           super.transform(tree)
 
-    /** True for defs that the eta-expansion builder can shape into
-     *  a `FunctionN` (or poly `[T] => FunctionN[T, ...]`) value.
-     *  Accepts:
-     *    - nullary (`def g = 42`),
-     *    - one term-param list (`def g(p1, ..., pn): R`),
-     *    - one type-param list + one term-param list
-     *      (`def g[T](p1, ..., pn): R`).
-     *  Rejects context-bound / using-clause / multi-curried defs;
-     *  those need shapes we don't construct typed-side.
-     */
-    private def isCaptureableDef(sym: Symbol)(using Context): Boolean =
-      sym.paramSymss match
-        case Nil => true
-        case List(termList) => termList.forall(_.isTerm)
-        case List(typeList, termList) =>
-          typeList.forall(_.isType) && termList.forall(_.isTerm)
-        case _ => false
-
-    /** Class members (val/var) emitted as `Eval.bind("x", this.x)`
+/** Class members (val/var) emitted as `Eval.bind("x", this.x)`
      *  bindings. The body-rewrite step turns `this.x` references in
      *  the body into reflective lookups by name, so the wrapper
      *  doesn't actually consume these by value — they exist solely
@@ -842,51 +843,108 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
         .appliedTo(nameLit, fn.withSpan(span))
         .withSpan(span)
 
-    /** `Eval.bind(name, eta-expansion)` for a captured def. Three
-     *  cases:
+    /** `Eval.bind(name, eta-expansion)` for a captured def.
      *
-     *    - Mono def `def g(p1, ..., pn): R` →
-     *        `(p1, ..., pn) => g(p1, ..., pn)` typed as
-     *        `(T1, ..., Tn) => R`.
-     *    - Nullary def `def g = 42` →
-     *        `() => g` typed as `Function0[R]`.
-     *    - Poly def `def g[T](p): R` →
-     *        `(p: Any) => g[Any](p)` typed as `(Any) => Any` (the
-     *        JVM erases all the T's to Object anyway, and the
-     *        wrapper's `applyCapturedFunction` lookup boxes/unboxes
-     *        as needed).
+     *  Strategy: flatten everything into a single uncurried lambda with
+     *  every param typed `Any` (and the result typed `Any`). This is
+     *  enough because:
+     *    - The JVM erases generics + value-param types to `Object`
+     *      after erasure, so the captured `(Any, …) => Any` matches
+     *      the def's bytecode signature.
+     *    - Body call sites of any shape — `g(a)`, `g(a)(b)`, `g[T](a)`,
+     *      `g[T](a)(using ev)` — are flattened by
+     *      [[ExtractEvalBody.transformedMethodArgs]] into a single
+     *      arg list, which the runtime delivers as a single
+     *      `binding.apply(args …)` call.
+     *
+     *  Inside the lambda body each param is cast back to its expected
+     *  type so the typed Apply tree we emit type-checks under the
+     *  def's declared signature; the casts erase to `Object` checkcasts
+     *  at runtime, which always succeed for the values the body's
+     *  call site can supply.
+     *
+     *  Special-cased:
+     *    - `def g: R` (`ExprType`) — `ref(defSym)` auto-applies, so
+     *      the lambda body is just the Ident.
+     *    - `def g[T]: R` — same after instantiating `T → Any`.
+     *
+     *  Type params are uniformly substituted to `Any`; context bounds
+     *  desugar to a `using Numeric[T]` clause whose param info
+     *  becomes `Numeric[Any]` after the substitution. Implicit search
+     *  for the using value happens at the body's typer time (inside
+     *  the wrapper compile, where the body's lexical scope is in
+     *  view), so the resolved evidence flows through the binding's
+     *  arg list as a regular value.
      */
     private def buildBindDef(c: CapturedSym, span: Span)(using Context): Tree =
       val nameLit = Literal(Constant(c.sourceName)).withSpan(span)
       val defSym = c.sym
-      val info = defSym.info
-      val etaTree: Tree = info match
+
+      // Strip a leading PolyType by instantiating its type params to
+      // `Any`. Subsequent `MethodType` clauses then have any
+      // `T`-mentioning param/result types substituted accordingly.
+      val (typeArgs: List[Type], methodLikeTpe: Type) = defSym.info match
         case poly: PolyType =>
-          // Erase the def's type params to `Any` and synthesise a
-          // FunctionN whose value/result types are also `Any`. Calls
-          // to `g(arg)` via `applyCapturedFunction` work after JVM
-          // erasure for any concrete T.
-          val mt = poly.resType.asInstanceOf[MethodType]
-          val anyTpes = mt.paramInfos.map(_ => defn.AnyType)
-          val methTpe = MethodType(mt.paramNames)(_ => anyTpes, _ => defn.AnyType)
-          Lambda(methTpe, params =>
-            ref(defSym)
-              .appliedToTypes(poly.paramRefs.map(_ => defn.AnyType))
-              .appliedToTermArgs(params)
-          ).withSpan(span)
+          val anys: List[Type] = poly.paramRefs.map(_ => defn.AnyType)
+          (anys, poly.instantiate(anys))
+        case other =>
+          (Nil, other)
+
+      // Walk the (possibly nested) MethodType chain and collect
+      // per-clause param infos and names. Each clause becomes one
+      // sub-list; the result type sits at the bottom.
+      def flatten(t: Type): (List[List[Type]], List[List[TermName]], Type) = t match
         case mt: MethodType =>
-          val paramNames = mt.paramNames
-          val paramTpes = mt.paramInfos
-          val resultTpe = mt.resultType
-          val methTpe = MethodType(paramNames)(_ => paramTpes, _ => resultTpe)
-          Lambda(methTpe, params => ref(defSym).appliedToTermArgs(params))
-            .withSpan(span)
-        case _ =>
-          // ExprType / no-paren `def g: R` — `ref(defSym)` auto-applies
-          // to `R`, so a Function0[R] thunk wraps it directly.
-          val resultTpe = info.finalResultType
-          val methTpe = MethodType(Nil, resultTpe)
-          Lambda(methTpe, _ => ref(defSym)).withSpan(span)
+          val (rest, namesRest, result) = flatten(mt.resType)
+          (mt.paramInfos :: rest, mt.paramNames :: namesRest, result)
+        case other =>
+          (Nil, Nil, other)
+      val (clauseInfos, clauseNames, _) = flatten(methodLikeTpe)
+
+      def applyTypeArgs(t: Tree): Tree =
+        if typeArgs.isEmpty then t else t.appliedToTypes(typeArgs)
+
+      val etaTree: Tree =
+        if clauseInfos.isEmpty then
+          // No `MethodType` in the chain — `ref(defSym)` auto-applies
+          // (no-paren `def g: R`, possibly poly).
+          val methTpe = MethodType(Nil, defn.AnyType)
+          Lambda(methTpe, _ => applyTypeArgs(ref(defSym))).withSpan(span)
+        else
+          val flatNames = clauseNames.flatten
+          val flatInfos = clauseInfos.flatten
+          // By-name params can't be `cast` to: `asInstanceOf[=> T]` is
+          // not a legal cast target. Keep the original `ExprType` as
+          // the lambda's param type for those positions so the call
+          // site type-checks without a cast. Other params get `Any` and
+          // a cast inside the body.
+          val lambdaParamTpes: List[Type] = flatInfos.map {
+            case et: ExprType => et
+            case _ => defn.AnyType
+          }
+          val methTpe = MethodType(flatNames)(_ => lambdaParamTpes, _ => defn.AnyType)
+          Lambda(methTpe, params =>
+            // Cast each lambda param back to the def's expected type at
+            // that position. Required so the typed Apply tree
+            // type-checks; at runtime these are `checkcast`s against the
+            // erased Object form and always succeed for body-supplied
+            // values. By-name params skip the cast — their lambda
+            // param already carries the matching `ExprType`.
+            val callArgs = params.lazyZip(flatInfos).map { (p, t) =>
+              t match
+                case _: ExprType => p
+                case _ => p.cast(t)
+            }
+            // Re-group the flat params into the def's original clause
+            // arities so `appliedToArgss` builds the right Apply chain.
+            def regroup(xs: List[Tree], sizes: List[Int]): List[List[Tree]] = sizes match
+              case Nil => Nil
+              case n :: rest =>
+                val (head, tail) = xs.splitAt(n)
+                head :: regroup(tail, rest)
+            val grouped = regroup(callArgs, clauseInfos.map(_.length))
+            applyTypeArgs(ref(defSym)).appliedToArgss(grouped)
+          ).withSpan(span)
       ref(EvalRewriteTyped.bindSym)
         .appliedTo(nameLit, etaTree)
         .withSpan(span)

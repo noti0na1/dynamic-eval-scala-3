@@ -336,10 +336,22 @@ class ReplDriver(settings: Array[String],
       ReplCompiler.objectNames.get(idx).exists { wrapperName =>
         replOutDir.lookupName(s"$wrapperName$$.class", directory = false) != null
       }
-    val replWrapperImports = state.validObjectIndexes
-      .filter(hasClassfile)
-      .map(i => s"import ${ReplCompiler.objectNames(i)}.{given, *}")
-      .toArray
+    // For each valid line: the wrapper import (when its classfile exists)
+    // followed by the user-typed top-level imports collected at that line
+    // (e.g. `import A.*`). Wildcard-importing the wrapper module doesn't
+    // re-export imports declared inside it, so without this the eval
+    // driver would lose `import A.*`-style names that the live session has.
+    // Force color off when rendering, otherwise the live session's
+    // syntax-highlighting setting embeds ANSI escapes into the source
+    // we hand to the eval compiler.
+    val printCtx = ctx.fresh.setSetting(ctx.settings.color, "never")
+    val replWrapperImports = state.validObjectIndexes.flatMap { i =>
+      val wrapperImport =
+        if hasClassfile(i) then Some(s"import ${ReplCompiler.objectNames(i)}.{given, *}")
+        else None
+      val userImports = state.imports.getOrElse(i, Nil).map(_.show(using printCtx))
+      wrapperImport ++ userImports
+    }.toArray
 
     // Forward CLI settings from the live session (minus those incompatible
     // with the eval driver's standalone setup).

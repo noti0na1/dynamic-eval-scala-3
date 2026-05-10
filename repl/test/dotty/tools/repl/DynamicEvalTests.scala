@@ -418,6 +418,32 @@ class DynamicEvalTests extends ReplTest:
     assertContains("List(3, 2, 1)", storedOutput())
   }
 
+  @Test def seesUserDefinedWildcardImport = initially {
+    // The REPL's `import A.*` is a top-level user import: it doesn't add
+    // members to the line wrapper, so wildcard-importing `rs$line$N`
+    // can't recover it. The eval driver must propagate `state.imports`
+    // separately so unqualified names brought in by user imports resolve.
+    run("""|object A:
+           |  def f: Int = 42""".stripMargin)
+  } andThen {
+    run("import A.*")
+  } andThen {
+    storedOutput()
+    run("""val r: Int = eval[Int]("f")""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def seesUserDefinedRenamingImport = initially {
+    run("""|object Pkg:
+           |  def greet: String = "hi"""".stripMargin)
+  } andThen {
+    run("import Pkg.{greet as hello}")
+  } andThen {
+    storedOutput()
+    run("""val r: String = eval[String]("hello")""")
+    assertContains("""val r: String = "hi"""", storedOutput())
+  }
+
   @Test def mutatesVarFieldOnReplObject = initially {
     // `Counter` is a REPL-defined class with a mutable field. The eval
     // body mutates the field through the captured instance reference;
@@ -617,24 +643,89 @@ class DynamicEvalTests extends ReplTest:
     assertContains("val r: Int = 70", storedOutput())
   }
 
-  @Test def contextBoundDefSkipped = initially {
-    // Context bounds desugar to a separate `using` clause, which the
-    // multi-paramlist guard rejects. Eta-expansion is therefore
-    // skipped and the eval body falls back to a "no binding for `g`"
-    // failure: V1 fails at compile time with "Not found: g"; V2's
-    // splice path lets the typer resolve `g` against the local def
-    // but ExtractEvalBody then routes the (uncaptured) reference
-    // through `getValue`, surfacing as a runtime
-    // `NoSuchElementException: g`. Either way the call doesn't
-    // succeed, which is the intended outcome of the rewriter
-    // skipping the def.
+  @Test def multiCurryDefCaptured = initially {
+    // `def g(a: A)(b: B): C` becomes a single uncurried `(Any, Any) => Any`
+    // binding. `transformedMethodArgs` flattens the body's `g(a)(b)`
+    // call into one arg list `[a, b]`, so the binding's `apply(a, b)`
+    // delivers the call.
+    run("""|def f(): Int =
+           |  def g(a: Int)(b: Int): Int = a * 10 + b
+           |  eval[Int]("g(4)(2)")
+           |val r: Int = f()""".stripMargin)
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def usingClauseDefCaptured = initially {
+    // `def g(x: A)(using ev: B): C` — same flattening applies. The
+    // body's `summon[B]` resolves through the captured outer `given`,
+    // flowing through the binding's flat arg list.
+    run("""|def f(): Int =
+           |  given Int = 5
+           |  def g(x: Int)(using m: Int): Int = x * m
+           |  eval[Int]("g(8)")
+           |val r: Int = f()""".stripMargin)
+    assertContains("val r: Int = 40", storedOutput())
+  }
+
+  @Test def byNameParamDefCaptured = initially {
+    // `def g(x: => Int)` — by-name param. The lambda's expected type
+    // for the param is `=> Any` after the substitution, so the
+    // captured value is wrapped in a thunk consistent with g's
+    // signature.
+    run("""|def f(): Int =
+           |  def g(x: => Int): Int = x + x
+           |  eval[Int]("g(7)")
+           |val r: Int = f()""".stripMargin)
+    val out = storedOutput()
+    assertTrue(s"expected r = 14 or capture failure, got:\n$out",
+      out.contains("val r: Int = 14") ||
+        out.contains("NoSuchElementException") ||
+        out.contains("failed to compile"))
+  }
+
+  @Test def varargsDefCaptured = initially {
+    run("""|def f(): Int =
+           |  def g(xs: Int*): Int = xs.sum
+           |  eval[Int]("g(1, 2, 3, 4)")
+           |val r: Int = f()""".stripMargin)
+    assertContains("val r: Int = 10", storedOutput())
+  }
+
+  @Test def multiCurryDefPartiallyAppliedReturnsFunction = initially {
+    // `def g(i: Int)(j: Int): Int` captured as a flat
+    // `(Any, Any) => Any`. The body's `g(1)` is type-checked against
+    // the expected `Int => Int`, so the typer eta-expands it into
+    // `(j: Int) => g(1)(j)` — that lambda's inner Apply chain still
+    // flattens to `[1, j]` for the binding's `apply(1, j)` call.
+    run("""|def f(): Int =
+           |  def g(i: Int)(j: Int): Int = i * 100 + j
+           |  val h: Int => Int = eval[Int => Int]("g(3)")
+           |  h(7)
+           |val r: Int = f()""".stripMargin)
+    assertContains("val r: Int = 307", storedOutput())
+  }
+
+  @Test def threeCurriedDefCaptured = initially {
+    // Three term clauses still flatten into a single flat `(Any, Any, Any)`.
+    run("""|def f(): String =
+           |  def g(a: Int)(b: String)(c: Boolean): String = s"$a-$b-$c"
+           |  eval[String]("g(1)(\"x\")(true)")
+           |val r: String = f()""".stripMargin)
+    assertContains("""val r: String = "1-x-true"""", storedOutput())
+  }
+
+  @Test def contextBoundDefCaptured = initially {
+    // `def g[T : Numeric](x: T): T` desugars to
+    // `def g[T](x: T)(using ev: Numeric[T]): T`. The eta-expansion
+    // flattens both clauses into one `(Any, Any) => Any` lambda;
+    // the body's `g[Int](21)` resolves to `g[Int](21)(using <Numeric[Int]>)`
+    // at typer time, both arguments flow through the binding's apply
+    // and `g` returns `21 + 21 = 42`.
     run("""|def f(): Int =
            |  def g[T : Numeric](x: T): T = summon[Numeric[T]].plus(x, x)
            |  eval[Int]("g[Int](21)")
            |f()""".stripMargin)
-    val out = storedOutput()
-    assertTrue(s"expected the eval call to fail, got:\n$out",
-      out.contains("Not found: g") || out.contains("NoSuchElementException: g"))
+    assertContains("val res0: Int = 42", storedOutput())
   }
 
   // ===========================================================================
@@ -712,6 +803,84 @@ class DynamicEvalTests extends ReplTest:
       out.contains("val r: String =") ||
         out.contains("NoSuchElementException") ||
         out.contains("failed to compile"))
+  }
+
+  @Test def usingParamFromContextFunctionCaptured = initially {
+    // The eval call sits inside a context-function lambda whose using
+    // parameter (`contextual$1: Cap`) is what the body's implicit
+    // lookup resolves against. Those params used to be filtered out
+    // of the binding capture, so `getValue("contextual$1")` threw
+    // `NoSuchElementException` at runtime. Captured now under the
+    // synthesised parameter name.
+    run("""|trait Cap
+           |def use[T](body: Cap ?=> T): T = body(using new Cap {})
+           |def needsCap(using Cap): String = "ok"
+           |val r: String = use(eval[String]("needsCap"))""".stripMargin)
+    assertContains("""val r: String = "ok"""", storedOutput())
+  }
+
+  @Test def usingParamReachableByImplicitSearch = initially {
+    // Same shape as above, but the body uses `summon[Cap]` rather
+    // than calling a method that takes `using Cap`. Both paths reach
+    // the captured using-param via the typer.
+    run("""|trait Cap:
+           |  def label: String
+           |def use[T](body: Cap ?=> T): T = body(using new Cap { def label = "tag" })
+           |val r: String = use(eval[String]("summon[Cap].label"))""".stripMargin)
+    assertContains("""val r: String = "tag"""", storedOutput())
+  }
+
+  @Test def localGivenValEvalNotInTrailingPosition = initially {
+    // Block-local `given str: String = "hi"` is reached by the eval
+    // body's `summon[String]`. When the eval call sits at the trailing
+    // expr of the block, SpliceEvalBody's hoist mechanism handles it.
+    // When it doesn't (something follows), only the rewriter's binding
+    // capture keeps the given visible — so the rewriter must capture
+    // block-local given vals even though the surface form looks like
+    // a `given`.
+    run("""|def f(): String =
+           |  given str: String = "hi"
+           |  val tag = "."
+           |  val r = eval[String]("summon[String] + tag")
+           |  r
+           |val r: String = f()""".stripMargin)
+    assertContains("""val r: String = "hi."""", storedOutput())
+  }
+
+  @Test def localGivenDefWithUsingClauseCapturedAndCalled = initially {
+    // A `given foo(using Bar): Foo = ...` desugars to a DefDef with
+    // `Flags.Given` and one using clause. `isCaptureableDef` accepts
+    // the single-paramlist shape. The typer resolves `summon[Foo]` in
+    // the body against the def, threading the local `Bar` given as
+    // its using arg; the resulting `foo(<bar>)` call lowers through
+    // the captured eta-expansion.
+    run("""|trait Bar:
+           |  def n: Int
+           |trait Foo:
+           |  def label: String
+           |def f(): String =
+           |  given Bar = new Bar { def n = 7 }
+           |  given foo(using b: Bar): Foo = new Foo { def label = b.n.toString + "!" }
+           |  eval[String]("summon[Foo].label")
+           |val r: String = f()""".stripMargin)
+    assertContains("""val r: String = "7!"""", storedOutput())
+  }
+
+  @Test def usingParamPlusLocalGivenValCombined = initially {
+    // Outer using param (from a context function) plus a block-local
+    // given val. The body summons both. Exercises the cross of the
+    // two fixes: DefDef-given-param capture and Block-given-val capture.
+    run("""|trait Cap:
+           |  def n: Int
+           |def use[T](body: Cap ?=> T): T = body(using new Cap { def n = 42 })
+           |def f(): String =
+           |  use {
+           |    given str: String = "x"
+           |    val r = eval[String]("summon[Cap].n.toString + summon[String]")
+           |    r
+           |  }
+           |val r: String = f()""".stripMargin)
+    assertContains("""val r: String = "42x"""", storedOutput())
   }
 
   // ===========================================================================
@@ -923,20 +1092,22 @@ class DynamicEvalTests extends ReplTest:
 
   @Test def shadowedTypeParameterRejectsCrossClauseUse = initially {
     // Companion to `shadowedTypeParameterPreservesPrecision`: with the
-    // outer `T` renamed to `T$0`, attempting to mix `xs` and `y` in a
-    // way that requires their element types to unify is a compile
-    // error inside the eval body, exactly what source-level scoping
-    // already says (the two `T`s are distinct symbols). Before the
-    // rewriter alpha-renamed shadowed tparams the wrapper would have
-    // captured `xs` as raw `List` (precision lost), so the body's
-    // `xs :+ y` would silently widen to `List[Any]` and never surface
-    // the mismatch.
+    // outer `T` renamed to `T$0`, mixing `xs` (outer `T`) and `y`
+    // (inner `T`) in invariant position is a compile error inside the
+    // eval body, exactly what source-level scoping already says.
+    // `Box[T].set(v: T)` is invariant, so the mismatch can't be
+    // hidden by widening (unlike `xs :+ y` which would just produce
+    // `List[Any]`). Before the rewriter alpha-renamed shadowed
+    // tparams the wrapper would have captured `xs` as raw `Box`
+    // (precision lost) and the body would compile silently.
     run("""|import dotty.tools.repl.eval.EvalCompileException
+           |trait Box[T]:
+           |  def set(v: T): Unit
            |def f[T](x: T) =
-           |  val xs: List[T] = List(x)
+           |  val xs: Box[T] = new Box[T] { def set(v: T): Unit = () }
            |  def g[T](y: T): String =
            |    try
-           |      eval[List[T]]("xs :+ y")
+           |      eval[Unit]("xs.set(y)")
            |      "no error"
            |    catch case _: EvalCompileException => "compile-failed"
            |  g[Int](100)
@@ -3795,6 +3966,52 @@ class DynamicEvalCaptureCheckingTests extends ReplTest(
           (out.contains("captures") || out.contains("capability") || out.contains("flow"))
       )
     }
+
+  @Test def capabilityLeakageThroughExpectedTypeRejected =
+    // The eval body is just `c`. At the call site `c: AnyRef^`, but
+    // the call site's `eval[AnyRef]` strips the capture annotation
+    // off the result type. The wrapper compile sees the binding for
+    // `c` as plain `Object` (bindings erase capture sets through the
+    // `Eval.bind(name, value: Any)` shape) and would silently accept
+    // it; the verification pass re-typechecks the original
+    //     def leak(c: AnyRef^): AnyRef = ({ c })
+    // with the body inlined and rejects, because `c.rd` (or `c`
+    // itself) cannot flow into the empty capture set demanded by
+    // `AnyRef`.
+    initially {
+      run(
+        """|def leak(c: AnyRef^): AnyRef = eval[AnyRef]("c")
+           |leak(new Object)""".stripMargin
+      )
+      val out = storedOutput()
+      assertTrue(
+        s"expected a capture-leak failure on the return type, got:\n$out",
+        out.contains("failed to compile") &&
+          (out.contains("captures") || out.contains("capability") || out.contains("flow"))
+      )
+    }
+
+  @Test def capabilityCapturedIntoPureReturnLambdaRejected =
+    // The `eval[() -> Unit]` requires a pure function. The body
+    // `() => println(io)` captures `io: IO^` into the lambda's
+    // capture set, so the verification pass rejects: the lambda's
+    // inferred type is `() ->{io} Unit`, not `() -> Unit`, and the
+    // call site's expected type cannot widen to admit `io`.
+    initially {
+      run(
+        """|import caps.*
+           |class IO extends SharedCapability
+           |def mkPrinter(io: IO^): () -> Unit =
+           |  eval[() -> Unit]("() => println(io)")
+           |mkPrinter(new IO)""".stripMargin
+      )
+      val out = storedOutput()
+      assertTrue(
+        s"expected a capture-checking failure on the pure-lambda return, got:\n$out",
+        out.contains("failed to compile") &&
+          (out.contains("captures") || out.contains("capability") || out.contains("flow"))
+      )
+    }
 end DynamicEvalCaptureCheckingTests
 
 /** Safe mode (`-language:experimental.safe`) is a stricter cousin of plain
@@ -3989,6 +4206,84 @@ class DynamicEvalSafeModeTests extends ReplTest(
         s"expected a scala.Console safe-mode rejection, got:\n$out",
         out.contains("failed to compile") &&
           (out.contains("Console") || out.contains("@rejectSafe") || out.contains("safe"))
+      )
+    }
+
+  // -- Mutating an outer var through a pure / read-only function. -----------
+
+  @Test def mutableVarWriteInPureLambdaInBodyRejected =
+    // Companion of `mutableVarCapturedByPureFunctionInBodyRejected`:
+    // here the pure (`->`) lambda *writes* to the captured var
+    // instead of reading it. The Supplier/Consumer pair the rewriter
+    // synthesises for `bindVar` carries no capture set, so neither
+    // the read nor the write effect can flow into a `() -> Unit`.
+    // The whole `def f` is rejected at the REPL compile.
+    initially {
+      run(
+        """|def f(): Unit =
+           |  var r: Int = 0
+           |  eval[Unit]("val pure: () -> Unit = () => { r = r + 1 }; pure()")
+           |val out: Unit = f()""".stripMargin
+      )
+      val out = storedOutput()
+      assertTrue(
+        s"expected a capture-checking failure on the var write, got:\n$out",
+        out.contains("cannot flow into capture set") &&
+          (out.contains("r.rd") || out.contains("r ") ||
+            out.contains("Supplier") || out.contains("Consumer"))
+      )
+    }
+
+  @Test def mutableInstanceWriteThroughRdLambdaInBodyRejected =
+    // Mutable class instance captured as a binding (a `val`, not a
+    // `var`, so the rewriter uses plain `bind` with `value: Any`).
+    // Inside the eval body the user declares a function whose
+    // capture set is `{b.rd}` (read-only access to `b`) and tries to
+    // write `b.x = 1` through it. Writing requires the full `b`
+    // capability, not just `b.rd`. The verification pass re-checks
+    // the original lexical context with the body inlined and
+    // rejects.
+    initially {
+      run(
+        """|import caps.*
+           |class Box extends Mutable:
+           |  var x: Int = 0
+           |def h(): Unit =
+           |  val b = new Box
+           |  eval[Unit]("val ro: () ->{b.rd} Unit = () => { b.x = 1 }; ro()")
+           |h()""".stripMargin
+      )
+      val out = storedOutput()
+      assertTrue(
+        s"expected a write-through-rd safe-mode rejection, got:\n$out",
+        out.contains("failed to compile") &&
+          (out.contains("capture") || out.contains("capability") ||
+            out.contains("flow") || out.contains("update") ||
+            out.contains("read-only") || out.contains("readOnly"))
+      )
+    }
+
+  @Test def mutableInstanceReadInPureLambdaInBodyRejected =
+    // Read-only access through a pure (`->`) lambda is also
+    // rejected: reading `b.x` carries the `b.rd` effect, which
+    // cannot flow into the empty capture set required by `() -> Int`.
+    // The body's `pure` declaration is ill-typed under safe mode.
+    initially {
+      run(
+        """|import caps.*
+           |class Box extends Mutable:
+           |  var x: Int = 0
+           |def k(): Int =
+           |  val b = new Box
+           |  eval[Int]("val pure: () -> Int = () => b.x; pure()")
+           |k()""".stripMargin
+      )
+      val out = storedOutput()
+      assertTrue(
+        s"expected a read-through-pure safe-mode rejection, got:\n$out",
+        out.contains("failed to compile") &&
+          (out.contains("captures") || out.contains("capability") ||
+            out.contains("flow") || out.contains("b.rd") || out.contains("b "))
       )
     }
 
