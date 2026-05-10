@@ -67,13 +67,16 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
   private def isExpressionVal(sym: Symbol)(using Context): Boolean =
     sym.exists && sym.name == SpliceEvalBody.EvalResultName
 
-  /** True iff `sym` is the wrapper module class or its companion val,
-   *  identified by name prefix. The wrapper is synthesised in
-   *  `EvalAdapter` as `__EvalWrapper_<uuid>` and never under any other
-   *  pattern, so a name-based check is reliable.
+  /** True iff `sym` is the wrapper module class or its companion val.
+   *  The wrapper is synthesised in `EvalAdapter` and always carries
+   *  `__EvalWrapper` as part of its name; a `contains` check covers
+   *  both shapes the adapter emits — `__EvalWrapper_<uuid>` (direct
+   *  bridge use) and `rs$line$<uuid>$__EvalWrapper` (REPL session use,
+   *  where the `rs$line$` prefix makes `NameOps.isReplWrapperName`
+   *  recognise it as a REPL wrapper).
    */
   private def isWrapperSymbol(sym: Symbol)(using Context): Boolean =
-    sym.exists && sym.name.toString.startsWith(ExtractEvalBody.WrapperPrefix)
+    sym.exists && sym.name.toString.contains(ExtractEvalBody.WrapperMarker)
 
   /** True iff the wrapper module's body has no nested class declarations.
    *  Used to gate the wrapper drop in the `PackageDef` case.
@@ -602,9 +605,12 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
 
 private[eval] object ExtractEvalBody:
   val name: String = "extractEvalBody"
-  /** Name prefix shared by every wrapper module synthesised in
+  /** Substring shared by every wrapper module synthesised in
    *  [[EvalAdapter]]. Used by `ExtractEvalBody` to identify the
-   *  wrapper symbol when pruning the package after the body has
-   *  moved to `__Expression.evaluate`.
+   *  wrapper symbol via `name.contains(...)` when pruning the
+   *  package after the body has moved to `__Expression.evaluate`.
+   *  Both wrapper-name shapes — `__EvalWrapper_<uuid>` (direct
+   *  bridge use) and `rs$line$<uuid>$__EvalWrapper` (REPL use) —
+   *  carry this substring.
    */
-  val WrapperPrefix: String = "__EvalWrapper_"
+  val WrapperMarker: String = "__EvalWrapper"
