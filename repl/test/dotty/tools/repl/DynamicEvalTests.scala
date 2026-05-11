@@ -4012,6 +4012,52 @@ class DynamicEvalCaptureCheckingTests extends ReplTest(
           (out.contains("captures") || out.contains("capability") || out.contains("flow"))
       )
     }
+
+  @Test def evalBindingDoesNotPropagateCapturesToEnclosingPureLambda =
+    // Regression test. The rewriter emits `Eval.bind("f", f)` for every
+    // captured local at the eval call site, including ones whose type
+    // carries a non-empty capture set (here `f: AnyRef^{io}` via the
+    // contextual IOCap). Without suppression, the use of `f` inside the
+    // synthesised `Eval.bind` propagates `io` into the enclosing
+    // function literal's capture set; the surrounding `Classified.map`
+    // expects `String ->{any.rd} Int`, so `io` (not in `{any.rd}`) is
+    // reported as a capture violation.
+    //
+    // The fix: each binding's value is wrapped in a `Predef.identity[T](v)`
+    // Apply stamped with `CheckCaptures.DiscardUses`. The capture
+    // checker recognises the attachment and rechecks the inner
+    // expression with `withDiscardedUses`, so the propagation is
+    // suppressed. The eval body itself is still typechecked under its
+    // original lexical context by the verification compile, where `f`'s
+    // capability is legal.
+    initially {
+      run(
+        """|import caps.*
+           |trait IOCap extends SharedCapability
+           |trait Classified[T]:
+           |  def map[U](f: T ->{any.rd} U): Classified[U]
+           |def useIO[T](body: IOCap ?=> T): T = body(using new IOCap {})
+           |def specialRef(using io: IOCap): AnyRef^{io} = new AnyRef
+           |def classify[T](x: T): Classified[T] = new Classified[T]:
+           |  def map[U](f: T ->{any.rd} U): Classified[U] = classify(f(x))""".stripMargin
+      )
+    } andThen {
+      storedOutput() // discard
+      run(
+        """|val r: Classified[Int] = useIO {
+           |  val f = specialRef
+           |  val ss = classify("hello")
+           |  ss.map(s => eval[Int]("s.length"))
+           |}""".stripMargin
+      )
+      val out = storedOutput()
+      assertTrue(
+        s"expected no capture-checking error, got:\n$out",
+        !out.contains("CaptureChecking")
+          && !out.contains("not included in the allowed capture set")
+      )
+      assertContains("val r: Classified[Int]", out)
+    }
 end DynamicEvalCaptureCheckingTests
 
 /** Safe mode (`-language:experimental.safe`) is a stricter cousin of plain
@@ -4285,6 +4331,49 @@ class DynamicEvalSafeModeTests extends ReplTest(
           (out.contains("captures") || out.contains("capability") ||
             out.contains("flow") || out.contains("b.rd") || out.contains("b "))
       )
+    }
+
+  @Test def evalBindingDoesNotPropagateCapturesUnderSafeMode =
+    // Same scenario as `evalBindingDoesNotPropagateCaptures...` in
+    // `DynamicEvalCaptureCheckingTests`, but under safe mode. This
+    // additionally exercises the safe-mode constraint: the rewriter
+    // cannot synthesise a direct call to `caps.unsafe.unsafeDiscardUses`
+    // because `caps.unsafe` is `@rejectSafe` and would fail
+    // `SafeRefs.checkSafe`. The fix routes through `Predef.identity`
+    // (which is `@assumeSafe`) carrying a `CheckCaptures.DiscardUses`
+    // attachment, so the cc check applies discard semantics without
+    // touching any rejected symbol.
+    initially {
+      run(
+        """|import caps.*
+           |trait IOCap extends SharedCapability
+           |trait Classified[T]:
+           |  def map[U](f: T ->{any.rd} U): Classified[U]
+           |def useIO[T](body: IOCap ?=> T): T = body(using new IOCap {})
+           |def specialRef(using io: IOCap): AnyRef^{io} = new AnyRef
+           |def classify[T](x: T): Classified[T] = new Classified[T]:
+           |  def map[U](f: T ->{any.rd} U): Classified[U] = classify(f(x))""".stripMargin
+      )
+    } andThen {
+      storedOutput() // discard
+      run(
+        """|val r: Classified[Int] = useIO {
+           |  val f = specialRef
+           |  val ss = classify("hello")
+           |  ss.map(s => eval[Int]("s.length"))
+           |}""".stripMargin
+      )
+      val out = storedOutput()
+      assertTrue(
+        s"expected no capture-checking error, got:\n$out",
+        !out.contains("CaptureChecking")
+          && !out.contains("not included in the allowed capture set")
+      )
+      assertTrue(
+        s"expected no safe-mode rejection from a synthesised carrier, got:\n$out",
+        !out.contains("Cannot refer to") && !out.contains("@rejectSafe")
+      )
+      assertContains("val r: Classified[Int]", out)
     }
 
 end DynamicEvalSafeModeTests

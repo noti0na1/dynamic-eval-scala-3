@@ -44,6 +44,18 @@ object CheckCaptures:
   /** An attachment to prevent widening of arguments to tracked parameters */
   val NoWiden: Property.Key[Unit] = Property.Key()
 
+  /** An attachment marking an `Apply` tree to be rechecked with
+   *  `unsafeDiscardUses` semantics: uses inside the call are not
+   *  recorded into enclosing environments. Lets a compiler-internal
+   *  rewriter (e.g. the REPL eval-binding rewriter) suppress capture
+   *  propagation for synthesised value references without emitting a
+   *  source-level call to `caps.unsafe.unsafeDiscardUses`, which
+   *  would be rejected in safe mode. Sticky so the marker survives
+   *  the tree copies between PostTyper-stage rewriters and the
+   *  capture-check phase.
+   */
+  val DiscardUses: Property.StickyKey[Unit] = Property.StickyKey()
+
   enum EnvKind derives CanEqual:
     case Regular        // normal case
     case NestedInOwner  // environment is a temporary one nested in the owner's environment,
@@ -889,6 +901,13 @@ class CheckCaptures extends Recheck, SymTransformer:
       else if meth == defn.Caps_unsafeDiscardUses then
         val arg :: Nil = tree.args: @unchecked
         withDiscardedUses(recheck(arg, pt))
+      else if tree.hasAttachment(DiscardUses) then
+        // A compiler-internal rewriter asked for `unsafeDiscardUses`
+        // semantics on this whole call without going through the
+        // (safe-mode-rejected) `caps.unsafe.unsafeDiscardUses` symbol.
+        // Recheck the application normally, but with use recording
+        // suppressed for everything inside it.
+        withDiscardedUses(super.recheckApply(tree, pt))
       else if meth == defn.Caps_freeze then
         freeze(super.recheckApply(tree, pt), tree.srcPos)
       else

@@ -6,7 +6,7 @@ import scala.collection.mutable
 
 import dotc.ast.tpd
 import dotc.ast.tpd.*
-import dotc.cc.CaptureAnnotation
+import dotc.cc.{CaptureAnnotation, CheckCaptures}
 import dotc.core.Annotations.Annotation
 import dotc.core.Constants.Constant
 import dotc.core.Contexts.*
@@ -794,10 +794,37 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
       else if c.isDef then buildBindDef(c, span)
       else
         val nameLit = Literal(Constant(c.sourceName)).withSpan(span)
-        val valueRef = readRef(c, span)
-        ref(EvalRewriteTyped.bindSym)
-          .appliedTo(nameLit, valueRef)
-          .withSpan(span)
+        discardUses:
+          ref(EvalRewriteTyped.bindSym)
+            .appliedTo(nameLit, readRef(c, span))
+            .withSpan(span)
+
+    /** Stamp the `Eval.bind*(...)` call with [[CheckCaptures.DiscardUses]]
+     *  so the capture checker rechecks the whole application — including
+     *  the value argument and any closures it nests — with
+     *  `withDiscardedUses`, i.e. without recording captured-reference
+     *  uses into enclosing environments.
+     *
+     *  Why this is needed: at every `eval` / `agent` call site the
+     *  rewriter emits `Eval.bind("x", x)` for each captured local. The
+     *  reference to `x` carries `x`'s capture set; without suppression
+     *  the use is recorded into every enclosing function literal —
+     *  including a surrounding lambda whose expected capture set forbids
+     *  it (e.g. `String ->{any.rd} Int` in `Classified.map`). The binding
+     *  only travels to the spliced eval body, which the driver
+     *  re-typechecks in its own enclosing source where `x`'s capability
+     *  is already legal; the surrounding lambda never consumes the
+     *  capability through this binding.
+     *
+     *  We use the attachment rather than emitting
+     *  `caps.unsafe.unsafeDiscardUses(...)` directly because the latter
+     *  is `@rejectSafe` and would fail `SafeRefs.checkSafe` when the
+     *  live REPL session runs in safe mode. No extra runtime call is
+     *  introduced — the attachment rides on the `Eval.bind*` Apply we
+     *  already emit.
+     */
+    private def discardUses(bindApp: Tree)(using Context): Tree =
+      bindApp.withAttachment(CheckCaptures.DiscardUses, ())
 
     /** Read site for a captured symbol.
      *  - `selfThisCls`: a `__this__` / `__this__<Cls>` synthetic
@@ -819,10 +846,10 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
     /** `Eval.bindGiven(name, value)` for given-val captures. */
     private def buildBindGiven(c: CapturedSym, span: Span)(using Context): Tree =
       val nameLit = Literal(Constant(c.sourceName)).withSpan(span)
-      val valueRef = readRef(c, span)
-      ref(EvalRewriteTyped.bindGivenSym)
-        .appliedTo(nameLit, valueRef)
-        .withSpan(span)
+      discardUses:
+        ref(EvalRewriteTyped.bindGivenSym)
+          .appliedTo(nameLit, readRef(c, span))
+          .withSpan(span)
 
     /** `Eval.bind(name, () => name)` for a by-name parameter capture.
      *  ElimByName has already lowered the body's `name` references
@@ -838,10 +865,11 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
         case ExprType(rt) => rt
         case other => other
       val methTpe = MethodType(Nil, resultTpe)
-      val fn = Lambda(methTpe, _ => readRef(c, span))
-      ref(EvalRewriteTyped.bindSym)
-        .appliedTo(nameLit, fn.withSpan(span))
-        .withSpan(span)
+      val fn = Lambda(methTpe, _ => readRef(c, span)).withSpan(span)
+      discardUses:
+        ref(EvalRewriteTyped.bindSym)
+          .appliedTo(nameLit, fn)
+          .withSpan(span)
 
     /** `Eval.bind(name, eta-expansion)` for a captured def.
      *
@@ -945,9 +973,10 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
             val grouped = regroup(callArgs, clauseInfos.map(_.length))
             applyTypeArgs(ref(defSym)).appliedToArgss(grouped)
           ).withSpan(span)
-      ref(EvalRewriteTyped.bindSym)
-        .appliedTo(nameLit, etaTree)
-        .withSpan(span)
+      discardUses:
+        ref(EvalRewriteTyped.bindSym)
+          .appliedTo(nameLit, etaTree)
+          .withSpan(span)
 
     /** `Eval.bindVar(name, Eval.varRef[T](getter, setter))` where
      *  `getter` / `setter` are SAM-typed `Supplier[T]` / `Consumer[T]`
@@ -989,9 +1018,10 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
         .withSpan(span)
 
       val nameLit = Literal(Constant(c.sourceName)).withSpan(span)
-      ref(EvalRewriteTyped.bindVarSym)
-        .appliedTo(nameLit, varRef)
-        .withSpan(span)
+      discardUses:
+        ref(EvalRewriteTyped.bindVarSym)
+          .appliedTo(nameLit, varRef)
+          .withSpan(span)
 
   end EvalRewriteTransformer
 
