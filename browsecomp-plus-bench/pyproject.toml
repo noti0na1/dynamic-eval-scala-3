@@ -1,0 +1,36 @@
+[project]
+name = "browsecomp-plus-bench"
+version = "0.1.0"
+description = "BrowseComp-Plus deep-research benchmark harness for the Scala 3 `agent` primitive (retriever shim, recall check, LLM judge)."
+# Pinned to 3.12: the published faiss-cpu / corpus-index toolchain is proven on
+# it, and `.python-version` makes `uv` auto-fetch a managed CPython 3.12 if the
+# host lacks one. Bump deliberately, not implicitly.
+requires-python = ">=3.12,<3.13"
+
+# Runtime dependencies — everything imported by retriever_server.py,
+# check_recall.py, and evaluate.py. (pyarrow + tqdm used to come in only
+# transitively via `datasets`; they're declared here so the bench env stands
+# alone even without the one-time `setup` group.)
+dependencies = [
+    "numpy",
+    "faiss-cpu",
+    "pyarrow",      # retriever_server.py: read corpus parquet
+    "flask",        # retriever_server.py: HTTP shim
+    "openai",       # query embedding + LLM judge (OpenAI-compatible)
+    "tqdm",         # progress bars in check_recall.py / evaluate.py
+]
+
+# One-time data-prep tooling: the README setup steps that decrypt the dataset
+# and `snapshot_download` the 8B index + corpus. Not needed to run/judge the
+# bench, so they're an opt-in group: `uv sync --group setup`.
+[dependency-groups]
+setup = [
+    "datasets",
+    "huggingface_hub",
+]
+
+[tool.uv]
+# This dir is a collection of standalone scripts, not an installable package —
+# tell uv to provision the dependencies into .venv without trying to build the
+# project itself.
+package = false

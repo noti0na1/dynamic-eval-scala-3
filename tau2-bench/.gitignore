@@ -1,0 +1,43 @@
+### Python ###
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+### Bench-specific ###
+
+# Secrets — never commit the real key file. env.example.sh is the template.
+env.sh
+
+# Upstream tau2-bench clone (installed editable via `uv pip install -e ./upstream`)
+upstream/
+
+# Per-run agent outputs (one JSON + trace folder per task)
+runs/
+evals/
+
+# Per-run REPL eval logs (-Xrepl-eval-log-dir) + shard logs, passed per run
+log/
+
+# REPL transcript (-Xrepl-history-file). The conversation harness reads it back as
+# the agent's cross-turn memory (AGENT_REPL_HISTORY=on); per-run copies live under
+# log/ (already ignored). Never commit it.
+session.repl
+
+# scala-cli build artifacts
+.scala-build/
+.bsp/
