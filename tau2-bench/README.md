@@ -39,8 +39,9 @@ customer-service suites, **user tools** (dual-control — e.g. telecom — handl
 | `banking_knowledge` | ❌ | RAG / knowledge-base domain. Its environment build pulls in the BM25 retrieval pipeline (`rank_bm25` + knowledge extras), which isn't installed — so `gen_tools.py` can't read its schemas and there is **no committed facade**. Enable with `uv pip install rank_bm25` then `./regen_facades.sh banking_knowledge`. |
 
 Each runnable domain has a FIXED typed facade in `facades/<Domain>.scala`;
-`run_bench.sh` picks it by domain and `runBench` asserts the loaded facade's
-`facadeDomain` matches, so the agent's prompt always lists that domain's tools.
+`run_bench.sh` picks it by domain and the orchestrator (`facadeInfo()`) asserts the
+loaded facade's `facadeDomain` matches, so the agent's prompt always lists that
+domain's tools.
 
 ## What's a task
 
@@ -84,7 +85,7 @@ repl_bench.py  (orchestrator — owns the conversation loop)
   │  end of task: /reward + /trace ─► reward + full trajectory
   ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  tau2_server.py           http://127.0.0.1:8771                     │
+│  tau2_server.py           http://127.0.0.1:8881                     │
 │  AgentGymEnv(domain, task_id)   ── tau2 orchestrator in a bg thread: │
 │    /reset ─► opening user message + policy + tools_info             │
 │    /step  ─► respond (to LLM user simulator) OR tool call (mock DB)  │
@@ -157,7 +158,8 @@ source .venv/bin/activate
 # Clone the upstream benchmark and install it editable (with the gym interface)
 git clone --depth 1 https://github.com/sierra-research/tau2-bench upstream
 uv pip install -e "./upstream[gym]"
-uv pip install flask
+uv pip install flask waitress   # waitress = production WSGI server (tau2_server.py);
+                                # the flask dev server wedges under many parallel shards
 
 cp env.example.sh env.sh        # fill in the agent + user-simulator base_url/key/model
 ```

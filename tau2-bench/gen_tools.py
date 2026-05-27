@@ -19,6 +19,7 @@ The output is pure Scala on stdout (logs go to stderr), so redirect to a file.
 """
 
 import argparse
+import os
 import re
 import sys
 
@@ -150,6 +151,19 @@ def case_class_def(name: str, model: dict) -> str:
     return f"case class {name}({', '.join(fields)})"
 
 
+def read_guidance(domain: str) -> str:
+    """Per-domain prompt guidance (hand-written tactics distilled from failure
+    traces), kept in facades/guidance/<domain>.md so it survives regeneration and
+    is easy to edit. Emitted into the facade as `val domainGuidance` and injected
+    into the agent prompt by Tau.tauStep. Empty when no file exists."""
+    path = os.path.join(os.path.dirname(__file__), "facades", "guidance", f"{domain}.md")
+    try:
+        with open(path) as fp:
+            return fp.read().strip()
+    except FileNotFoundError:
+        return ""
+
+
 def gen(domain: str) -> str:
     global MODELS
     schemas = get_schemas(domain)
@@ -172,6 +186,18 @@ def gen(domain: str) -> str:
         f'val facadeDomain: String = "{domain}"',
         "",
     ]
+
+    # Hand-written, regeneration-safe per-domain guidance (facades/guidance/<domain>.md),
+    # injected into the agent prompt by Tau.tauStep alongside the common instructions.
+    guidance = read_guidance(domain)
+    if guidance:
+        out.append("/** Per-domain prompt guidance — see facades/guidance/" + domain + ".md. */")
+        out.append("val domainGuidance: String =")
+        out.append('  """' + guidance + '"""')
+    else:
+        out.append('val domainGuidance: String = ""')
+    out.append("")
+
     type_doc = []
     if MODELS:
         out.append("// --- data types for structured tool parameters ---")

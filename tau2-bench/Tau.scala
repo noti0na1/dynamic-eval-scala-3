@@ -221,7 +221,11 @@ end Tau
  *  next message — so the agent must NOT loop or message the customer itself.
  *  `toolsDoc` is the domain's `domainToolsDoc`; `customerMessage` is the LATEST
  *  message to answer this turn. */
-def tauStep(domain: String, policy: String, toolsDoc: String, customerMessage: String): String =
+def tauStep(domain: String, policy: String, toolsDoc: String, guidance: String, customerMessage: String): String =
+  val guidanceBlock =
+    if guidance.trim.isEmpty then ""
+    else s"\n\nDOMAIN-SPECIFIC GUIDANCE for $domain — hard-won tactics distilled from " +
+      s"prior runs.\nThey REFINE, never override, the policy above; apply them when relevant:\n$guidance"
   s"""You are a customer-service agent for a $domain company in a live chat with
      |one customer, handling ONE turn. Follow the company policy EXACTLY and use
      |ONLY the in-scope Scala tool functions listed below. Produce your SINGLE next
@@ -266,7 +270,7 @@ def tauStep(domain: String, policy: String, toolsDoc: String, customerMessage: S
      |
      |COMPANY POLICY — follow it to the letter; it governs what you may and may not
      |do, and what you MUST confirm with the customer before doing:
-     |$policy
+     |$policy$guidanceBlock
      |
      |HOW TO HANDLE THIS TURN:
      |  - Authenticate the customer first if the policy requires it; never reveal or
@@ -277,6 +281,19 @@ def tauStep(domain: String, policy: String, toolsDoc: String, customerMessage: S
      |    exchange, ...) the policy requires explicit customer confirmation: take the
      |    action ONLY if the customer's confirmation is ALREADY visible in the
      |    transcript; otherwise state the exact change and ask for it in your reply.
+     |  - If that confirmation IS already visible, do NOT re-ask — call the action tool
+     |    THIS turn. After any state-changing call, READ its result: if it starts with
+     |    "Error", do NOT tell the customer it succeeded; fix the arguments and retry,
+     |    or report the real outcome.
+     |  - DUAL CONTROL: in some domains (e.g. telecom) the CUSTOMER performs actions
+     |    on their OWN device/account — toggling a setting, granting a permission,
+     |    restarting, reading a code off the screen. Your tools read state and make
+     |    account-side changes; device-side steps are done BY THE CUSTOMER on your
+     |    instruction. So GUIDE them step-by-step ("open Settings > ..., turn X on,
+     |    then tell me when done") and continue once they confirm. NEVER tell the
+     |    customer you "lack remote access" or "can't do that" and give up —
+     |    instructing them IS how you do it. Do NOT `transferToHumanAgents` or
+     |    `done()` merely because a step happens on the customer's device.
      |  - Take the required action and tell the customer the outcome on the SAME turn
      |    (so they're informed before the chat ends).
      |  - ENDING: once everything the customer asked for is handled, give your final
@@ -295,17 +312,22 @@ def tauStep(domain: String, policy: String, toolsDoc: String, customerMessage: S
      |      eval compiler ("cannot reach outer ..."). Hold structured data in tuples
      |      (`val o = (id, status, total)`, then `o._1` or destructure), or just read
      |      fields straight off the ujson value when you need them.
-     |    • Keep the reply a plain String. Do NOT use `%`/`%.2f` formatting (write
-     |      plain numbers like 12.50), fancy unicode (bullets, ellipses, smart quotes,
+     |    • Keep the reply a plain String. To put a VALUE into the reply, use an
+     |      s-string with `$${...}`, e.g. `s"Your total is $${total} dollars ($${pct}% off)."`
+     |      — the `s` prefix is REQUIRED: without it, `"...$${total}..."` sends the
+     |      customer the LITERAL text `$${total}`. Do NOT use `%`/`%.2f` `f"..."`
+     |      formatting (write plain numbers like 12.50; a literal `%` inside an
+     |      `s"..."` is fine), fancy unicode (bullets, ellipses, smart quotes,
      |      non-breaking hyphens), or heavy markdown templates — they break Scala
-     |      string literals. Prefer a short `s"..."`; build a longer reply by
+     |      string literals or leak into the reply. Build a longer reply by
      |      concatenating simple `s"..."` pieces.
      |  - A tool result String may be JSON or a plain value (id / status /
      |    "Error: ..."). Only `ujson.read(...)` it when it starts with `{`/`[`;
      |    otherwise use the raw String as-is. From a parsed value, read fields with
      |    `j("k").str` / `.num` / `.arr` / `.obj` (coerce before any collection op).
      |    Do NOT wrap a read in a try/catch that turns a SUCCESSFUL non-JSON result
-     |    into a "not found".
+     |    into a "not found". Reply in plain prose — NEVER paste raw tool JSON or an
+     |    `"Error: ..."` string as your message to the customer.
      |  - You MAY use a focused recursive `agent[T2]("...")` for a sub-decision (e.g.
      |    `agent[Boolean]` to judge whether the customer just confirmed) — always pin
      |    a concrete `T2`.

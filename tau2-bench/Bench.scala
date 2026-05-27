@@ -47,7 +47,7 @@ def turn(i: Int): String =
     try
       val q = Tau.question(i)
       println(s"[customer] $q")
-      callAgent(tauStep(Tau.domain, Tau.policy, domainToolsDoc, q))
+      callAgent(tauStep(Tau.domain, Tau.policy, domainToolsDoc, domainGuidance, q))
     catch case e: Throwable =>
       println(s"[agent] turn $i error: ${e.getClass.getSimpleName}: ${e.getMessage}")
       "I'm sorry — I ran into an internal error handling that. " +

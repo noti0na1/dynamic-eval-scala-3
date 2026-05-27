@@ -26,8 +26,10 @@ Endpoints (POST JSON in/out, except /health):
   POST /tasks   {domain}                    -> {domain, num_tasks, task_ids}
   POST /reset   {domain, task_index|task_id}-> {session_id, observation, policy,
                                                 tools_info, num_tasks, task_id}
-  POST /step    {session_id, name, kwargs}  -> {observation, reward, done}
+  POST /step    {session_id, name, kwargs}  -> {observation, obs_role, reward, done}
                   name=="respond" -> message (kwargs.content); else a tool call.
+                  obs_role is the role of the observation ('user'/'tool'/'assistant'):
+                  after a respond it should be 'user' (the customer's reply).
   POST /reward  {session_id}                -> {reward}   (forces finish if needed)
   POST /trace   {session_id}                -> {messages, termination_reason,
                                                 duration, reward_info}
@@ -116,7 +118,7 @@ def _rerouted_completion(*args, **kwargs):
     return _orig_completion(*args, **kwargs)
 _llm_utils.completion = _rerouted_completion
 
-MAX_STEPS = int(os.getenv("TAU2_MAX_STEPS", "100"))
+MAX_STEPS = int(os.getenv("TAU2_MAX_STEPS", "200"))  # match tau2 official DEFAULT_MAX_STEPS
 SOLO_MODE = os.getenv("TAU2_SOLO_MODE", "0").lower() in ("1", "true", "on", "yes")
 
 sessions = {}  # session_id -> AgentGymEnv
@@ -130,15 +132,18 @@ def task_ids(domain):
     return [t.id for t in registry.get_tasks_loader(domain)()]
 
 
-def clean_obs(obs):
-    """Strip the leading 'role: ' tag tau2 prepends to a single-turn observation
-    ('user: ...', 'tool: ...', 'assistant: ...') so the agent sees clean text."""
+def split_role(obs):
+    """Split tau2's 'role: ...' observation tag into (role, content). tau2 prepends
+    the role of the observation's last message ('user'/'tool'/'assistant'); we
+    return the role so the orchestrator can tell a customer reply ('user') from a
+    trailing tool/assistant message. (role is None when there's no known prefix.)"""
     if not isinstance(obs, str):
-        return obs
-    for p in ("tool: ", "user: ", "assistant: "):
+        return None, obs
+    for role in ("tool", "user", "assistant"):
+        p = f"{role}: "
         if obs.startswith(p):
-            return obs[len(p):]
-    return obs
+            return role, obs[len(p):]
+    return None, obs
 
 
 app = Flask(__name__)
@@ -180,7 +185,7 @@ def reset():
     return jsonify(
         session_id=sid,
         task_id=tid,
-        observation=clean_obs(observation),
+        observation=split_role(observation)[1],
         policy=info["policy"],
         tools_info=[t.openai_schema for t in info["tools"]],
         num_tasks=len(ids),
@@ -200,7 +205,9 @@ def step():
     else:
         action = json.dumps({"name": name, "arguments": kwargs})
     observation, reward, terminated, truncated, _info = env.step(action)
-    return jsonify(observation=clean_obs(observation), reward=reward, done=terminated)
+    obs_role, obs_text = split_role(observation)
+    return jsonify(observation=obs_text, obs_role=obs_role,
+                   reward=reward, done=terminated)
 
 
 def _force_finish(env):
@@ -222,8 +229,15 @@ def reward():
     if env is None:
         return jsonify(error="unknown session"), 404
     _force_finish(env)
-    r, _info = env._get_reward()
-    return jsonify(reward=r)
+    r, info = env._get_reward()
+    # info is a JSON string of tau2's RewardInfo (db_check / action_checks /
+    # nl_assertions / communicate_checks / reward_breakdown) — the per-task
+    # failure attribution. Parse it so it lands structured in the run file.
+    try:
+        info = json.loads(info) if isinstance(info, str) else info
+    except Exception:
+        info = None
+    return jsonify(reward=r, reward_info=info)
 
 
 @app.post("/trace")
@@ -255,11 +269,24 @@ def close():
 
 
 def main():
+    # Serve with waitress (a production WSGI server), NOT flask's dev server: under
+    # many parallel shards the dev server can silently WEDGE (a respond /step blocks
+    # on the user-sim LLM, holding a worker the whole time). threads must comfortably
+    # exceed the shard count so concurrent /step calls don't queue. Falls back to the
+    # dev server if waitress isn't installed (then keep parallelism low, < ~8).
+    threads = int(os.getenv("TAU2_SERVER_THREADS", "64"))
     log(
         f"serving on http://127.0.0.1:{TAU2_PORT} "
-        f"(user_llm={USER_LLM} @ {USER_BASE_URL}, max_steps={MAX_STEPS}, solo={SOLO_MODE})"
+        f"(user_llm={USER_LLM} @ {USER_BASE_URL}, max_steps={MAX_STEPS}, "
+        f"solo={SOLO_MODE}, threads={threads})"
     )
-    app.run(host="127.0.0.1", port=TAU2_PORT, threaded=True)
+    try:
+        from waitress import serve
+        serve(app, host="127.0.0.1", port=TAU2_PORT, threads=threads)
+    except ImportError:
+        log("WARNING: waitress not installed; using flask dev server "
+            "(keep parallel shards below ~8 to avoid wedging)")
+        app.run(host="127.0.0.1", port=TAU2_PORT, threaded=True)
 
 
 if __name__ == "__main__":

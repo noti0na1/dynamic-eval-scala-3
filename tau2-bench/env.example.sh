@@ -31,13 +31,20 @@ export TAU2_USER_MODEL="REPLACE_ME"         # e.g. gpt-4.1, deepseek-chat, ...
 export TAU2_USER_TEMPERATURE="0.0"
 
 # --- tau2-bench gym shim (tau2_server.py) -------------------------------------
-export TAU2_SERVER_URL="http://127.0.0.1:8771"
-export TAU2_PORT="8771"
+export TAU2_SERVER_URL="http://127.0.0.1:8881"
+export TAU2_PORT="8881"
 export TAU2_MAX_STEPS="100"
+# Waitress worker threads — keep comfortably above your shard count so concurrent
+# /step calls (a respond blocks on the user-sim LLM) don't queue.
+# export TAU2_SERVER_THREADS="64"
 # export TAU2_SOLO_MODE="1"                 # solo mode (no user) for telecom etc.
 
-# --- orchestrator (repl_bench.py) caps ----------------------------------------
+# --- caps ---------------------------------------------------------------------
+# orchestrator (repl_bench.py):
 # export TAU_MAX_TURNS="40"                 # cap on customer turns per task
 # export TAU_TURN_TIMEOUT="300"             # idle secs before a turn is deemed stuck
 # export TAU_READY_TIMEOUT="400"            # secs to wait for first compile + :load
-# export TAU_MAX_TOOL_CALLS="300"           # cap on backend tool calls per task
+# backend tool-call caps (Tau.scala): one PER TURN (bounds a single turn's retry
+# storm so it can't exhaust tau2's max_steps), one PER TASK (cumulative):
+# export TAU_MAX_TURN_TOOL_CALLS="50"       # cap on backend tool calls per TURN
+# export TAU_MAX_TOOL_CALLS="500"           # cap on backend tool calls per TASK

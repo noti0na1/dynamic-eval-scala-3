@@ -34,7 +34,10 @@ object LLMChat:
       //                       (DeepSeek / GLM / Qwen3.6 / Gemini)
       //   "enable_thinking" → a single enable_thinking:true flag, no effort knob
       //                       (Qwen3.5-flash and similar)
-      defaultThinkingStyle: String = "effort"
+      defaultThinkingStyle: String = "effort",
+      // Sampling temperature; None omits it (provider default). The official
+      // tau2 agent uses 0.0 — set AGENT_TEMPERATURE to match (see fromEnv).
+      defaultTemperature: Option[Double] = None
   ):
 
     def chat(prompt: String): String =
@@ -46,6 +49,7 @@ object LLMChat:
         thinking: Boolean = defaultThinking,
         effort: String = defaultEffort,
         thinkingStyle: String = defaultThinkingStyle,
+        temperature: Option[Double] = defaultTemperature,
         stream: Boolean = false
     ): String =
       val body = ujson.Obj(
@@ -54,6 +58,9 @@ object LLMChat:
           ujson.Obj("role" -> m.role, "content" -> m.content))*),
         "stream"   -> stream
       )
+      // Greedy decoding when requested (official tau2 default). Providers that
+      // ignore temperature for reasoning models simply drop it.
+      temperature.foreach(t => body("temperature") = ujson.Num(t))
       // Off by default → a plain OpenAI body. The on-encoding is provider-specific:
       // most providers take `reasoning_effort` plus a `thinking` object, while
       // Qwen3.5-flash toggles a single `enable_thinking` flag with no effort knob
@@ -100,12 +107,13 @@ object LLMChat:
       model: String = "gpt-4o-mini",
       thinking: Boolean = false,
       effort: String = "high",
-      thinkingStyle: String = "effort"
+      thinkingStyle: String = "effort",
+      temperature: Option[Double] = None
   ): Client =
     val http = HttpClient.newBuilder()
       .connectTimeout(Duration.ofSeconds(30))
       .build()
-    Client(apiKey, baseUrl, model, http, thinking, effort, thinkingStyle)
+    Client(apiKey, baseUrl, model, http, thinking, effort, thinkingStyle, temperature)
 
   /** Build a client from an env var, defaulting to OpenAI. `thinking`/`effort`
    *  become the client's reasoning defaults. */
@@ -115,11 +123,12 @@ object LLMChat:
       model: String = "gpt-4o-mini",
       thinking: Boolean = false,
       effort: String = "high",
-      thinkingStyle: String = "effort"
+      thinkingStyle: String = "effort",
+      temperature: Option[Double] = None
   ): Client =
     val key = sys.env.getOrElse(envVar,
       throw IllegalStateException(s"$envVar not set"))
-    apply(key, baseUrl, model, thinking, effort, thinkingStyle)
+    apply(key, baseUrl, model, thinking, effort, thinkingStyle, temperature)
 
 end LLMChat
 
@@ -288,7 +297,10 @@ private val client = LLMChat.fromEnv(
   model         = sys.env.getOrElse("AGENT_MODEL", "deepseek-v4-flash"),
   thinking      = envFlag("AGENT_THINKING"),
   effort        = sys.env.getOrElse("AGENT_EFFORT", "high"),
-  thinkingStyle = sys.env.getOrElse("AGENT_THINKING_STYLE", "effort")
+  thinkingStyle = sys.env.getOrElse("AGENT_THINKING_STYLE", "effort"),
+  // Official tau2 agent uses temperature 0.0; set AGENT_TEMPERATURE to match.
+  // Unset -> omitted (provider default). Reasoning providers may ignore it.
+  temperature   = sys.env.get("AGENT_TEMPERATURE").map(_.trim.toDouble)
 )
 
 def chat(prompt: String): String =
@@ -422,10 +434,10 @@ def agentSafe[T](
     // That's an infrastructure failure, not a code problem, so we retry the
     // SAME prompt (without feeding the error back to the model) and only
     // rethrow once out of attempts.
+    val msgs = LLMChat.Message("system", system) +: history :+ LLMChat.Message("user", user)
+    AgentPromptLog.dump(msgs)
     val codeOrErr: Either[Throwable, String] =
-      try Right(AgentPrompt.stripCodeFences(
-        chat(LLMChat.Message("system", system) +: history :+ LLMChat.Message("user", user))
-      ).trim)
+      try Right(AgentPrompt.stripCodeFences(chat(msgs)).trim)
       catch case NonFatal(e) => Left(e)
 
     codeOrErr match
@@ -466,6 +478,26 @@ def agentSafe[T](
 
   try attempt(1, "", Nil)
   finally AgentDepth.exit()
+
+/** Optional dump of each agent LLM call's full prompt (system + ancestor chain +
+ *  user message) to AGENT_PROMPT_LOG_DIR, one file per call. Off unless that env
+ *  is set; the tau2 bench points it at the per-shard eval-log dir so dumps flow
+ *  into each task's trace. Best-effort — logging must never break a call. */
+private object AgentPromptLog:
+  private val dir = sys.env.get("AGENT_PROMPT_LOG_DIR").map(_.trim).filter(_.nonEmpty)
+  private val seq = java.util.concurrent.atomic.AtomicLong(0L)
+  def dump(messages: Seq[LLMChat.Message]): Unit =
+    dir.foreach { d =>
+      try
+        val p = java.nio.file.Paths.get(
+          d, s"prompt_${System.currentTimeMillis()}_${seq.incrementAndGet()}.txt")
+        val sb = StringBuilder()
+        messages.foreach(m =>
+          sb.append("===== ").append(m.role).append(" =====\n")
+            .append(m.content).append("\n\n"))
+        java.nio.file.Files.writeString(p, sb.toString)
+      catch case scala.util.control.NonFatal(_) => ()
+    }
 
 private object AgentPrompt:
 
@@ -616,10 +648,11 @@ private object AgentPrompt:
   private def historySection(replHistory: String): String =
     if replHistory.isEmpty then ""
     else
-      s"""Recent REPL session transcript (most-recent at the bottom; this
-         |is what the user has been doing in the session BEFORE the current
-         |request — use it to pick conventions, refer to vals/defs they
-         |defined, and align with their working style):
+      s"""Recent REPL session transcript (most-recent at the bottom) — the session
+         |so far BEFORE the current request: earlier inputs, the results they
+         |produced, and any printed output. Use it to avoid redoing work, to refer
+         |to vals/defs already in scope, and to stay consistent with what is already
+         |established:
          |```
          |$replHistory
          |```""".stripMargin

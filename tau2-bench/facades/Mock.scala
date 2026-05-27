@@ -6,6 +6,8 @@
 
 val facadeDomain: String = "mock"
 
+val domainGuidance: String = ""
+
 /** Create a new task for a user. */
 def createTask(userId: String, title: String, description: Option[String] = None): String =
   val args = ujson.Obj()

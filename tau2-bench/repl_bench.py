@@ -38,7 +38,11 @@ the common case.
 
 Config (env; see env.example.sh / run_bench.sh):
   BENCH_DOMAIN BENCH_N BENCH_START   slice of tasks to run
+  BENCH_TASK_INDICES                 explicit comma-sep indices (overrides the
+                                     slice; used by rerun_failed.sh to backfill)
   BENCH_RUN_ID                       runs/<id>/ output dir
+  BENCH_NUM_TRIALS                   run each task N times (default 1); files are
+                                     <domain>-<i>.t<n>.json. evaluate.py -k N -> pass^N
   EVAL_LOG_DIR                       per-shard eval-log + history dir
   TAU_FACADE                         facades/<Domain>.scala (co-loaded)
   AGENT_FILE                         shared Agent.scala (default ../browsecomp-...)
@@ -46,6 +50,8 @@ Config (env; see env.example.sh / run_bench.sh):
   AGENT_MODEL TAU2_USER_MODEL        recorded into run-file metadata
   TAU_MAX_TURNS                      cap on customer turns per task (default 40)
   TAU_TURN_TIMEOUT                   idle seconds before a turn is deemed stuck
+  TAU_TURN_HARD_TIMEOUT              hard wall-clock cap per turn (default 900s) —
+                                     bounds a chatty runaway the idle timer can't catch
   TAU_READY_TIMEOUT                  seconds to wait for first compile + :load
 """
 
@@ -100,7 +106,8 @@ class Tau2Client:
                                     "kwargs": {}})
 
     def reward(self, session_id):
-        return self._post("/reward", {"session_id": session_id})["reward"]
+        # Full response: {"reward": float, "reward_info": {...}} (tau2 RewardInfo).
+        return self._post("/reward", {"session_id": session_id})
 
     def trace(self, session_id):
         return self._post("/trace", {"session_id": session_id})
@@ -267,17 +274,29 @@ class Repl:
         self._drain_to_prompt(30)
         self.cmd('Tau.ping("ready")', "__TAU_PONG__ready", 60)
 
-    def run_turn(self, i, idle_timeout, resends=3):
+    def run_turn(self, i, idle_timeout, hard_timeout=None, resends=3):
         """Feed `turn(i)` and wait for its done sentinel. Re-send only if the
         command was corrupted BEFORE it started executing (safe: it never ran);
-        if it started but then stalls, raise ReplDied so the caller restarts."""
+        if it started but then stalls, raise ReplDied so the caller restarts.
+
+        Two independent bounds once the turn is executing: `idle_timeout` (no
+        output for that long) AND `hard_timeout` (total wall-clock, regardless of
+        output). The hard cap is essential because a *chatty* runaway (a loop that
+        keeps emitting [tool]/[agent] lines, or repeated agent[...] calls) resets
+        the idle timer on every line and would otherwise never trip it."""
         sentinel = f"__TAU_TURN_DONE__{i}"
         for attempt in range(resends):
             self._raw(f"turn({i})")
             started = False
             last = time.time()
+            exec_start = last
             while True:
-                if time.time() - last > idle_timeout:
+                now = time.time()
+                if started and hard_timeout and now - exec_start > hard_timeout:
+                    raise ReplDied(
+                        f"turn({i}) exceeded hard {hard_timeout:.0f}s wall cap "
+                        f"(runaway code that keeps emitting output)")
+                if now - last > idle_timeout:
                     if started:
                         raise ReplDied(f"turn({i}) stalled after starting")
                     log(f"repl: turn({i}) no output (attempt {attempt + 1}); re-sending")
@@ -379,6 +398,11 @@ def main():
     domain = os.getenv("BENCH_DOMAIN", "retail")
     n = int(os.getenv("BENCH_N", "10"))
     start = int(os.getenv("BENCH_START", "0"))
+    # Explicit, possibly non-contiguous task indices (comma-separated) override the
+    # [start, start+n) slice — used by rerun_failed.sh to backfill missing tasks.
+    indices_env = os.getenv("BENCH_TASK_INDICES", "").strip()
+    indices = ([int(x) for x in indices_env.split(",") if x.strip()]
+               if indices_env else list(range(start, start + n)))
     run_id = os.getenv("BENCH_RUN_ID", "lacuna")
     eval_log_dir = Path(os.getenv("EVAL_LOG_DIR", "log")).resolve()
     facade = os.getenv("TAU_FACADE")
@@ -388,7 +412,14 @@ def main():
     user_model = os.getenv("TAU2_USER_MODEL", "unknown")
     max_turns = int(os.getenv("TAU_MAX_TURNS", "40"))
     turn_timeout = float(os.getenv("TAU_TURN_TIMEOUT", "300"))
+    # Hard per-turn wall-clock cap (regardless of output) — bounds a chatty
+    # runaway that the idle timeout above can't catch. Generous so legitimate
+    # long turns (thinking + many tool calls) aren't killed.
+    turn_hard_timeout = float(os.getenv("TAU_TURN_HARD_TIMEOUT", "900"))
     ready_timeout = float(os.getenv("TAU_READY_TIMEOUT", "400"))
+    # Run each task this many times (fresh session + history each time). pass^1 is
+    # the mean over trials (headline); evaluate.py also derives pass^k. Default 1.
+    num_trials = int(os.getenv("BENCH_NUM_TRIALS", "1"))
 
     if not facade or not Path(facade).is_file():
         sys.exit(f"repl_bench: TAU_FACADE not set or missing: {facade!r}")
@@ -401,13 +432,20 @@ def main():
     turns_root = run_dir / "turns"
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    # Cap each REPL JVM's heap so many shards (e.g. 16) don't over-subscribe RAM;
+    # without this scala-cli lets each JVM default to ~25% of physical memory.
+    repl_xmx = os.getenv("REPL_XMX", "4g")
     scala_cmd = [
         "scala-cli", "repl", "--server=false",
+        "--java-opt", f"-Xmx{repl_xmx}",
         "-O", "-color:never",   # plain output -> clean sentinel/prompt matching
         "-O", f"-Xrepl-eval-log-dir:{eval_log_dir}/",
         "-O", f"-Xrepl-history-file:{history_file}",
         agent_file, "Tau.scala", facade,
     ]
+    # Agent.scala dumps each LLM call's full prompt here (so it flows into the
+    # per-task trace dir alongside the generated code). Same dir as the eval log.
+    os.environ["AGENT_PROMPT_LOG_DIR"] = str(eval_log_dir)
 
     tau = Tau2Client(server_url)
     repl = Repl(scala_cmd, str(cwd))
@@ -445,14 +483,18 @@ def main():
     log(f"facade ok: {fac['line']}  | domain={domain} run_id={run_id}")
 
     ok = 0
-    for idx in range(start, start + n):
+    # Flat (task, trial) work list so a REPL restart resumes at the next unit.
+    work = [(idx, t) for idx in indices for t in range(num_trials)]
+    for idx, trial in work:
+        label = f"{domain}-{idx}" + (f" (trial {trial})" if num_trials > 1 else "")
         try:
             run_one(tau, repl, domain, idx, run_id, run_dir, trace_root, turns_root,
                     eval_log_dir, agent_model, user_model,
-                    max_turns, turn_timeout, ready_timeout)
+                    max_turns, turn_timeout, ready_timeout, trial, num_trials,
+                    turn_hard_timeout)
             ok += 1
         except (ReplDied, ReplError) as e:
-            log(f"task {domain}-{idx}: REPL failure ({e}); restarting REPL")
+            log(f"task {label}: REPL failure ({e}); restarting REPL")
             try:
                 repl.restart()
                 repl.handshake(ready_timeout)
@@ -460,17 +502,21 @@ def main():
                 log(f"REPL restart failed: {e2}; aborting shard")
                 break
         except Exception as e:
-            log(f"task {domain}-{idx} errored: {type(e).__name__}: {e}")
+            log(f"task {label} errored: {type(e).__name__}: {e}")
 
     repl.close()
-    log(f"completed {ok}/{n} tasks ({domain}, offset {start}) -> runs/{run_id}/")
+    log(f"completed {ok}/{len(work)} runs ({domain}, {num_trials} trial(s)) -> runs/{run_id}/")
 
 
 def run_one(tau, repl, domain, idx, run_id, run_dir, trace_root, turns_root,
             eval_log_dir, agent_model, user_model,
-            max_turns, turn_timeout, ready_timeout):
+            max_turns, turn_timeout, ready_timeout, trial=0, num_trials=1,
+            turn_hard_timeout=900):
     task_key = f"{domain}-{idx}"
-    log(f"=== task {task_key} ===")
+    # Per-trial key so trials don't clobber each other's files/dirs; the run file
+    # still records task_id, so evaluate.py groups trials per task for pass^k.
+    run_key = task_key if num_trials <= 1 else f"{task_key}.t{trial}"
+    log(f"=== task {run_key} ===")
     started_at = datetime.now(timezone.utc)
     t0 = time.time()
 
@@ -481,7 +527,7 @@ def run_one(tau, repl, domain, idx, run_id, run_dir, trace_root, turns_root,
     first_msg = info.get("observation", "") or ""
     policy = info.get("policy", "") or ""
 
-    turn_dir = turns_root / task_key
+    turn_dir = turns_root / run_key
     turn_dir.mkdir(parents=True, exist_ok=True)
     policy_file = turn_dir / "policy.txt"
     policy_file.write_text(policy, encoding="utf-8")
@@ -506,7 +552,7 @@ def run_one(tau, repl, domain, idx, run_id, run_dir, trace_root, turns_root,
     i = 0
     while not convo_done and i < max_turns:
         (turn_dir / f"{i}.q.txt").write_text(question, encoding="utf-8")
-        repl.run_turn(i, turn_timeout)
+        repl.run_turn(i, turn_timeout, turn_hard_timeout)
         reply_obj = json.loads((turn_dir / f"{i}.r.json").read_text(encoding="utf-8"))
         reply = reply_obj.get("reply", "")
         agent_done = bool(reply_obj.get("agent_done"))
@@ -515,6 +561,16 @@ def run_one(tau, repl, domain, idx, run_id, run_dir, trace_root, turns_root,
         step = tau.respond(session_id, reply)
         question = step.get("observation", "") or ""
         convo_done = bool(step.get("done"))
+
+        # Guard against a tau2 gym quirk: when a turn ends right after tool calls
+        # (e.g. it errored), the respond step's observation can come back as the
+        # trailing tool/assistant message instead of the customer's reply. Never
+        # feed that as the next turn's customer message — end the task instead
+        # (reward/trace below still score whatever happened).
+        if not convo_done and step.get("obs_role") in ("tool", "assistant"):
+            log(f"turn {i}: respond observation role={step.get('obs_role')!r} "
+                f"(not a customer reply); ending task")
+            convo_done = True
 
         if agent_done:
             # the agent resolved the task: its reply was delivered above; now end
@@ -525,8 +581,11 @@ def run_one(tau, repl, domain, idx, run_id, run_dir, trace_root, turns_root,
         i += 1
 
     # 4-5. authoritative reward + full trajectory from tau2 (forces a clean finish).
+    reward_info = None
     try:
-        reward = float(tau.reward(session_id))
+        rr = tau.reward(session_id)
+        reward = float(rr.get("reward", 0.0))
+        reward_info = rr.get("reward_info")  # tau2 RewardInfo: which check failed
     except Exception as e:
         log(f"reward failed: {e}")
         reward = 0.0
@@ -558,7 +617,7 @@ def run_one(tau, repl, domain, idx, run_id, run_dir, trace_root, turns_root,
     eval_rounds = sum(1 for f in new_logs if f.endswith("_wrapper.scala"))
 
     # trace dir: captured stdout + this task's generated-code rounds.
-    qtrace = trace_root / task_key
+    qtrace = trace_root / run_key
     qtrace.mkdir(parents=True, exist_ok=True)
     (qtrace / "progress.log").write_text(progress, encoding="utf-8")
     for f in new_logs:
@@ -575,6 +634,9 @@ def run_one(tau, repl, domain, idx, run_id, run_dir, trace_root, turns_root,
         "metadata": {
             "model": agent_model,
             "user_model": user_model,
+            "thinking": os.getenv("AGENT_THINKING", ""),
+            "temperature": os.getenv("AGENT_TEMPERATURE", ""),
+            "num_trials": num_trials,
             "started_at": started_at.isoformat(),
             "ended_at": ended_at.isoformat(),
             "duration_sec": round(time.time() - t0, 3),
@@ -585,15 +647,17 @@ def run_one(tau, repl, domain, idx, run_id, run_dir, trace_root, turns_root,
         },
         "task_id": task_id,
         "task_key": task_key,
+        "trial": trial,
         "domain": domain,
         "task_index": idx,
         "first_user_message": first_msg,
         "status": "completed",
         "reward": reward,
+        "reward_info": reward_info,
         "tool_call_counts": counts,
         "result": result,
     }
-    out_path = run_dir / f"{task_key}.json"
+    out_path = run_dir / f"{run_key}.json"
     out_path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
     n_tools = sum(counts.values())
     log(f"task {task_key} done -> runs/{run_id}/{task_key}.json "
