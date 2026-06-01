@@ -200,6 +200,7 @@ class Namer { typer: Typer =>
       || flags.isOneOf(Synthetic | Accessor | CaseAccessor) // check the case param not the accessor
       || flags.is(Param) && ctx.owner.is(Synthetic)
       || isDollars
+      || cc.SafeRefs.allowDollarIn(name) // REPL / eval wrapper names carry a reserved `$` prefix
     if !exempt && (isModule || !name.toTermName.isInstanceOf[DerivedName]) then
       val simple = name.toSimpleName
       val max = if isModule then simple.length - 1 else simple.length

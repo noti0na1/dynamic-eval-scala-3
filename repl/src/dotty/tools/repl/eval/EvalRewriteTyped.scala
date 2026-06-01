@@ -742,7 +742,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
       val markerText = EvalBodyPlaceholder.Marker
       val sourceFile = topLevelSource
       if topLevelStart < 0 || !evalSpan.exists || sourceFile == null then return ""
-      val src = sourceFile.nn.content
+      val src = sourceFile.content
       if topLevelEnd > src.length || topLevelStart >= topLevelEnd then return ""
       val relStart = evalSpan.start - topLevelStart
       val relEnd = evalSpan.end - topLevelStart

@@ -9,6 +9,7 @@ import scala.util.control.NonFatal
 import dotty.tools.dotc.Driver
 import dotty.tools.dotc.classpath.ClassPathFactory
 import dotty.tools.dotc.core.Contexts.{Context, ContextBase, inContext}
+import dotty.tools.dotc.core.Mode
 import dotty.tools.dotc.core.Symbols.defn
 import dotty.tools.dotc.core.SymbolLoaders
 import dotty.tools.dotc.reporting.StoreReporter
@@ -107,7 +108,15 @@ class EvalCompilerBridge:
     driver.setup(settingsWithoutCp, initCtx) match
       case Some((_, ctx0)) =>
         val storeReporter = new StoreReporter(null)
+        // The inner compile is a continuation of the live REPL session:
+        // it recompiles an eval body inside a `rs$line$<uuid>$__Eval…`
+        // wrapper whose name is an `isReplWrapperName`. Run it in
+        // `Mode.Interactive` (as `ReplDriver` does for the session
+        // itself) so those reserved `$`-containing wrapper names are
+        // accepted — `SafeRefs.allowDollarIn` and `Namer.checkDefName`
+        // both exempt REPL wrapper names only in interactive mode.
         val freshCtx = ctx0.fresh
+          .addMode(Mode.Interactive)
           .setSetting(ctx0.settings.outputDir, outDir)
           .setReporter(storeReporter)
         if replOutDir != null then
