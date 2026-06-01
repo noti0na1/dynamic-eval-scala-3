@@ -945,25 +945,27 @@ Open an sbt shell (`sbt`) and run the commands below at the
 `sbt:scala3>` prompt, or pass them as a single quoted argument
 (`sbt "scala3-repl/testOnly ..."`).
 
+All eval tests live under the `dotty.tools.repl.eval` package (in
+`repl/test/dotty/tools/repl/eval/`), so a single package glob runs
+every one of them — the end-to-end REPL suites and the lower-level
+pipeline unit tests alike:
+
 ```
-# Every REPL test (includes all eval suites below)
-scala3-repl/test
-
-# All the end-to-end eval suites
-scala3-repl/testOnly *DynamicEval*
-
-# The lower-level eval pipeline unit tests
+# Every eval test (all suites in both tables below)
 scala3-repl/testOnly dotty.tools.repl.eval.*
 
 # One suite
-scala3-repl/testOnly dotty.tools.repl.DynamicEvalTests
+scala3-repl/testOnly dotty.tools.repl.eval.DynamicEvalTests
 
 # One test method (junit-interface glob on the method name)
-scala3-repl/testOnly dotty.tools.repl.DynamicEvalTests -- *returnsInt
+scala3-repl/testOnly dotty.tools.repl.eval.DynamicEvalTests -- *returnsInt
+
+# The whole REPL test suite (eval tests plus everything else)
+scala3-repl/test
 ```
 
 The eval tests are split into suites by axis. The end-to-end
-suites (in `repl/test/dotty/tools/repl/DynamicEvalTests.scala`)
+suites (in `repl/test/dotty/tools/repl/eval/DynamicEvalTests.scala`)
 drive the real REPL by feeding it source lines and asserting on
 the session output:
 
@@ -985,7 +987,8 @@ the full REPL:
 | `EvalCompilerBridgeTest`   | Splice + extract mechanics: spliced enclosing source compiles, `__Expression` is emitted, `evaluate()` returns the body's value. |
 | `EvalAdapterTest`          | The `EvalAdapter.evalIsolated` entry point on the basic shapes (no captures, simple captures, `expectedType` cast). |
 
-`ReplHistoryTests` (same package) covers the related
+`ReplHistoryTests` (in the parent `dotty.tools.repl` package, so
+not matched by the `eval.*` glob above) covers the related
 `-Xrepl-history-file` transcript feature.
 
 Because `scala3-repl` runs on the bootstrapped compiler, the first

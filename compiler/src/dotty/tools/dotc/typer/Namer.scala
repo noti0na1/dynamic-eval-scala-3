@@ -200,6 +200,7 @@ class Namer { typer: Typer =>
       || flags.isOneOf(Synthetic | Accessor | CaseAccessor) // check the case param not the accessor
       || flags.is(Param) && ctx.owner.is(Synthetic)
       || isDollars
+      || cc.SafeRefs.allowDollarIn(name) // REPL / eval wrapper names carry a reserved `$` prefix
     // no point in warning about $ in Java, there are no backticks to insert nor other ways to suppress such a warning
     if !flags.is(JavaDefined) && !exempt && (isModule || !name.toTermName.isInstanceOf[DerivedName]) then
       val simple = name.toSimpleName

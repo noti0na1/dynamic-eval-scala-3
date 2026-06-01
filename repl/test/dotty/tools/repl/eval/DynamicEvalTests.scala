@@ -1,5 +1,6 @@
 package dotty.tools
 package repl
+package eval
 
 import org.junit.Test
 import org.junit.Assert._
@@ -4725,15 +4726,15 @@ class DynamicEvalLogTests extends ReplTest(
         codeContent.trim == "i + j")
       // The synthesised wrapper module is dropped by `ExtractEvalBody`
       // when its body has no nested classes, so the post-resolve
-      // snapshot only carries the `__EvalExpression_` class. (When the
+      // snapshot only carries the `__EvalExpression` class. (When the
       // user's enclosing source contains a `class`/`object`, the
       // wrapper survives to host the nested copy and would also appear
       // here. The simple `def f(i, j): Int = i + j` shape doesn't
       // trigger that path.)
       assertTrue(s"wrapper log should NOT contain the dropped __EvalWrapper module: $wrapperContent",
-        !wrapperContent.contains("__EvalWrapper_"))
+        !wrapperContent.contains("__EvalWrapper"))
       assertTrue(s"wrapper should contain the synthesised __Expression class: $wrapperContent",
-        wrapperContent.contains("__EvalExpression_"))
+        wrapperContent.contains("__EvalExpression"))
       assertTrue(s"wrapper should contain `evaluate` with the lowered body: $wrapperContent",
         wrapperContent.contains("def evaluate"))
       assertTrue(s"wrapper should show the lowered binding lookup for `i`: $wrapperContent",
@@ -4755,7 +4756,7 @@ class DynamicEvalLogTests extends ReplTest(
       assertTrue(s"error log should mention diagnostic: $errContent",
         errContent.contains("Not found: undefinedSymbol"))
       assertTrue(s"error log should embed generated source: $errContent",
-        errContent.contains("__EvalWrapper_"))
+        errContent.contains("__EvalWrapper"))
     }
 
 end DynamicEvalLogTests
