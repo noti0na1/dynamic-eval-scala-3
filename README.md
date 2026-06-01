@@ -933,6 +933,65 @@ with composed context." The kinship is technical; the use cases
 sit on either side of a familiar split between observation
 (debugging) and construction (programming).
 
+## Running the tests
+
+The REPL, the eval driver, and their tests all live in the
+`scala3-repl` sbt subproject (`repl/` in the tree, wired up in
+`project/Build.scala`). The tests are ordinary JUnit `@Test`
+methods run through `junit-interface`, so the usual dotty
+`testOnly <fully.qualified.Class> -- *methodGlob` form applies.
+
+Open an sbt shell (`sbt`) and run the commands below at the
+`sbt:scala3>` prompt, or pass them as a single quoted argument
+(`sbt "scala3-repl/testOnly ..."`).
+
+```
+# Every REPL test (includes all eval suites below)
+scala3-repl/test
+
+# All the end-to-end eval suites
+scala3-repl/testOnly *DynamicEval*
+
+# The lower-level eval pipeline unit tests
+scala3-repl/testOnly dotty.tools.repl.eval.*
+
+# One suite
+scala3-repl/testOnly dotty.tools.repl.DynamicEvalTests
+
+# One test method (junit-interface glob on the method name)
+scala3-repl/testOnly dotty.tools.repl.DynamicEvalTests -- *returnsInt
+```
+
+The eval tests are split into suites by axis. The end-to-end
+suites (in `repl/test/dotty/tools/repl/DynamicEvalTests.scala`)
+drive the real REPL by feeding it source lines and asserting on
+the session output:
+
+| Suite                            | What it covers                                                                 | REPL flags exercised                          |
+|----------------------------------|--------------------------------------------------------------------------------|-----------------------------------------------|
+| `DynamicEvalTests`               | Core behaviour: return types, capturing previous lines / locals / `var`s / `given`s, class members, nested eval, compile-error reporting. | (defaults)                                    |
+| `DynamicEvalExplicitNullsTests`  | Flag forwarding into the body compile: `null` no longer conforms to `String`.  | `-Yexplicit-nulls`                            |
+| `DynamicEvalCaptureCheckingTests`| Capture checking on the spliced body (the `cc` examples above).                | `-language:experimental.captureChecking`      |
+| `DynamicEvalSafeModeTests`       | Safe-mode checks applied to the body, including the verify-compile pass.        | `-language:experimental.safe`                 |
+| `DynamicEvalAgentApiTests`       | The `@evalLike` / `@evalSafeLike` wrapper API, the `eval { ctx => ... }` closure form, and `EvalContext`. | (defaults)                                    |
+| `DynamicEvalLogTests`            | The per-invocation log files written by `-Xrepl-eval-log-dir`.                 | `-Xrepl-eval-log-dir:<dir>`                   |
+
+The lower-level unit tests (in
+`repl/test/dotty/tools/repl/eval/`) exercise the pipeline without
+the full REPL:
+
+| Suite                      | What it covers                                                                                  |
+|----------------------------|-------------------------------------------------------------------------------------------------|
+| `EvalCompilerBridgeTest`   | Splice + extract mechanics: spliced enclosing source compiles, `__Expression` is emitted, `evaluate()` returns the body's value. |
+| `EvalAdapterTest`          | The `EvalAdapter.evalIsolated` entry point on the basic shapes (no captures, simple captures, `expectedType` cast). |
+
+`ReplHistoryTests` (same package) covers the related
+`-Xrepl-history-file` transcript feature.
+
+Because `scala3-repl` runs on the bootstrapped compiler, the first
+invocation in a fresh sbt session builds `scala3-compiler-bootstrapped`
+and can take a while; subsequent `testOnly` runs are incremental.
+
 ---------------------------
 
 Scala 3
