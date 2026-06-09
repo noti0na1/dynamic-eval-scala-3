@@ -111,3 +111,5 @@ scaladoc/output/
 
 log/
 session.repl
+runs/
+evals/
