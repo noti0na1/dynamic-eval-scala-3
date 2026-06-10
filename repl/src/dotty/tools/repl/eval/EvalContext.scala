@@ -22,7 +22,7 @@ package eval
  *
  *  Lives in `dotty.tools.repl` so the eval-output classloader routes
  *  it through the parent loader and there's a single shared `Class`
- *  on both sides of the eval / REPL boundary (see BetterEval.md
+ *  on both sides of the eval / REPL boundary (see README.md
  *  "Classloader bridging").
  *
  *  @param enclosingSource Source text of the enclosing top-level
@@ -51,7 +51,7 @@ final class EvalContext(
     s"EvalContext(enclosingSource=${enclosingSource.length} chars, bindings=${bindings.length})"
 
 object EvalContext:
-  /** The marker the parser-stage rewriter substitutes into the
-   *  `enclosingSource` text at each eval call site.
+  /** The marker the [[EvalRewriteTyped]] rewriter substitutes into
+   *  the `enclosingSource` text at each eval call site.
    */
   val placeholder: String = "__evalBodyPlaceholder__"

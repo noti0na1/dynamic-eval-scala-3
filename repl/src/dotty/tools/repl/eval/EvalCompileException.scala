@@ -27,12 +27,4 @@ final class EvalCompileException(
 
 object EvalCompileException:
   private def formatMessage(errors: Array[String], generatedSource: String): String =
-    val joined =
-      val sb = new StringBuilder
-      var i = 0
-      while i < errors.length do
-        if i > 0 then sb.append('\n')
-        sb.append(errors(i))
-        i += 1
-      sb.toString
-    s"eval failed to compile:\n$joined\n\nGenerated source:\n$generatedSource"
+    s"eval failed to compile:\n${errors.mkString("\n")}\n\nGenerated source:\n$generatedSource"

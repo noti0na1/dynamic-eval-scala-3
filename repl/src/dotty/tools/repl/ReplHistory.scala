@@ -49,12 +49,13 @@ object ReplHistory:
    *  (definitions, error messages); user `println`s would go elsewhere.
    *
    *  When `historyFile` is empty, work runs untouched (no capture
-   *  installation): the no-flag path has zero overhead.
+   *  installation, `input` never forced): the no-flag path has zero
+   *  overhead.
    */
   private[repl] def captureLine[A](
       tee: TeePrintStream,
       historyFile: String,
-      input: String
+      input: => String
   )(work: => A): A =
     if historyFile.isEmpty then return work
 
