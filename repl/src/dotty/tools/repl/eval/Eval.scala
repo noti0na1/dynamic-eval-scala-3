@@ -12,10 +12,10 @@ import scala.language.experimental.captureChecking
  *  `Eval.eval(code)` compiles and runs `code` at runtime, returning the
  *  result as the polymorphic type `T`. The argument can be any `String`.
  *
- *  The REPL parser injects bindings automatically for every lambda
- *  parameter (and block-local val/def) syntactically in scope at the call
- *  site, so `xs.map(z => eval[Int]("z + 1"))` works without the user
- *  writing the bindings explicitly.
+ *  The REPL compiler's [[EvalRewriteTyped]] phase injects bindings
+ *  automatically for every lambda parameter (and block-local val/def)
+ *  in scope at the call site, so `xs.map(z => eval[Int]("z + 1"))`
+ *  works without the user writing the bindings explicitly.
  *
  *  The public surface intentionally avoids any Scala-library types
  *  (`Seq`, `ClassTag`, etc.). User wrappers and `Eval` are loaded by
@@ -66,19 +66,19 @@ object Eval:
    *
    *  Lives in `dotty.tools.repl` so the eval-output classloader routes
    *  the `Class` through the REPL infra loader (one shared `Class` on
-   *  both sides of the eval boundary; see BetterEval.md "Classloader bridging").
+   *  both sides of the eval boundary; see README.md "Classloader bridging").
    */
   trait VarRef[T]:
     def get(): T
     def set(v: T): Unit
 
-  /** Helper used by the parser-stage rewriter so the bind-site call
-   *  `Eval.varRef(() => x, v => x = v)` stays terse. The parameter
+  /** Helper used by the [[EvalRewriteTyped]] rewriter so the bind-site
+   *  call `Eval.varRef(() => x, v => x = v)` stays terse. The parameter
    *  types are the JDK functional interfaces (`Supplier`/`Consumer`)
    *  rather than `scala.Function0`/`Function1`: Scala-library types
    *  on the eval API surface trigger `LinkageError` when called from
    *  user-classloader-loaded code (each loader has its own `Class`
-   *  object for `Function0` etc.; see BetterEval.md "Classloader bridging").
+   *  object for `Function0` etc.; see README.md "Classloader bridging").
    *  Scala 3's SAM conversion accepts a `() => x` literal where a
    *  `Supplier[T]` is expected and a `v => x = v` literal where a
    *  `Consumer[T]` is expected, with `T` solved from the getter and
@@ -119,7 +119,7 @@ object Eval:
    *  spliced into the marker position. For an `eval[T]` call the
    *  body's `T` matches the surrounding context; for `evalSafe[T]`
    *  the surrounding context expects `EvalResult[T]`, so
-   *  [[EvalTypeAnnotate]] rewrites the marker as
+   *  [[EvalRewriteTyped]] rewrites the marker as
    *  `Eval.handleCompileError(__evalBodyPlaceholder__)`. The
    *  verification compile then sees a tree of type
    *  `EvalResult[T]`, so the surrounding `val r =
@@ -159,7 +159,7 @@ object Eval:
    *  inside `evalSafe` would silently swallow nested-eval failures.
    *
    *  Lives in `dotty.tools.repl` so the eval-output classloader
-   *  shares the `Class` with the REPL infra (see BetterEval.md
+   *  shares the `Class` with the REPL infra (see README.md
    *  "Classloader bridging").
    */
   final class CompileFailure(val errors: Array[String], val source: String):
@@ -221,11 +221,11 @@ object Eval:
    *      literal here even though the parameter is
    *      `java.util.function.Function` (JDK type so the API surface
    *      crosses the eval / REPL classloader boundary cleanly — see
-   *      BetterEval.md "Classloader bridging"; `scala.Function1` would trip
+   *      README.md "Classloader bridging"; `scala.Function1` would trip
    *      the JVM's loader-constraint check with `LinkageError`).
    *
-   *  Defaulted parameters are normally filled in by the parser-stage
-   *  rewriter from the call site:
+   *  Defaulted parameters are normally filled in by the
+   *  [[EvalRewriteTyped]] rewriter from the call site:
    *
    *    - `bindings`: every term-level name (lambda parameter,
    *      block-local val/var/def/given, method parameter) syntactically

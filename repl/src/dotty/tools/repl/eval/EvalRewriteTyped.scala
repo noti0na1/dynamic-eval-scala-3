@@ -336,7 +336,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
         case _ =>
           super.transform(tree)
 
-/** Class members (val/var) emitted as `Eval.bind("x", this.x)`
+    /** Class members (val/var) emitted as `Eval.bind("x", this.x)`
      *  bindings. The body-rewrite step turns `this.x` references in
      *  the body into reflective lookups by name, so the wrapper
      *  doesn't actually consume these by value — they exist solely
@@ -783,7 +783,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
      *    - `isGiven`   → `Eval.bindGiven(name, value)`
      *    - `isByName`  → `Eval.bind(name, () => name)` (Function0 thunk
      *                    so the body's post-ElimByName `apply()` lines
-     *                    up; see parser-stage doc).
+     *                    up; see [[buildBindByName]]).
      *    - `isDef`     → `Eval.bind(name, eta-expansion)`
      *    - default     → `Eval.bind(name, value)`
      */

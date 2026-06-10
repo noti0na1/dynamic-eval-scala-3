@@ -60,6 +60,17 @@ class ReplHistoryTests
     assertFalse(s"expected no ANSI escapes, got:\n$s", s.contains("\u001b["))
   }
 
+  @Test def capturesEvalLineOutput = initially {
+    // An eval line runs a nested compile through a separate Driver;
+    // its rendering must still land in the same per-line capture.
+    run("""val r: Int = eval("21 * 2")""")
+    val s = historyContent
+    assertTrue(s"expected the eval input to be recorded, got:\n$s",
+      s.contains("""scala> val r: Int = eval("21 * 2")"""))
+    assertTrue(s"expected the eval result to be recorded, got:\n$s",
+      s.contains("val r: Int = 42"))
+  }
+
 end ReplHistoryTests
 
 object ReplHistoryTests:

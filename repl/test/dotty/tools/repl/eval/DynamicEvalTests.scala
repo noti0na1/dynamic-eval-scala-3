@@ -17,9 +17,10 @@ import DynamicEvalAssertions.*
  *       separate dotc Driver to compile and run `code` against the live REPL
  *       session's classpath.
  *    2. The argument can be any `String`: literal, `val`, `s"..."`, etc.
- *    3. The REPL parser stage rewriter injects `Eval.bind("z", z)` for every
- *       lambda parameter (and block-local `val`) syntactically in scope at
- *       the call site, so `xs.map(z => eval[Int]("z + 1"))` Just Works.
+ *    3. The REPL compiler's `EvalRewriteTyped` phase injects
+ *       `Eval.bind("z", z)` for every lambda parameter (and block-local
+ *       `val`) in scope at the call site, so
+ *       `xs.map(z => eval[Int]("z + 1"))` Just Works.
  *    4. REPL session state (vals, vars, defs, classes, givens) is imported
  *       into the body's scope.
  *    5. Return type is the polymorphic `T`; the user ascribes the expected
@@ -199,8 +200,8 @@ class DynamicEvalTests extends ReplTest:
   }
 
   // ===========================================================================
-  // 5. Lambda parameter capture (headline feature). The parser stage rewriter
-  //    injects bindings for every lambda param syntactically in scope.
+  // 5. Lambda parameter capture (headline feature). The EvalRewriteTyped
+  //    rewriter injects bindings for every lambda param in scope.
   // ===========================================================================
 
   @Test def lambdaParamCapturedInLiteralBody = initially {
@@ -307,7 +308,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def lambdaCapturingComplexType = initially {
-    // The post-typer `EvalTypeAnnotate` phase records `xs2`'s typer-side
+    // The post-typer `EvalRewriteTyped` phase records `xs2`'s typer-side
     // type, so the synthesised wrapper parameter is `xs2: List[Int]`
     // (with the Int element preserved). If that phase is disabled the
     // runtime would walk the cons cell up the superclass chain and
@@ -318,7 +319,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def capturedListElementTypePreserved = initially {
-    // Demonstrates the EvalTypeAnnotate phase keeping element types
+    // Demonstrates the EvalRewriteTyped phase keeping element types
     // visible inside the eval body. With only the runtime fallback
     // `xs.head` would return `?`, which can't be used in arithmetic;
     // this body would fail to compile.
@@ -786,7 +787,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def genericLocalGivenSilentlySkipped = initially {
-    // Generic local givens have an empty parser-stage name and are
+    // Generic local givens have an empty source-level name and are
     // not yet captured. V1 silently fell back to a non-local
     // Ordering and produced *some* sorted output. V2 surfaces the
     // missing capture explicitly: the typer resolves `summon` against
@@ -2560,7 +2561,7 @@ class DynamicEvalTests extends ReplTest:
   // ===========================================================================
 
   @Test def bodyAssembledByLoopAtRuntime = initially {
-    // The body is "1 + 2 + 3" but the rewriter at parser stage sees
+    // The body is "1 + 2 + 3" but the compile-time rewriter sees
     // only `eval[Int](expr)` with `expr` opaque. The string is built
     // by `mkString` on a List the size of which is `n`, so a constant-
     // folder couldn't have known how many `+` separators would land in
@@ -2664,6 +2665,23 @@ class DynamicEvalTests extends ReplTest:
     // The next eval still works: no spurious "Not found: rs$line$1".
     run("""val r: Int = eval("1 + 2")""")
     assertContains("val r: Int = 3", storedOutput())
+  }
+
+  @Test def evalWorksAfterResetAndCacheIsCleared = initially {
+    run("""val a: Int = eval("1 + 1")""")
+    assertContains("val a: Int = 2", storedOutput())
+    assertTrue("expected the eval call to populate the wrapper cache",
+      EvalAdapter.cache.size > 0)
+    run(":reset")
+  } andThen {
+    // `:reset` drops the cached wrappers (they pin the old session's
+    // classloader) ...
+    assertEquals("expected :reset to drop all cached wrappers",
+      0, EvalAdapter.cache.size)
+    storedOutput()
+    // ... and eval keeps working against the fresh session state.
+    run("""val b: Int = eval("2 + 2")""")
+    assertContains("val b: Int = 4", storedOutput())
   }
 
   // ===========================================================================

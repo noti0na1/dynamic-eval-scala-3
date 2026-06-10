@@ -5,16 +5,14 @@ package eval
 import org.junit.Test
 import org.junit.Assert.*
 
-/** Integration smoke tests for [[EvalAdapter]] — the production-
- *  shaped entry point that takes the same inputs `Eval.evalIsolated`
- *  takes and routes them through the new eval pipeline.
+/** Integration smoke tests for [[EvalAdapter.evalIsolated]] — the
+ *  entry point `ReplDriver.evalDynamic` drives at runtime — exercised
+ *  directly, without a live REPL session.
  *
- *  These tests stand in for the future Phase 7 switchover: they verify
- *  the adapter handles the basic shapes the production REPL would
- *  exercise (no captures, simple captures, expectedType cast). Tests
- *  involving REPL-line wrappers and nested eval are deferred until
- *  the parser-stage rewriter's body pre-processing is wired into
- *  eval.
+ *  Covers the basic shapes (no captures, simple captures, compile
+ *  failures) plus the wrapper cache's hit/eviction behaviour. The
+ *  REPL-session shapes (line wrappers, nested eval, captures of every
+ *  kind) are covered end-to-end in [[DynamicEvalTests]].
  */
 class EvalAdapterTest:
 
@@ -78,6 +76,7 @@ class EvalAdapterTest:
     val b2 = new Eval.Binding("arg", java.lang.Integer.valueOf(20), false, false)
     assertEquals(Right(java.lang.Integer.valueOf(11)), call("arg + 1", enclosing, Array(b1)))
     val sizeAfterFirst = EvalAdapter.cache.size
+    assertEquals("first call should add exactly one cache entry", 1, sizeAfterFirst)
     assertEquals(Right(java.lang.Integer.valueOf(21)), call("arg + 1", enclosing, Array(b2)))
     val sizeAfterSecond = EvalAdapter.cache.size
     assertEquals("second call should hit the cache, not add a new entry", sizeAfterFirst, sizeAfterSecond)
@@ -90,8 +89,29 @@ class EvalAdapterTest:
     val first = call("\"hello\"", enclosing)
     assertTrue(first.isLeft)
     val sizeAfterFirst = EvalAdapter.cache.size
+    assertEquals("the failure itself should be cached", 1, sizeAfterFirst)
     val second = call("\"hello\"", enclosing)
     assertTrue(second.isLeft)
     val sizeAfterSecond = EvalAdapter.cache.size
     assertEquals("repeated failures shouldn't grow the cache", sizeAfterFirst, sizeAfterSecond)
     EvalAdapter.clearCache()
+
+  @Test def compileFailureErrorsExcludeWarnings(): Unit =
+    val enclosing = s"def f(): Int = ({ ${EvalContext.placeholder} })"
+    // The non-exhaustive match raises a (default-on) warning; the
+    // unknown identifier raises the actual error. `CompileFailure.errors`
+    // must carry only the error — agent retry loops feed it back into
+    // generators, and lint noise about unrelated code derails them.
+    val body =
+      """val m = (None: Option[Int]) match { case Some(x) => x }
+        |undefinedName
+        |""".stripMargin
+    call(body, enclosing) match
+      case Left(failure) =>
+        val rendered = failure.errors.mkString("\n")
+        assertTrue("expected at least one error", failure.errors.nonEmpty)
+        assertTrue(s"expected the unknown-identifier error, got:\n$rendered",
+          rendered.contains("undefinedName"))
+        assertFalse(s"expected warnings to be filtered out, got:\n$rendered",
+          rendered.toLowerCase.contains("exhaustive"))
+      case Right(v) => fail(s"expected compile failure, got Right($v)")

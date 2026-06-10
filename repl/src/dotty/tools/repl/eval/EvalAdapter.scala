@@ -22,7 +22,7 @@ import dotty.tools.io.{AbstractFile, VirtualDirectory}
  *      substituted, so comments / string literals containing the
  *      marker substring don't get corrupted.
  *    - Each binding's source type comes from the typer
- *      ([[EvalTypeAnnotate]]), not from `value.getClass`. Soundness
+ *      ([[EvalRewriteTyped]]), not from `value.getClass`. Soundness
  *      for path-dependent and abstract types is preserved.
  *    - The wrapper is a real class; each eval call instantiates a
  *      fresh `__Expression` and invokes its `evaluate()` method.
@@ -233,16 +233,18 @@ class EvalAdapter:
     new EvalAdapter.CompiledExpression(cls, ctor, evaluate, cl)
 
   /** Instantiate the cached expression class with the call's bindings
-   *  and invoke `evaluate()`. Body runtime exceptions surface as their
-   *  cause (reflection wraps them in `InvocationTargetException`).
+   *  and invoke `evaluate()`. Runtime exceptions — from `evaluate()`
+   *  or from the wrapper's constructor — surface as their cause
+   *  (reflection wraps them in `InvocationTargetException`).
    */
   private def invokeCached(
       compiled: EvalAdapter.CompiledExpression,
       bindings: Array[Eval.Binding]
   ): Either[Eval.CompileFailure, Any] =
     val thisObject = extractThisObject(bindings)
-    val instance = compiled.ctor.newInstance(thisObject, bindings).asInstanceOf[AnyRef]
-    try Right(compiled.evaluate.invoke(instance))
+    try
+      val instance = compiled.ctor.newInstance(thisObject, bindings).asInstanceOf[AnyRef]
+      Right(compiled.evaluate.invoke(instance))
     catch case e: java.lang.reflect.InvocationTargetException =>
       val cause = e.getCause
       if cause != null then throw cause else throw e
@@ -305,9 +307,9 @@ class EvalAdapter:
     catch case scala.util.control.NonFatal(_) => ()
 
   /** Pull the `__this__` binding out of the bindings array. The
-   *  parser-stage rewriter inserts it whenever the eval call sits
-   *  inside a class method, so its presence indicates the captured
-   *  outer instance.
+   *  [[EvalRewriteTyped]] rewriter inserts it whenever the eval call
+   *  sits inside a class method, so its presence indicates the
+   *  captured outer instance.
    */
   private def extractThisObject(bindings: Array[Eval.Binding]): AnyRef | Null =
     val it = bindings.iterator
@@ -353,17 +355,18 @@ object EvalAdapter:
       defineClass(name, bytes, 0, bytes.length)
 
     override def loadClass(name: String): Class[?] =
-      val loaded = findLoadedClass(name)
-      if loaded != null then loaded
-      else
-        try findClass(name)
-        catch case _: ClassNotFoundException => parent.loadClass(name)
-
-  /** Names that trigger nested-eval parsing. The textual fast path
-   *  in [[mightContainNestedEval]] only parses bodies that contain
-   *  one of these as a candidate call.
-   */
-  private[eval] val NestedEvalNames: Array[String] = Array("eval", "evalSafe", "agent", "agentSafe")
+      // Cached `CompiledExpression`s share this loader across calls
+      // (and threads). Lock per name like the JVM's own
+      // `loadClass(name, resolve)` does, so two threads resolving the
+      // same wrapper-referenced class can't race into a duplicate
+      // `defineClass` (`LinkageError: duplicate class definition`).
+      getClassLoadingLock(name).synchronized {
+        val loaded = findLoadedClass(name)
+        if loaded != null then loaded
+        else
+          try findClass(name)
+          catch case _: ClassNotFoundException => parent.loadClass(name)
+      }
 
   /** Replace the first `__evalBodyPlaceholder__` in `wrappedSource`
    *  with `body` so compile-error messages show the actual code that

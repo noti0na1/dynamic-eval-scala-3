@@ -12,7 +12,7 @@ package eval
  *
  *  Lives in `dotty.tools.repl` so the eval-output classloader routes
  *  it through the parent loader and there's a single shared `Class`
- *  on both sides of the eval / REPL boundary (see BetterEval.md
+ *  on both sides of the eval / REPL boundary (see README.md
  *  "Classloader bridging"). We deliberately avoid `scala.Either` on
  *  the API surface because Scala-library types resolve to two
  *  distinct `Class` objects across that boundary, which trips the
@@ -24,8 +24,8 @@ package eval
  *    case EvalResult.Failure(f)  => regenerate(f.errors)
  *  ```
  *
- *  The legacy method-style accessors (`isSuccess`, `get`, `error`,
- *  `getOrElse`) are retained so existing call sites continue to work.
+ *  The method-style accessors (`isSuccess`, `get`, `error`,
+ *  `getOrElse`) cover the common cases without a pattern match.
  */
 enum EvalResult[+T]:
   case Success(value: T)

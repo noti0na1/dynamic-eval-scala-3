@@ -35,7 +35,7 @@ import dotty.tools.dotc.util.SrcPos
  *  object EnclosingTest:
  *    def f(): Int = ({
  *      val __evalResult: Int = { <parsed body> }
- *      scala.Predef.print("")  // suppress constant folding
+ *      Eval.__noFold__()  // suppress constant folding
  *      __evalResult
  *    })
  *
@@ -334,8 +334,8 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
           Ident(thisName).withSpan(t.span)
         case t @ This(qual) =>
           // Qualified `OuterName.this` — point at the corresponding
-          // `__this__<OuterName>` parameter the lifted def carries.
-          // Matches `EvalRewriteTyped's `__this__<OuterName>``.
+          // `__this__<OuterName>` parameter the lifted def carries,
+          // matching the binding names `EvalRewriteTyped` emits.
           Ident(termName(s"__this__${qual.name}")).withSpan(t.span)
         // Don't descend into a body-local class/object: its inner
         // `this` refers to that nested type, not to the enclosing
@@ -553,7 +553,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
    *  (innermost first), so the lifted def can take a `__this__`
    *  parameter for the immediate class plus `__this__<OuterName>`
    *  parameters for every outer class — matching the binding names
-   *  the parser-stage rewriter populates in the bindings array.
+   *  [[EvalRewriteTyped]] populates in the bindings array.
    */
   private def liftClassMethodsRec(td: TypeDef, outerScopes: List[OuterScope])(using Context): List[Tree] =
     val tmpl = td.rhs.asInstanceOf[Template]
@@ -725,7 +725,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
    *  The lifted def takes:
    *    - one `__this__` parameter for the innermost class,
    *    - one `__this__<OuterName>` parameter per outer class,
-   *  matching the bindings the parser-stage rewriter populates.
+   *  matching the bindings [[EvalRewriteTyped]] populates.
    *  Class type params from each scope are carried over as type
    *  params of the lifted def. The body is wrapped in a Block
    *  starting with `import __this__.*` (member names that shadow
@@ -778,9 +778,9 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
     )
     // Lifted `__this__` parameters, declared **outermost-first** so
     // path-dependent type refs on outer params (`__this__: __this__A.B`)
-    // see their prefix already in scope. Names match
-    // `EvalRewriteTyped's `__this__<OuterName>``: `__this__<OuterName>` for
-    // outer classes, plain `__this__` for the immediate innermost.
+    // see their prefix already in scope. Names match the bindings
+    // `EvalRewriteTyped` emits: `__this__<OuterName>` for outer
+    // classes, plain `__this__` for the immediate innermost.
     val outerParams = outerScopes.tail.reverse.map { scope =>
       val name = termName(s"__this__${scope.name}")
       ValDef(name, scope.typeRef, EmptyTree)
@@ -891,16 +891,16 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
    *  ```
    *  {
    *    val __evalResult = { <body> }
-   *    scala.Predef.print("")
+   *    Eval.__noFold__()
    *    __evalResult
    *  }
    *  ```
    *
    *  The val carries the body's value, captured for [[ExtractEvalBody]]
-   *  to drain into `__Expression.evaluate` later. The `print` effect
-   *  prevents constant-folding of the surrounding expression during
-   *  firstTransform, mirroring the trick from the debug pipeline's
-   *  `InsertExpression`.
+   *  to drain into `__Expression.evaluate` later. The `__noFold__()`
+   *  effect prevents constant-folding of the surrounding expression
+   *  during firstTransform, mirroring the trick from the debug
+   *  pipeline's `InsertExpression`.
    *
    *  The block ends in `__evalResult` (a back-reference to the val)
    *  so the spliced position takes on the body's type — the marker
@@ -928,7 +928,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
         if config.expectedType.isEmpty then TypeTree()
         else parseTypeFromString(config.expectedType, span)
       val valDef = ValDef(EvalResultName, valTpt, effectiveBody).withSpan(span)
-      // `Eval.__noFold__()`, a no-op on the `@caps.assumeSafe` Eval` module:
+      // `Eval.__noFold__()`, a no-op on the `@caps.assumeSafe` `Eval` module:
       // an opaque side-effecting call that prevents the surrounding expression
       // from being constant-folded before `ExtractEvalBody` drains the spliced
       // `val __evalResult`'s rhs.

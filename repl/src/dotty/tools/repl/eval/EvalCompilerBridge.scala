@@ -12,7 +12,7 @@ import dotty.tools.dotc.core.Contexts.{Context, ContextBase, inContext}
 import dotty.tools.dotc.core.Mode
 import dotty.tools.dotc.core.Symbols.defn
 import dotty.tools.dotc.core.SymbolLoaders
-import dotty.tools.dotc.reporting.StoreReporter
+import dotty.tools.dotc.reporting.{Diagnostic, StoreReporter}
 import dotty.tools.dotc.util.ClasspathFromClassloader
 import dotty.tools.io.{AbstractFile, ClassPath}
 
@@ -134,7 +134,12 @@ class EvalCompilerBridge:
           val run = compiler.newRun(using freshCtx)
           run.compileFromStrings(source :: Nil)
           if storeReporter.hasErrors then
-            Left(storeReporter.removeBufferedMessages(using freshCtx).map(_.message))
+            // The reporter buffers warnings alongside errors; keep only
+            // the errors so `CompileFailure.errors` (which agent
+            // retry loops feed back into generators) isn't diluted
+            // with lint output about code the user didn't write.
+            Left(storeReporter.removeBufferedMessages(using freshCtx)
+              .collect { case err: Diagnostic.Error => err.message })
           else Right(())
         catch case NonFatal(e) =>
           val sw = new java.io.StringWriter

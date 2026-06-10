@@ -767,6 +767,10 @@ class ReplDriver(settings: Array[String],
         out.println("Resetting REPL state.")
 
       resetToInitial(tokens)
+      // Cached eval wrappers pin the old session's classloader (and
+      // its classes); the fresh session can never hit those entries,
+      // so release them.
+      EvalAdapter.clearCache()
       initialState
 
     case Replay(arg) =>

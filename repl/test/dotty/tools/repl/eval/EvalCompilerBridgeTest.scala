@@ -937,7 +937,7 @@ class EvalCompilerBridgeTest:
     assertEquals(java.lang.Integer.valueOf(21), result)
 
   @Test def evaluatesLocalTypeAliasNoEffect(): Unit =
-    // Local type alias inside a method. EvalTypeAnnotate's
+    // Local type alias inside a method. EvalRewriteTyped's
     // `dealiasLocalAliases` peels term-owned aliases so the
     // expected-type rendering doesn't get stuck on a name that
     // wouldn't resolve in the wrapper.
