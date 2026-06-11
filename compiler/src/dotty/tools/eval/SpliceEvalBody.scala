@@ -1,5 +1,4 @@
 package dotty.tools
-package repl
 package eval
 
 import dotty.tools.dotc.ast.untpd.*
@@ -81,15 +80,16 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
     // copy, and instances crossing the two loaders fail `checkcast`
     // ("X cannot be cast to X (different loaders)").
     //
-    // Gated on `import rs$line$N.{*}`: the lift drops the class
-    // declaration, so it's only safe when the class is reachable
-    // elsewhere (the REPL session's compiled copy). Bridge-test
-    // fixtures don't have that import and rely on the wrapper to be
-    // the only source of the class.
+    // Gated on `import rs$line$N.{*}` (REPL) or `config.standalone`:
+    // the lift drops the class declaration, so it's only safe when
+    // the class is reachable elsewhere, either as the REPL session's
+    // compiled copy or (standalone) as the program's own classes on
+    // the runtime classpath. Bridge-test fixtures have neither and
+    // rely on the wrapper to be the only source of the class.
     val hasReplSessionImport = sourceImportsReplSession(ctx.compilationUnit.untpdTree)
     val extractor = new ClassMethodExtractor
     val lifted =
-      if hasReplSessionImport then extractor.transform(ctx.compilationUnit.untpdTree)
+      if hasReplSessionImport || config.standalone then extractor.transform(ctx.compilationUnit.untpdTree)
       else ctx.compilationUnit.untpdTree
     // Lifted methods have no enclosing `This` for the original class,
     // so rewrite plain `this` in the body to the injected `__this__`
@@ -880,8 +880,8 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
    *  with the typed user body.
    */
   private def expressionClassSource: String =
-    s"""class ${config.outputClassName}(thisObject: Object | Null, bindings: Array[dotty.tools.repl.eval.Eval.Binding])
-       |  extends dotty.tools.repl.eval.EvalExpressionBase(thisObject, bindings) {
+    s"""class ${config.outputClassName}(thisObject: Object | Null, bindings: Array[dotty.tools.eval.Eval.Binding])
+       |  extends dotty.tools.eval.EvalExpressionBase(thisObject, bindings) {
        |  def evaluate(): Any = ()
        |}
        |""".stripMargin
@@ -933,7 +933,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
       // from being constant-folded before `ExtractEvalBody` drains the spliced
       // `val __evalResult`'s rhs.
       val effect = Apply(
-        ReplCompiler.selectFqn("dotty.tools.repl.eval.Eval.__noFold__", span),
+        SpliceEvalBody.selectFqn("dotty.tools.eval.Eval.__noFold__", span),
         Nil
       ).withSpan(span)
       val tail = Ident(EvalResultName).withSpan(span)
@@ -965,6 +965,16 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
 
 private[eval] object SpliceEvalBody:
   val name: String = "spliceEvalBody"
+
+  /** Build an untyped `Select` chain for a dotted FQN (e.g.
+   *  `"dotty.tools.eval.Eval"` becomes
+   *  `Select(Select(Select(Ident(dotty), tools), eval), Eval)`).
+   */
+  private[eval] def selectFqn(fqn: String, span: Span)(using Context): Tree =
+    val parts = fqn.split('.').toList
+    parts.tail.foldLeft[Tree](Ident(parts.head.toTermName).withSpan(span)) { (acc, part) =>
+      Select(acc, part.toTermName).withSpan(span)
+    }
 
   /** Name of the val we splice the body's value into. The
    *  [[ExtractEvalBody]] phase identifies the spliced val by this name

@@ -1,5 +1,4 @@
 package dotty.tools
-package repl
 package eval
 
 import org.junit.Test

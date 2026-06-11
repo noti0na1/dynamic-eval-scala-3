@@ -50,8 +50,9 @@ class ReplCompiler extends Compiler:
     // we have resolved symbols (verifies `eval` / `evalSafe` against
     // `Eval.moduleClass`), inline / macro expansion is still
     // pending, and class-member references are in their
-    // `This(cls).select(name)` form.
-    List(new EvalRewriteTyped),
+    // `This(cls).select(name)` form. Always enabled in the REPL;
+    // `-Xdynamic-eval` is only needed for regular compilation.
+    List(new EvalRewriteTyped(alwaysEnabled = true)),
     List(UnrollDefinitions()),
   )
 
@@ -293,7 +294,7 @@ object ReplCompiler:
   val objectNames = mutable.Map.empty[Int, TermName]
 
   /** Build an untyped `Select` chain for a dotted FQN (e.g.
-   *  `"dotty.tools.repl.eval.Eval"` becomes
+   *  `"dotty.tools.eval.Eval"` becomes
    *  `Select(Select(Select(Ident(dotty), tools), repl), Eval)`).
    */
   private[repl] def selectFqn(fqn: String, span: Span)(using Context): untpd.Tree =
@@ -416,7 +417,7 @@ class ReplPhase extends Phase:
     // resolve in user code. CollectTopLevelImports filters these back
     // out so they don't pollute `:imports`.
     val evalImport = Import(
-      ReplCompiler.selectFqn("dotty.tools.repl.eval.Eval", span),
+      ReplCompiler.selectFqn("dotty.tools.eval.Eval", span),
       ImportSelector(Ident("eval".toTermName))
         :: ImportSelector(Ident("evalSafe".toTermName))
         :: Nil

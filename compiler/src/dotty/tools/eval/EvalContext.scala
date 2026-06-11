@@ -1,5 +1,4 @@
 package dotty.tools
-package repl
 package eval
 
 /** Information about the call site passed to the closure form of
@@ -20,7 +19,7 @@ package eval
  *  }
  *  ```
  *
- *  Lives in `dotty.tools.repl` so the eval-output classloader routes
+ *  Lives in `dotty.tools.eval` so the eval-output classloader routes
  *  it through the parent loader and there's a single shared `Class`
  *  on both sides of the eval / REPL boundary (see README.md
  *  "Classloader bridging").

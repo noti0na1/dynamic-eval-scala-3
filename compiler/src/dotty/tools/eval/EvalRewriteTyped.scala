@@ -1,5 +1,4 @@
 package dotty.tools
-package repl
 package eval
 
 import scala.collection.mutable
@@ -60,12 +59,23 @@ import dotc.util.Spans.{NoSpan, Span}
  *  eval's body) is set up earlier by [[SpliceEvalBody.parseBody]],
  *  before this phase runs on the wrapper compile.
  */
-class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends MacroTransform:
+class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEnabled: Boolean = false) extends MacroTransform:
 
   override def phaseName: String = EvalRewriteTyped.name
 
   override def runsAfter: Set[String] =
     Set(dotc.transform.PostTyper.name)
+
+  /** Three callers install this phase:
+   *    - the main `dotc.Compiler` pipeline, gated on `-Xdynamic-eval`;
+   *    - the REPL's `ReplCompiler`, with `alwaysEnabled = true` (eval is
+   *      a built-in REPL feature, no flag required);
+   *    - [[EvalCompiler]] (the runtime wrapper compile), with a config;
+   *      the wrapper must always be rewritten so nested eval calls get
+   *      their synthetic args filled.
+   */
+  override def isEnabled(using Context): Boolean =
+    alwaysEnabled || maybeConfig.isDefined || ctx.settings.XdynamicEval.value
 
   override protected def newTransformer(using Context): Transformer =
     new EvalRewriteTransformer
@@ -150,6 +160,40 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
     private var topLevelSource: SourceFile | Null = null
     private var topLevelKind: TopKind = TopKind.Unknown
 
+    /** Lexical context that must be re-established when the slice is
+     *  recompiled outside this unit, rendered as import lines:
+     *
+     *    - `fileImports`: the unit's package-level `import` clauses,
+     *      sliced verbatim from the source.
+     *    - `packageImport`: `import <pkg>.{given, *}` when the call
+     *      site sits in a named package. The wrapper compiles in the
+     *      empty package, so siblings of the file (other top-level
+     *      classes, `<file>$package` members) must come in by import.
+     *    - `moduleImport`: `import <path>.<Obj>.{given, *}` when the
+     *      current top-level statement is a member of a user-written
+     *      top-level `object`, mirroring the REPL's
+     *      `import rs$line$N.{given, *}` so sibling members resolve
+     *      against the *runtime* module (live state) rather than a
+     *      re-minted copy.
+     *
+     *  All three are empty in a REPL compile (the REPL passes its
+     *  session imports to the adapter at runtime instead), so REPL
+     *  slices are byte-identical to the pre-standalone behaviour.
+     */
+    private var fileImports: List[String] = Nil
+    private var packageImport: String = ""
+    private var moduleImport: String = ""
+
+    private def withModuleImport[T](imp: String)(action: => T): T =
+      val saved = moduleImport
+      moduleImport = imp
+      try action
+      finally moduleImport = saved
+
+    /** Import lines prepended to every enclosing-source slice. */
+    private def contextImports: List[String] =
+      fileImports ++ List(packageImport, moduleImport).filter(_.nonEmpty)
+
     private def classifyTopLevel(tree: Tree): TopKind = tree match
       case _: DefDef | _: ValDef | _: TypeDef | _: Import | _: PackageDef =>
         TopKind.Definition
@@ -174,6 +218,27 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
         topLevelSource = savedSrc
         topLevelKind = savedKind
 
+    /** Source text of `stat`, sliced verbatim from its source file.
+     *  Empty when the span is missing or out of bounds.
+     */
+    private def sliceSource(stat: Tree)(using Context): String =
+      val span = stat.span
+      if !span.exists then ""
+      else
+        val content = stat.source.content
+        if span.start >= 0 && span.start < span.end && span.end <= content.length then
+          String.valueOf(content, span.start, span.end - span.start)
+        else ""
+
+    /** True for the modules the eval machinery synthesises itself:
+     *  REPL line wrappers (`rs$line$N`) and the inner compile's
+     *  `__EvalWrapper…` modules. Their members get lexical context
+     *  from the runtime adapter, not from compile-time imports.
+     */
+    private def isEvalInfraModule(sym: Symbol)(using Context): Boolean =
+      val n = sym.name.toString
+      n.startsWith(dotc.core.StdNames.str.REPL_SESSION_LINE) || n.contains(ExtractEvalBody.WrapperMarker)
+
     private def withScope[T](caps: List[CapturedSym])(action: => T): T =
       val pushed = caps.nonEmpty
       if pushed then frameStack.push(caps)
@@ -191,6 +256,35 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
 
     override def transform(tree: Tree)(using Context): Tree =
       tree match
+        case pkg: PackageDef =>
+          // Ordinary source file (or the eval wrapper unit): each
+          // package-level stat is a top-level statement; for an eval
+          // call inside a top-level class the slice is the whole
+          // class. Module shapes whose members behave like REPL lines
+          // (REPL wrappers, eval wrappers, `<file>$package` objects)
+          // override this per member in the module-Template case
+          // below. Package-level imports and the package itself are
+          // recorded so slices can re-establish the file's lexical
+          // context when recompiled in the wrapper's empty package.
+          val savedFileImports = fileImports
+          val savedPackageImport = packageImport
+          fileImports = fileImports ++ pkg.stats.collect {
+            case imp: Import => sliceSource(imp)
+          }.filter(_.nonEmpty)
+          val pkgSym = pkg.pid.symbol
+          if pkgSym.exists && pkgSym != defn.EmptyPackageVal && pkgSym != defn.RootPackage then
+            packageImport = s"import ${pkgSym.fullName.toString}.{given, *}"
+          try
+            inContext(localCtx(pkg)) {
+              val newStats = pkg.stats.mapConserve { stat =>
+                withTopLevel(stat)(transform(stat))
+              }
+              cpy.PackageDef(pkg)(pkg.pid, newStats)
+            }
+          finally
+            fileImports = savedFileImports
+            packageImport = savedPackageImport
+
         case Block(stats, expr) =>
           // Pre-scan defs: block-local defs are visible from any
           // sibling (Scala's forward-reference semantics for `def`s
@@ -266,14 +360,28 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
             if ctx.owner.isClass
             && ctx.owner.is(Flags.Module)
             && ctx.owner.maybeOwner.is(Flags.Package) =>
-          // The REPL session wrapper (`object rs$line$N`). Each member
-          // of its Template body is a "top-level statement" w.r.t. the
-          // user's REPL line — that's the boundary the encl-source
-          // slice uses to splice the eval call's marker. Walk the
-          // body stats one at a time, recording each as the current
+          // A top-level module whose members are "top-level statements":
+          // the REPL session wrapper (`object rs$line$N`), the eval
+          // wrapper of the inner compile, a `<file>$package` object
+          // holding top-level definitions, or a user-written top-level
+          // `object`. That member boundary is what the encl-source
+          // slice uses to splice the eval call's marker. Walk the body
+          // stats one at a time, recording each as the current
           // top-level for the duration of its transform.
+          //
+          // For a user-written `object` (standalone compilation) the
+          // slice loses the enclosing object, so record an
+          // `import <Obj>.{given, *}` to be prepended to the slice;
+          // sibling members then resolve against the *runtime* module
+          // on the classpath, mirroring the REPL's session imports.
+          // REPL / eval wrappers get their imports from the adapter at
+          // runtime, and package-object members are visible via the
+          // package itself, so both skip the module import.
+          val modImport =
+            if isEvalInfraModule(ctx.owner) || ctx.owner.isPackageObject then ""
+            else s"import ${ctx.owner.sourceModule.fullName.toString}.{given, *}"
           val newStats = impl.body.mapConserve { stat =>
-            withTopLevel(stat)(transform(stat))
+            withTopLevel(stat)(withModuleImport(modImport)(transform(stat)))
           }
           cpy.Template(impl)(
             transformSub(impl.constr),
@@ -430,7 +538,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
             if kind.isSafe && encl.contains(EvalContext.placeholder) then
               encl.replace(
                 EvalContext.placeholder,
-                s"_root_.dotty.tools.repl.eval.Eval.handleCompileError(${EvalContext.placeholder})"
+                s"_root_.dotty.tools.eval.Eval.handleCompileError(${EvalContext.placeholder})"
               )
             else encl
           val bindingsArg = buildBindingsArray(currentBindings, span)
@@ -580,7 +688,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
         if kind.isSafe && encl.contains(EvalContext.placeholder) then
           encl.replace(
             EvalContext.placeholder,
-            s"_root_.dotty.tools.repl.eval.Eval.handleCompileError(${EvalContext.placeholder})"
+            s"_root_.dotty.tools.eval.Eval.handleCompileError(${EvalContext.placeholder})"
           )
         else encl
       argsBuf(enclIdx) = Literal(Constant(wrappedEncl)).withSpan(argsBuf(enclIdx).span)
@@ -703,7 +811,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
       val name = sym.name.toString
       if name == "eval" || name == "evalSafe" then
         report.warning(
-          i"`$name` here resolves to ${sym.owner}.${sym.name}, not `dotty.tools.repl.eval.Eval.$name`; the eval rewriter is leaving this call alone. If you intended a custom eval generator, annotate the function with `@evalLike` (or `@evalSafeLike`).",
+          i"`$name` here resolves to ${sym.owner}.${sym.name}, not `dotty.tools.eval.Eval.$name`; the eval rewriter is leaving this call alone. If you intended a custom eval generator, annotate the function with `@evalLike` (or `@evalSafeLike`).",
           app.srcPos
         )
 
@@ -751,9 +859,18 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None) extends M
       val topSrc = String.valueOf(src, topLevelStart, topLen)
       val withMarker =
         topSrc.substring(0, relStart) + markerText + topSrc.substring(relEnd)
+      // Prepend the recorded lexical-context imports (file imports,
+      // package import, enclosing-object import) so the wrapper
+      // compile resolves the same names the original file saw. All
+      // empty in a REPL compile, where session imports are passed to
+      // the adapter at runtime instead.
+      def withContextImports(slice: String): String =
+        val imps = contextImports
+        if imps.isEmpty then slice
+        else imps.mkString("", "\n", "\n") + slice
       topLevelKind match
-        case TopKind.Definition => withMarker
-        case TopKind.Expression => s"val __unused__ : Any = { $withMarker }"
+        case TopKind.Definition => withContextImports(withMarker)
+        case TopKind.Expression => withContextImports(s"val __unused__ : Any = { $withMarker }")
         case TopKind.Unknown => ""
 
     private def composeChainedEncl(innerSpan: Span, outerBody: String, outerEncl: String): String =
@@ -1045,31 +1162,31 @@ object EvalRewriteTyped:
   private val EnclosingSourceParamName: String = "enclosingSource"
 
   private def evalModuleClass(using Context): Symbol =
-    requiredModule("dotty.tools.repl.eval.Eval").moduleClass
+    requiredModule("dotty.tools.eval.Eval").moduleClass
 
   private def evalLikeAnnotClass(using Context): ClassSymbol =
-    requiredClass("dotty.tools.repl.eval.evalLike")
+    requiredClass("dotty.tools.eval.evalLike")
 
   private def evalSafeLikeAnnotClass(using Context): ClassSymbol =
-    requiredClass("dotty.tools.repl.eval.evalSafeLike")
+    requiredClass("dotty.tools.eval.evalSafeLike")
 
   private def evalResultClass(using Context): ClassSymbol =
-    requiredClass("dotty.tools.repl.eval.EvalResult")
+    requiredClass("dotty.tools.eval.EvalResult")
 
   private def bindingClass(using Context): ClassSymbol =
-    requiredClass("dotty.tools.repl.eval.Eval.Binding")
+    requiredClass("dotty.tools.eval.Eval.Binding")
 
   private def bindSym(using Context): Symbol =
-    requiredModule("dotty.tools.repl.eval.Eval").requiredMethod("bind")
+    requiredModule("dotty.tools.eval.Eval").requiredMethod("bind")
 
   private def bindVarSym(using Context): Symbol =
-    requiredModule("dotty.tools.repl.eval.Eval").requiredMethod("bindVar")
+    requiredModule("dotty.tools.eval.Eval").requiredMethod("bindVar")
 
   private def bindGivenSym(using Context): Symbol =
-    requiredModule("dotty.tools.repl.eval.Eval").requiredMethod("bindGiven")
+    requiredModule("dotty.tools.eval.Eval").requiredMethod("bindGiven")
 
   private def varRefSym(using Context): Symbol =
-    requiredModule("dotty.tools.repl.eval.Eval").requiredMethod("varRef")
+    requiredModule("dotty.tools.eval.Eval").requiredMethod("varRef")
 
   private def supplierClass(using Context): ClassSymbol =
     requiredClass("java.util.function.Supplier")
@@ -1090,7 +1207,7 @@ object EvalRewriteTyped:
    *  Otherwise they're stripped — the wrapper's val type only needs
    *  the underlying erased shape.
    */
-  private[repl] def renderType(tpe: Type)(using Context): String =
+  private[eval] def renderType(tpe: Type)(using Context): String =
     if tpe == null || !tpe.exists || tpe.isError then return ""
     val widened = tpe.widen
     if !widened.exists || widened.isError then return ""

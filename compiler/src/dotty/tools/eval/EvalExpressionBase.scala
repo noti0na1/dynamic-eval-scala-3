@@ -1,5 +1,4 @@
 package dotty.tools
-package repl
 package eval
 
 // `experimental.captureChecking` is required for `@caps.assumeSafe`

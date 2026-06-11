@@ -1,5 +1,4 @@
 package dotty.tools
-package repl
 package eval
 
 /** Thrown by the throwing-form `eval[T]` when the inner compile of
