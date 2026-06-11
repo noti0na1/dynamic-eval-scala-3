@@ -57,6 +57,23 @@ private[eval] case class EvalCompilerConfig(
 ):
   val expressionClassName: TypeName = typeName(outputClassName)
 
+  /** Names of all bindings the call site captured (visible and
+   *  synthetic alike). The inner compile consults this to decide
+   *  whether a term-owned class/module in the wrapper is *linked*
+   *  (i.e. has a `__evalClass_…__` / `__evalModule_…__` /
+   *  `__evalNew_…__$i` synthetic binding carrying the original
+   *  runtime entity) and whether a non-local `return` can be
+   *  honoured (`__evalReturnKey__` present).
+   */
+  val bindingNames: Set[String] = initialScope.map(_._1).toSet
+
+  /** True when the call site wrapped the eval call in a
+   *  non-local-return catch and passed the key binding, so
+   *  [[ExtractEvalBody]] may lower a body `return` to an
+   *  [[EvalNonLocalReturn]] throw.
+   */
+  def hasReturnKey: Boolean = bindingNames.contains(EvalNames.ReturnKeyBinding)
+
   def expressionClass(using Context): ClassSymbol =
     if packageName.isEmpty then requiredClass(outputClassName)
     else requiredClass(s"$packageName.$outputClassName")

@@ -25,5 +25,17 @@ private[eval] enum ReflectEvalStrategy:
   case Field(field: TermSymbol, isByName: Boolean, useReceiverClass: Boolean = false)
   case FieldAssign(field: TermSymbol, useReceiverClass: Boolean = false)
   case MethodCall(method: TermSymbol, useReceiverClass: Boolean = false)
+  /** Construct an instance of a *linked* local class by applying the
+   *  call-site factory closure stored under `bindingName`
+   *  (`__evalNew_<C>__$<i>`). The factory closes over the class's
+   *  captured environment, so the instance belongs to the *original*
+   *  lifted class rather than the wrapper's re-elaborated copy.
+   */
+  case ConstructLocal(bindingName: String)
+  /** Read a synthetic binding by its exact name: a linked module
+   *  instance (`__evalModule_<M>__`) or the non-local-return key
+   *  (`__evalReturnKey__`).
+   */
+  case BindingValue(bindingName: String)
 
 private[eval] object ReflectEvalStrategy extends StickyKey[ReflectEvalStrategy]

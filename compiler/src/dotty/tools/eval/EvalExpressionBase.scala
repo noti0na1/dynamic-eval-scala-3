@@ -178,7 +178,10 @@ abstract class EvalExpressionBase(
    *  methods. An empty `className` means "use obj.getClass" (see
    *  `getField`); in that mode the return-type filter is skipped
    *  too — the wrapper's symbol-derived return type won't match the
-   *  runtime instance's signature for a term-owned class.
+   *  runtime instance's signature for a term-owned class. A `"*"` in
+   *  a parameter position (or as the return type) is a wildcard: the
+   *  wrapper-side encoding uses it for types naming a *linked* local
+   *  class, whose runtime JVM name differs from the wrapper symbol's.
    */
   protected final def callMethod(
       obj: Object | Null,
@@ -195,13 +198,23 @@ abstract class EvalExpressionBase(
           throw new NullPointerException("callMethod on null receiver with empty className")
         else obj.getClass
       else classLoader.loadClass(className)
+    def paramsMatch(actual: Array[Class[?]]): Boolean =
+      actual.length == paramTypesNames.length && {
+        var i = 0
+        var ok = true
+        while ok && i < actual.length do
+          val expected = paramTypesNames(i)
+          if expected != "*" && actual(i).getName != expected then ok = false
+          i += 1
+        ok
+      }
     var method: java.lang.reflect.Method | Null = null
     while clazz != null && method == null do
       method = clazz.getDeclaredMethods
         .find { m =>
           m.getName == methodName &&
-            (useReceiverClass || m.getReturnType.getName == returnTypeName) &&
-            m.getParameterTypes.map(_.getName).toSeq == paramTypesNames.toSeq
+            (useReceiverClass || returnTypeName == "*" || m.getReturnType.getName == returnTypeName) &&
+            paramsMatch(m.getParameterTypes)
         }
         .getOrElse(null)
       if method == null then clazz = clazz.getSuperclass
@@ -212,6 +225,41 @@ abstract class EvalExpressionBase(
       catch
         case e: java.lang.reflect.InvocationTargetException => throw e.getCause
     if returnTypeName == "void" then (() : Any) else res
+
+  /** Runtime `Class` of a *linked* local class: a class declared in
+   *  a method enclosing the eval call, whose `classOf` the rewriter
+   *  captured as the `__evalClass_<name>__` synthetic binding. The
+   *  wrapper compile re-elaborates the class declaration so the body
+   *  typechecks, but every runtime artifact must refer to the
+   *  *original* lifted class; this accessor is how the lowered code
+   *  reaches it.
+   */
+  private final def linkedClass(sourceName: String): Class[?] =
+    getRaw(EvalNames.classBinding(sourceName)) match
+      case c: Class[?] => c
+      case other => throw new IllegalStateException(
+        s"linked-class binding for `$sourceName` is not a Class: $other")
+
+  /** `x.isInstanceOf[C]` against the original runtime class of the
+   *  linked local class `C`. [[ResolveEvalAccess]] lowers type tests
+   *  whose target is a re-elaborated local class to this call.
+   */
+  protected final def isLinkedInstance(obj: Object | Null, sourceName: String): Boolean =
+    obj != null && linkedClass(sourceName).isInstance(obj)
+
+  /** `x.asInstanceOf[C]` against the original runtime class of the
+   *  linked local class `C`. Throws `ClassCastException` on
+   *  mismatch, like the checkcast it replaces; `null` passes through
+   *  (matching JVM checkcast semantics).
+   */
+  protected final def castLinked(obj: Object | Null, sourceName: String): Object | Null =
+    if obj == null then null
+    else
+      val cls = linkedClass(sourceName)
+      if cls.isInstance(obj) then obj
+      else throw new ClassCastException(
+        s"${obj.getClass.getName} cannot be cast to linked local class " +
+          s"$sourceName (${cls.getName})")
 
   /** Placeholder consumed by `ResolveEvalAccess`, which rewrites
    *  every `reflectEval(...)` Apply in `evaluate`'s body into the

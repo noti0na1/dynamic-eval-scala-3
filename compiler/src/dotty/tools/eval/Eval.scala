@@ -41,22 +41,34 @@ object Eval:
 
   /** A captured binding.
    *
-   *  @param name     source-level name at the call site.
-   *  @param value    runtime value, or for var captures a [[VarRef]]
-   *                  facade closing over the outer var.
-   *  @param isVar    `var` capture.
-   *  @param isGiven  `given` capture. The runtime emits given bindings
-   *                  as members of a `(using ...)` clause on the
-   *                  synthesised wrapper so `summon[T]` resolves.
+   *  @param name        source-level name at the call site (or a
+   *                     reserved `__eval*__` name for synthetic
+   *                     bindings).
+   *  @param value       runtime value, or for var captures a [[VarRef]]
+   *                     facade closing over the outer var.
+   *  @param isVar       `var` capture.
+   *  @param isGiven     `given` capture. The runtime emits given bindings
+   *                     as members of a `(using ...)` clause on the
+   *                     synthesised wrapper so `summon[T]` resolves.
+   *  @param isSynthetic the binding is not a user-visible name. It
+   *                     carries a value the *compiler* needs to link
+   *                     the body's generated code back to the live
+   *                     program: the `classOf` of a local class, a
+   *                     constructor factory closure, a local module
+   *                     instance, the non-local-return key, or the
+   *                     enclosing `__this__` chain. The eval body
+   *                     never names these directly; only the eval
+   *                     phases emit reads of them.
    */
   final class Binding(
       val name: String,
       val value: Any,
       val isVar: Boolean,
-      val isGiven: Boolean = false
+      val isGiven: Boolean = false,
+      val isSynthetic: Boolean = false
   ):
     override def toString =
-      s"Binding($name, $value, isVar=$isVar, isGiven=$isGiven)"
+      s"Binding($name, $value, isVar=$isVar, isGiven=$isGiven, isSynthetic=$isSynthetic)"
 
   /** Live getter/setter facade over a captured `var`. The rewriter
    *  emits a `varRef(() => x, v => x = v)` at every `bindVar` site:
@@ -116,6 +128,15 @@ object Eval:
    */
   def bindGiven(name: String, value: Any): Binding =
     new Binding(name, value, isVar = false, isGiven = true)
+
+  /** Capture a synthetic (compiler-only) binding. Used by the
+   *  [[EvalRewriteTyped]] rewriter for values the generated code
+   *  needs to link back to the live program: `classOf` of a local
+   *  class, constructor factory closures, local module instances,
+   *  and the non-local-return key. See [[Binding.isSynthetic]].
+   */
+  def bindSynthetic(name: String, value: Any): Binding =
+    new Binding(name, value, isVar = false, isSynthetic = true)
 
   /** Synthetic verification-compile shim for `evalSafe[T]` /
    *  `agentSafe[T]` calls. The eval driver's verification compile

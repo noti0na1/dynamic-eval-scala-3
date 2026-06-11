@@ -11,7 +11,7 @@ import dotc.core.Constants.Constant
 import dotc.core.Contexts.*
 import dotc.core.Decorators.*
 import dotc.core.Flags
-import dotc.core.NameKinds.DefaultGetterName
+import dotc.core.NameKinds.{DefaultGetterName, UniqueName}
 import dotc.core.Names.{Name, TermName, termName}
 import dotc.core.Phases.Phase
 import dotc.core.StdNames.nme
@@ -97,6 +97,21 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
    *    elimination drops private members (the body-rewrite step
    *    replaces the only reference with a reflective lookup that
    *    looks up the field at runtime, missing it after DCE).
+   *  - `localClassOf` set: a `__evalClass_<C>__` synthetic carrying
+   *    `classOf[C]` of a local (term-owned) class. The wrapper
+   *    compile uses it to run `isInstanceOf` / `asInstanceOf` /
+   *    type-pattern tests against the *original* lifted class
+   *    instead of the wrapper's re-elaborated copy.
+   *  - `ctorFactory` set: a `__evalNew_<C>__$<i>` synthetic carrying
+   *    a factory closure `(args…) => new C(args…)` for constructor
+   *    `i` of the local class. The closure closes over `C`'s captured
+   *    environment, so LambdaLift does the env plumbing and the
+   *    wrapper can construct instances of the *original* class.
+   *  - `isModuleRef` set: a `__evalModule_<M>__` synthetic carrying
+   *    the live module instance of a local `object M` (including the
+   *    synthesized companion of a local class). The wrapper routes
+   *    `M.member` / `C.apply` / `C.unapply` through it reflectively,
+   *    so module state is shared rather than re-elaborated.
    */
   private case class CapturedSym(
       sym: Symbol,
@@ -106,8 +121,17 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       isByName: Boolean = false,
       isDef: Boolean = false,
       selfThisCls: Option[ClassSymbol] = None,
-      classMemberOf: Option[ClassSymbol] = None
-  )
+      classMemberOf: Option[ClassSymbol] = None,
+      localClassOf: Option[ClassSymbol] = None,
+      ctorFactory: Option[(ClassSymbol, Symbol)] = None,
+      isModuleRef: Boolean = false
+  ):
+    /** Compiler-only binding (reserved name, emitted via
+     *  `Eval.bindSynthetic`); never resolved by a body identifier.
+     */
+    def isSyntheticBinding: Boolean =
+      selfThisCls.isDefined || classMemberOf.isDefined ||
+        localClassOf.isDefined || ctorFactory.isDefined || isModuleRef
 
   /** What kind of top-level shape encloses an eval call. The verify
    *  compile wraps `Expression` shapes in a synthetic
@@ -147,6 +171,14 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
 
     /** Stack of in-scope local frames (innermost on top). */
     private val frameStack = mutable.Stack.empty[List[CapturedSym]]
+
+    /** Enclosing `DefDef`s, innermost first, as (symbol, declared
+     *  result type). The result type comes from the tree's `tpt` so
+     *  method type/term parameters are in their in-scope form (the
+     *  symbol's `info.finalResultType` would carry unbound param
+     *  refs). Drives the non-local-return wrap.
+     */
+    private var enclosingMethods: List[(Symbol, Type)] = Nil
 
     /** Span / source / kind of the *top-level* statement currently
      *  being processed — i.e. the outermost user-written declaration
@@ -297,11 +329,33 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
           // path — the body's implicit search may resolve `summon[Foo]`
           // through the def, and the typer's `foo(<given-Bar>)` call
           // lowers via the captured eta-expansion.
-          val forwardDefs: List[CapturedSym] = stats.collect {
+          //
+          // The same pre-scan collects the *synthetic* link bindings
+          // for block-local classes and modules (forward-visible like
+          // defs, since types resolve block-wide):
+          //   - a class contributes `classOf[C]` plus one constructor
+          //     factory per (non-private) constructor;
+          //   - a `Module`-flagged val (a local `object`, or the
+          //     synthesized companion of a local class) contributes
+          //     its live module instance. Reading the lazy module val
+          //     at the bind site forces initialization, which matches
+          //     a body that touches the module at all.
+          val forwardDefs: List[CapturedSym] = stats.flatMap {
             case dd: DefDef
                 if !dd.symbol.is(Flags.Synthetic)
                 && !dd.name.isEmpty =>
-              CapturedSym(dd.symbol, dd.name.toString, isVar = false, isDef = true)
+              CapturedSym(dd.symbol, dd.name.toString, isVar = false, isDef = true) :: Nil
+            case td: TypeDef
+                if td.isClassDef && td.symbol.isClass
+                && !td.symbol.is(Flags.ModuleClass)
+                && !td.symbol.is(Flags.Synthetic) =>
+              localClassBundle(td.symbol.asClass)
+            case vd: ValDef
+                if vd.symbol.is(Flags.Module) && !vd.name.isEmpty =>
+              CapturedSym(
+                vd.symbol, EvalNames.moduleBinding(vd.name.toString),
+                isVar = false, isModuleRef = true) :: Nil
+            case _ => Nil
           }
           val processed = mutable.ListBuffer.empty[Tree]
           var blockCaps: List[CapturedSym] = forwardDefs
@@ -311,6 +365,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
             stat match
               case vd: ValDef
                   if !vd.symbol.is(Flags.Synthetic)
+                  && !vd.symbol.is(Flags.Module)
                   && !vd.name.isEmpty =>
                 val isVar = vd.symbol.is(Flags.Mutable)
                 val isGiven = vd.symbol.is(Flags.Given)
@@ -349,10 +404,16 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
           // Switch ctx.owner to the def's symbol so any new symbols
           // we synthesise inside its body (anon-fun closures for
           // bindVar's get/set, etc.) get the right enclosure for
-          // LambdaLift's free-var analysis.
+          // LambdaLift's free-var analysis. The (symbol, declared
+          // result type) pair is pushed on the method stack so eval
+          // calls inside the body know which frame a body `return`
+          // would target (the non-local-return wrap).
           val newRhs =
             inContext(ctx.withOwner(dd.symbol)) {
-              withScope(paramCaps)(transform(dd.rhs))
+              val savedMethods = enclosingMethods
+              enclosingMethods = (dd.symbol, dd.tpt.tpe) :: enclosingMethods
+              try withScope(paramCaps)(transform(dd.rhs))
+              finally enclosingMethods = savedMethods
             }
           cpy.DefDef(tree)(dd.name, dd.paramss, dd.tpt, newRhs)
 
@@ -479,6 +540,49 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       }
       out.toList
 
+    /** Synthetic link bindings for a block-local class `C`:
+     *
+     *    - `__evalClass_C__` → `classOf[C]`, resolved by the backend
+     *      to the *lifted* runtime class, so the wrapper compile can
+     *      run instance tests against the original class;
+     *    - `__evalNew_C__$<i>` → a factory closure per reachable
+     *      constructor (primary first, secondaries in source order).
+     *      The closure body is an ordinary `new C(…)`, so LambdaLift
+     *      threads `C`'s captured environment through the closure:
+     *      exactly the synthetic plumbing the wrapper can't
+     *      reconstruct on its own.
+     *
+     *  Traits and abstract classes contribute only the `classOf`
+     *  binding. Private constructors are skipped (the factory
+     *  closure would trip the JVM access check after lifting).
+     */
+    private def localClassBundle(cls: ClassSymbol)(using Context): List[CapturedSym] =
+      val src = cls.name.toString
+      val classOfCap = CapturedSym(
+        cls, EvalNames.classBinding(src), isVar = false, localClassOf = Some(cls))
+      val ctorCaps =
+        if cls.is(Flags.Trait) || cls.is(Flags.Abstract) then Nil
+        else
+          constructorsOf(cls).zipWithIndex.collect {
+            case (ctor, i) if !ctor.isPrivate =>
+              CapturedSym(
+                ctor, EvalNames.ctorBinding(src, i), isVar = false,
+                ctorFactory = Some((cls, ctor)))
+          }
+      classOfCap :: ctorCaps
+
+    /** Constructors of `cls` in the order both compiles agree on:
+     *  primary first, then secondaries by source position. The
+     *  wrapper compile re-elaborates the same class source, so the
+     *  index identifies the same constructor on both sides.
+     */
+    private def constructorsOf(cls: ClassSymbol)(using Context): List[Symbol] =
+      val primary = cls.primaryConstructor
+      val secondaries = cls.info.decls.toList
+        .filter(s => s.isConstructor && s != primary)
+        .sortBy(_.span.start)
+      if primary.exists then primary :: secondaries else secondaries
+
     /** Classify an Apply into the eval-pipeline category whose call
      *  contract it follows. Pure symbol + annotation based — never
      *  by name or arity, so a user-defined `eval` shadowing the
@@ -517,7 +621,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
      *  closure overload has no defaults the rewriter could otherwise
      *  reach via accessor, so the values are baked in here).
      */
-    private def expandOneArgToFourArg(app: Apply, kind: EvalKind)(using Context): Option[Apply] =
+    private def expandOneArgToFourArg(app: Apply, kind: EvalKind)(using Context): Option[Tree] =
       val Apply(fun, List(closureArg)) = app: @unchecked
       val oneArgSym = fun.symbol
       val typeArgs = fun match
@@ -541,10 +645,21 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
                 s"_root_.dotty.tools.eval.Eval.handleCompileError(${EvalContext.placeholder})"
               )
             else encl
-          val bindingsArg = buildBindingsArray(currentBindings, span)
+          val wrapTarget = returnWrapTarget
+          val keySymOpt = wrapTarget.map { _ =>
+            newSymbol(
+              ctx.owner, UniqueName.fresh(termName("__evalReturnKey")),
+              Flags.Synthetic, defn.ObjectType, coord = span)
+          }
+          val extraBinds = keySymOpt.map(k => buildBindReturnKey(k, span)).toList
+          val bindingsArg = buildBindingsArray(currentBindings, span, extraBinds)
           val expTpeArg = Literal(Constant(rendered)).withSpan(span)
           val enclArg = Literal(Constant(wrappedEncl)).withSpan(span)
-          Apply(newFun, List(closureArg, bindingsArg, expTpeArg, enclArg)).withSpan(span)
+          val filled = Apply(newFun, List(closureArg, bindingsArg, expTpeArg, enclArg)).withSpan(span)
+          (wrapTarget, keySymOpt) match
+            case (Some((meth, resTpe)), Some(keySym)) =>
+              wrapWithReturnHandler(filled, keySym, meth, resTpe, span)
+            case _ => filled
         }
       }
 
@@ -693,16 +808,29 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
         else encl
       argsBuf(enclIdx) = Literal(Constant(wrappedEncl)).withSpan(argsBuf(enclIdx).span)
 
-      // bindings: rebuilt from the typed scope.
-      argsBuf(bindIdx) = buildBindingsArray(currentBindings, argsBuf(bindIdx).span)
+      // bindings: rebuilt from the typed scope, plus the non-local-
+      // return key when the call sits directly inside a real method.
+      val wrapTarget = returnWrapTarget
+      val keySymOpt = wrapTarget.map { _ =>
+        newSymbol(
+          ctx.owner, UniqueName.fresh(termName("__evalReturnKey")),
+          Flags.Synthetic, defn.ObjectType, coord = span)
+      }
+      val extraBinds = keySymOpt.map(k => buildBindReturnKey(k, span)).toList
+      argsBuf(bindIdx) = buildBindingsArray(currentBindings, argsBuf(bindIdx).span, extraBinds)
 
       val newClauseApp = cpy.Apply(clauseApp)(clauseApp.fun, argsBuf.toList)
       // If the synthetic clause is the outer Apply (single-clause
       // method) we're done; otherwise re-thread the rewritten clause
       // through the chain of intervening Applies.
-      if (newClauseApp eq clauseApp) || (clauseApp eq app) then
-        if clauseApp eq app then newClauseApp else app
-      else rethreadApply(app, clauseApp, newClauseApp)
+      val filled =
+        if (newClauseApp eq clauseApp) || (clauseApp eq app) then
+          if clauseApp eq app then newClauseApp else app
+        else rethreadApply(app, clauseApp, newClauseApp)
+      (wrapTarget, keySymOpt) match
+        case (Some((meth, resTpe)), Some(keySym)) =>
+          wrapWithReturnHandler(filled, keySym, meth, resTpe, span)
+        case _ => filled
 
     /** Walk `app.fun` down to find the `Apply` whose direct args are
      *  the parameter clause declaring `bindings` / `expectedType` /
@@ -887,34 +1015,184 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
 
     /** `scala.Array(bindings...)` typed as `Array[Eval.Binding]`.
      *  Empty case still emits a typed `Array[Eval.Binding]` so the
-     *  surrounding 4-arg overload solves correctly.
+     *  surrounding 4-arg overload solves correctly. `extra` carries
+     *  pre-built bind trees appended after the scope captures
+     *  (currently only the non-local-return key).
      */
-    private def buildBindingsArray(caps: List[CapturedSym], span: Span)(using Context): Tree =
+    private def buildBindingsArray(caps: List[CapturedSym], span: Span, extra: List[Tree] = Nil)(using Context): Tree =
       val elemTpe: Type = EvalRewriteTyped.bindingClass.typeRef
-      val elems: List[Tree] = caps.map(c => buildBind(c, span))
+      val elems: List[Tree] = caps.map(c => buildBind(c, span)) ++ extra
       JavaSeqLiteral(elems, TypeTree(elemTpe)).withSpan(span)
+
+    /** The method a body `return` would target, when the eval call
+     *  sits directly inside a real (named, non-constructor) method.
+     *  Inside a lambda there is no target: Scala 3 has no non-local
+     *  returns, and the inner compile rejects the body's `return`
+     *  with the standard diagnostic, matching source semantics at
+     *  that position.
+     */
+    private def returnWrapTarget(using Context): Option[(Symbol, Type)] =
+      enclosingMethods.headOption.filter { (meth, resTpe) =>
+        meth.exists
+          && meth.is(Flags.Method)
+          && !meth.isAnonymousFunction
+          && !meth.isConstructor
+          && resTpe.exists && !resTpe.isError
+          && !resTpe.isRef(defn.NothingClass)
+      }
+
+    /** `Eval.bindSynthetic("__evalReturnKey__", <key>)`. */
+    private def buildBindReturnKey(keySym: Symbol, span: Span)(using Context): Tree =
+      val nameLit = Literal(Constant(EvalNames.ReturnKeyBinding)).withSpan(span)
+      discardUses:
+        ref(EvalRewriteTyped.bindSyntheticSym)
+          .appliedTo(nameLit, ref(keySym).withSpan(span))
+          .withSpan(span)
+
+    /** Wrap a filled eval call so a `return` inside the body can
+     *  reach the enclosing method's frame:
+     *
+     *  ```
+     *  {
+     *    val __evalReturnKey: Object = new Object()
+     *    try <call with __evalReturnKey__ binding appended>
+     *    catch case ex: EvalNonLocalReturn if ex.key eq __evalReturnKey =>
+     *      return ex.value.asInstanceOf[R]   // ordinary return from m
+     *  }
+     *  ```
+     *
+     *  [[ExtractEvalBody]] lowers the body's `return expr` to
+     *  `throw new EvalNonLocalReturn(<key binding>, expr)`; the
+     *  throwable unwinds through `evaluate()` and the adapter to
+     *  this catch. The key is a fresh object per *execution*, so
+     *  recursive frames stay distinct, and the identity guard
+     *  re-throws returns belonging to other frames (including outer
+     *  eval calls in a nested chain).
+     */
+    private def wrapWithReturnHandler(
+        call: Tree, keySym: Symbol, meth: Symbol, resTpe: Type, span: Span
+    )(using Context): Tree =
+      val nlrCls = EvalRewriteTyped.evalNonLocalReturnClass
+      val keyVal = ValDef(keySym.asTerm, New(defn.ObjectType, Nil)).withSpan(span)
+      val exSym = newSymbol(
+        ctx.owner, UniqueName.fresh(termName("__evalNLR")),
+        Flags.Case | Flags.Synthetic, nlrCls.typeRef, coord = span)
+      val pat = Bind(exSym, Typed(Underscore(nlrCls.typeRef), TypeTree(nlrCls.typeRef))).withSpan(span)
+      val guard = ref(exSym).select(termName("key"))
+        .select(defn.Object_eq).appliedTo(ref(keySym)).withSpan(span)
+      val retVal = ref(exSym).select(termName("value")).cast(resTpe)
+      val ret = Return(retVal, ref(meth)).withSpan(span)
+      val tryTree = Try(call, List(CaseDef(pat, guard, ret)), EmptyTree).withSpan(span)
+      Block(keyVal :: Nil, tryTree).withSpan(span)
 
     /** Dispatch a `CapturedSym` to its appropriate binding builder:
      *
-     *    - `isVar`     → `Eval.bindVar(name, Eval.varRef(get, set))`
-     *    - `isGiven`   → `Eval.bindGiven(name, value)`
-     *    - `isByName`  → `Eval.bind(name, () => name)` (Function0 thunk
-     *                    so the body's post-ElimByName `apply()` lines
-     *                    up; see [[buildBindByName]]).
-     *    - `isDef`     → `Eval.bind(name, eta-expansion)`
-     *    - default     → `Eval.bind(name, value)`
+     *    - `isVar`         → `Eval.bindVar(name, Eval.varRef(get, set))`
+     *    - `isGiven`       → `Eval.bindGiven(name, value)`
+     *    - `isByName`      → `Eval.bind(name, () => name)` (Function0 thunk
+     *                        so the body's post-ElimByName `apply()` lines
+     *                        up; see [[buildBindByName]]).
+     *    - `isDef`         → `Eval.bind(name, eta-expansion)`
+     *    - `localClassOf`  → `Eval.bindSynthetic(name, classOf[C])`
+     *    - `ctorFactory`   → `Eval.bindSynthetic(name, (args…) => new C(args…))`
+     *    - `isModuleRef`   → `Eval.bindSynthetic(name, M)`
+     *    - `selfThisCls` / `classMemberOf`
+     *                      → `Eval.bindSynthetic(name, value)` (compiler-only
+     *                        captures: the enclosing-`this` chain and the
+     *                        DCE-keeper class-member reads)
+     *    - default         → `Eval.bind(name, value)`
      */
     private def buildBind(c: CapturedSym, span: Span)(using Context): Tree =
       if c.isVar then buildBindVar(c, span)
       else if c.isGiven then buildBindGiven(c, span)
       else if c.isByName then buildBindByName(c, span)
       else if c.isDef then buildBindDef(c, span)
+      else if c.localClassOf.isDefined then buildBindClassOf(c, span)
+      else if c.ctorFactory.isDefined then buildBindCtorFactory(c, span)
       else
+        val bindFn =
+          if c.isSyntheticBinding then EvalRewriteTyped.bindSyntheticSym
+          else EvalRewriteTyped.bindSym
         val nameLit = Literal(Constant(c.sourceName)).withSpan(span)
         discardUses:
-          ref(EvalRewriteTyped.bindSym)
+          ref(bindFn)
             .appliedTo(nameLit, readRef(c, span))
             .withSpan(span)
+
+    /** `Eval.bindSynthetic("__evalClass_C__", classOf[C])`. Type
+     *  params are instantiated to `Any` purely so the class literal's
+     *  carried type is well-formed; erasure reduces it to the runtime
+     *  class either way.
+     */
+    private def buildBindClassOf(c: CapturedSym, span: Span)(using Context): Tree =
+      val cls = c.localClassOf.get
+      val targs = cls.typeParams.map(_ => defn.AnyType)
+      val clsTpe = if targs.isEmpty then cls.typeRef else cls.typeRef.appliedTo(targs)
+      val nameLit = Literal(Constant(c.sourceName)).withSpan(span)
+      discardUses:
+        ref(EvalRewriteTyped.bindSyntheticSym)
+          .appliedTo(nameLit, clsOf(clsTpe).withSpan(span))
+          .withSpan(span)
+
+    /** `Eval.bindSynthetic("__evalNew_C__$i", (p1…pn) => new C(p1…pn))`.
+     *
+     *  Same flattened, `Any`-typed lambda technique as
+     *  [[buildBindDef]]: every value param is typed `Any` (cast back
+     *  to the constructor's expected type inside the body), type
+     *  params are instantiated to `Any`, and multiple clauses are
+     *  uncurried into one. The wrapper compile flattens the body's
+     *  `new C(…)` arg lists the same way, so a single
+     *  `FunctionN.apply(args…)` call lines up.
+     *
+     *  The `new C(…)` inside the closure is ordinary code in `C`'s
+     *  defining scope: LambdaLift extends it with `C`'s captured
+     *  free variables and closes the factory over them, which is
+     *  exactly the environment the wrapper-side construction needs
+     *  but cannot reconstruct.
+     */
+    private def buildBindCtorFactory(c: CapturedSym, span: Span)(using Context): Tree =
+      val (cls, ctor) = c.ctorFactory.get
+      val nameLit = Literal(Constant(c.sourceName)).withSpan(span)
+      val (typeArgs: List[Type], methodLikeTpe: Type) = ctor.info match
+        case poly: PolyType =>
+          val anys: List[Type] = poly.paramRefs.map(_ => defn.AnyType)
+          (anys, poly.instantiate(anys))
+        case other =>
+          (Nil, other)
+      def flatten(t: Type): (List[List[Type]], List[List[TermName]]) = t match
+        case mt: MethodType =>
+          val (rest, namesRest) = flatten(mt.resType)
+          (mt.paramInfos :: rest, mt.paramNames :: namesRest)
+        case _ =>
+          (Nil, Nil)
+      val (clauseInfos, clauseNames) = flatten(methodLikeTpe)
+      val clsTpe = if typeArgs.isEmpty then cls.typeRef else cls.typeRef.appliedTo(typeArgs)
+      val flatNames = clauseNames.flatten
+      val flatInfos = clauseInfos.flatten
+      val lambdaParamTpes: List[Type] = flatInfos.map {
+        case et: ExprType => et
+        case _ => defn.AnyType
+      }
+      val methTpe = MethodType(flatNames)(_ => lambdaParamTpes, _ => defn.AnyType)
+      val factory = Lambda(methTpe, params =>
+        val callArgs = params.lazyZip(flatInfos).map { (p, t) =>
+          t match
+            case _: ExprType => p
+            case _ => p.cast(t)
+        }
+        def regroup(xs: List[Tree], sizes: List[Int]): List[List[Tree]] = sizes match
+          case Nil => Nil
+          case n :: rest =>
+            val (head, tail) = xs.splitAt(n)
+            head :: regroup(tail, rest)
+        val ctorSel = New(clsTpe).select(ctor)
+        val ctorTyped = if typeArgs.isEmpty then ctorSel else ctorSel.appliedToTypes(typeArgs)
+        ctorTyped.appliedToArgss(regroup(callArgs, clauseInfos.map(_.length)))
+      ).withSpan(span)
+      discardUses:
+        ref(EvalRewriteTyped.bindSyntheticSym)
+          .appliedTo(nameLit, factory)
+          .withSpan(span)
 
     /** Stamp the `Eval.bind*(...)` call with [[CheckCaptures.DiscardUses]]
      *  so the capture checker rechecks the whole application — including
@@ -1184,6 +1462,12 @@ object EvalRewriteTyped:
 
   private def bindGivenSym(using Context): Symbol =
     requiredModule("dotty.tools.eval.Eval").requiredMethod("bindGiven")
+
+  private def bindSyntheticSym(using Context): Symbol =
+    requiredModule("dotty.tools.eval.Eval").requiredMethod("bindSynthetic")
+
+  private def evalNonLocalReturnClass(using Context): ClassSymbol =
+    requiredClass("dotty.tools.eval.EvalNonLocalReturn")
 
   private def varRefSym(using Context): Symbol =
     requiredModule("dotty.tools.eval.Eval").requiredMethod("varRef")

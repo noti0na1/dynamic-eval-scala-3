@@ -3693,6 +3693,162 @@ class DynamicEvalTests extends ReplTest:
   }
 
   // ===========================================================================
+  // 38. Local classes across the eval boundary (linked local classes).
+  //
+  //     A class declared inside a method is re-elaborated by the wrapper
+  //     compile so the body typechecks, but every runtime artifact is
+  //     *linked* back to the original lifted class through synthetic
+  //     bindings captured at the call site: `classOf[C]` (`__evalClass_C__`)
+  //     for type tests, one factory closure per constructor
+  //     (`__evalNew_C__$i`) for `new`, and the live module instance
+  //     (`__evalModule_M__`) for companions and local objects. Instances
+  //     created inside the body and instances captured from outside share
+  //     one JVM class, so they can cross the boundary in both directions.
+  // ===========================================================================
+
+  @Test def localClassNewInBody = initially {
+    // `new C(2)` inside the body goes through the `__evalNew_C__$0`
+    // factory closure, so it constructs the *original* lifted class:
+    // the same class the captured `c` belongs to.
+    run("""|def f(): Int =
+           |  class C(val x: Int)
+           |  val c = new C(1)
+           |  eval[Int]("c.x + new C(2).x")
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 3", storedOutput())
+  }
+
+  @Test def localClassInstanceReturnedFromBody = initially {
+    // The body constructs the instance and the *outer* code uses it
+    // directly. The factory creates the original class, so the call
+    // site's `asInstanceOf[C]` checkcast passes.
+    run("""|def f(): Int =
+           |  class C(val x: Int)
+           |  val c = eval[C]("new C(7)")
+           |  c.x * 2
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 14", storedOutput())
+  }
+
+  @Test def localClassSecondaryConstructor = initially {
+    // Secondary constructors get their own factory binding
+    // (`__evalNew_C__$1`), index-matched by source order on both
+    // sides of the compile.
+    run("""|def f(): Int =
+           |  class C(val x: Int):
+           |    def this() = this(42)
+           |  eval[Int]("new C().x")
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def localClassIsInstanceOf = initially {
+    // The body's type test lowers to `Class.isInstance` against the
+    // `__evalClass_C__` binding (the original runtime class), so a
+    // captured instance passes and an unrelated value fails.
+    run("""|def f(): (Boolean, Boolean) =
+           |  class C
+           |  val c: Any = new C
+           |  val s: Any = "str"
+           |  eval[(Boolean, Boolean)]("(c.isInstanceOf[C], s.isInstanceOf[C])")
+           |f()""".stripMargin)
+    assertContains("(true, false)", storedOutput())
+  }
+
+  @Test def localClassTypePattern = initially {
+    // `case c2: C =>`: PatternMatcher generates the test/cast *after*
+    // ExtractEvalBody ran, so this exercises the post-erasure sweep in
+    // ResolveEvalAccess (isInstanceOf → isLinkedInstance, asInstanceOf
+    // → castLinked, member access → receiver-class reflection).
+    run("""|def f(): Int =
+           |  class C(val x: Int)
+           |  val c: Any = new C(5)
+           |  eval[Int]("c match { case c2: C => c2.x; case _ => -1 }")
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 5", storedOutput())
+  }
+
+  @Test def localCaseClassApplyAndUnapplyInBody = initially {
+    // `Pt(3, 4)` routes through the live companion captured as
+    // `__evalModule_Pt__` (apply), and `case Pt(a, b)` destructures via
+    // the case-class accessor path on the original class. Previously a
+    // known limitation ("Could not find proxy for lazy var Pt$lzy1").
+    run(
+      """|def f: Int =
+         |  case class Pt(x: Int, y: Int)
+         |  eval[Int]("{ val q = Pt(3, 4); q match { case Pt(a, b) => a + b } }")
+         |f""".stripMargin
+    )
+    assertContains("val res0: Int = 7", storedOutput())
+  }
+
+  @Test def localCaseClassInstanceAcrossBoundary = initially {
+    // Outside-built instance read inside; inside-built instance used
+    // outside. One JVM class on both sides.
+    run("""|def f(): Int =
+           |  case class Pt(x: Int, y: Int)
+           |  val p = Pt(1, 2)
+           |  val q = eval[Pt]("Pt(p.y, p.x * 10)")
+           |  q.x + q.y
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 12", storedOutput())
+  }
+
+  @Test def localObjectLiveState = initially {
+    // A local `object`'s state is shared with the body through the
+    // `__evalModule_Counter__` binding (previously the wrapper
+    // re-elaborated the module, so writes were lost).
+    run("""|def f(): Int =
+           |  object Counter:
+           |    var n = 0
+           |  Counter.n = 1
+           |  eval[Unit]("Counter.n += 10")
+           |  Counter.n
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 11", storedOutput())
+  }
+
+  // ===========================================================================
+  // 39. Non-local `return` from the eval body.
+  //
+  //     The rewriter wraps every eval call that sits directly inside a real
+  //     method in a `try/catch` keyed on a per-execution
+  //     `__evalReturnKey__` synthetic binding; the body's `return` lowers
+  //     to an `EvalNonLocalReturn` throw that unwinds through `evaluate()`
+  //     and the adapter until the call-site catch turns it back into an
+  //     ordinary `return`.
+  // ===========================================================================
+
+  @Test def returnFromEnclosingMethodInBody = initially {
+    // Previously a known limitation rejected with a diagnostic.
+    run("""|def f(): Int = eval[Int]("return 42")
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def conditionalReturnFromBody = initially {
+    // The non-return path falls through to the rest of the method.
+    run("""|def f(x: Int): Int =
+           |  eval[Unit]("if x > 0 then return x * 2")
+           |  -1
+           |f(21)
+           |f(0)""".stripMargin)
+    val out = storedOutput()
+    assertContains("val res0: Int = 42", out)
+    assertContains("val res1: Int = -1", out)
+  }
+
+  @Test def returnDistinguishesRecursiveFrames = initially {
+    // The key object is allocated per *execution*, so a recursive
+    // frame's return unwinds only its own frame.
+    run("""|def f(x: Int): Int =
+           |  eval[Unit]("if x > 0 then return f(x - 1) + 1")
+           |  0
+           |f(3)""".stripMargin)
+    assertContains("val res0: Int = 3", storedOutput())
+  }
+
+  // ===========================================================================
   // KNOWN LIMITATIONS
   //
   // Each test below pins a documented shape that the V2 pipeline cannot
@@ -3707,20 +3863,21 @@ class DynamicEvalTests extends ReplTest:
   //      reference the new class's `this`, unreachable from the wrapper).
   //   2. Eval inside a method of a *local* class (member references can't
   //      thread through the wrapper-class boundary).
-  //   3. *Local* case-class apply/unapply invoked from the body
-  //      (companion's lazy initializer can't be proxied across the boundary).
-  //   4. Private *val* on a session-level object accessed from the body via
+  //   3. Private *val* on a session-level object accessed from the body via
   //      a method on that same object. The V2 compile re-declares the object
   //      inside `__EvalWrapper_*` and Scala 3's nested-object lowering drops
   //      the private val, so reflective `getField` walks a stripped class.
   //      Fixing this requires lifting module methods out of their containing
   //      ModuleDef the same way `SpliceEvalBody.ClassMethodExtractor` lifts
   //      class methods. (No test for this one yet; tracked in EVAL.md.)
-  //   5. `return` in the body targeting the method enclosing the eval call.
-  //      The body executes inside `__Expression.evaluate` at runtime, so the
-  //      target frame is gone by construction. ExtractEvalBody rejects it
-  //      with a deliberate diagnostic. A `return` from a def declared inside
-  //      the body itself still works (the def and its return move together).
+  //
+  // Lifted (now covered by success tests above):
+  //   - *Local* case-class apply/unapply from the body: section 38
+  //     (linked local classes).
+  //   - `return` targeting the method enclosing the eval call: section 39
+  //     (non-local return via `__evalReturnKey__`). A `return` at the REPL
+  //     top level is still rejected with the standard typer diagnostic
+  //     (`returnOutsideMethodInBodyRejected` below).
   // ===========================================================================
 
   @Test def bodyDefinesCaseClassRejected = initially {
@@ -3760,52 +3917,6 @@ class DynamicEvalTests extends ReplTest:
       out.contains("cannot reference outer symbol")
         || out.contains("EvalCompileException")
     )
-  }
-
-  @Test def localCaseClassApplyAndUnapplyInBodyKnownLimitation = initially {
-    // A *local* case class defined inside a method, whose companion's
-    // synthesised `apply` would construct an instance and whose `unapply`
-    // would destructure it, both invoked from inside an eval body. The
-    // companion's lazy initializer (`Pt$lzy1`) lives in the user's outer
-    // method's scope and LambdaLift can't thread a proxy for it across the
-    // wrapper-class boundary, so the eval compile reports "Could not find
-    // proxy for lazy var Pt$lzy1". Once local-class-companion synthetics
-    // are routed through reflection (analogous to local-class instances),
-    // flip this test to assert the success result.
-    run(
-      """|def f: Int =
-         |  case class Pt(x: Int, y: Int)
-         |  eval[Int]("{ val q = Pt(3, 4); q match { case Pt(a, b) => a + b } }")
-         |f""".stripMargin
-    )
-    val out = storedOutput()
-    assertTrue(
-      s"expected the eval call to fail with a 'Could not find proxy' diagnostic, got:\n$out",
-      out.contains("Could not find proxy") || out.contains("EvalCompileException")
-    )
-  }
-
-  @Test def returnFromEnclosingMethodInBodyRejected = initially {
-    // `return` in the body targets the method enclosing the eval call. The
-    // body executes inside `__Expression.evaluate` at runtime, so the target
-    // frame is gone by construction. ExtractEvalBody rejects it with a
-    // deliberate diagnostic instead of letting LambdaLift crash with
-    // "Could not find proxy for val nonLocalReturnKey...". The failure is an
-    // ordinary EvalCompileException, so the session survives.
-    run(
-      """|def f(): Int = eval[Int]("return 42")
-         |f()""".stripMargin
-    )
-  } andThen {
-    val out = storedOutput()
-    assertTrue(s"expected the documented `return` diagnostic, got:\n$out",
-      out.contains("eval failed to compile") &&
-        out.contains("cannot `return` from the method enclosing the eval call"))
-    assertTrue(s"the failure must not surface as an internal compiler error:\n$out",
-      !out.contains("Internal compiler error"))
-    // The session is still usable after the rejected call.
-    run("1 + 1")
-    assertContains(": Int = 2", storedOutput())
   }
 
   @Test def returnOutsideMethodInBodyRejected = initially {
