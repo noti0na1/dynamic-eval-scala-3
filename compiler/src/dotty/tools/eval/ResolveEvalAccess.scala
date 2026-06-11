@@ -1,5 +1,4 @@
 package dotty.tools
-package repl
 package eval
 
 import dotty.tools.dotc.ast.tpd.*
@@ -134,11 +133,11 @@ private[eval] class ResolveEvalAccess(config: EvalCompilerConfig, store: EvalSto
       callOnThis("getOuter", qualifier :: Literal(Constant(outerCls.javaClassName)) :: Nil)
 
     def varRefGet(ref: Tree): Tree =
-      val varRefCls = requiredClass("dotty.tools.repl.eval.Eval.VarRef")
+      val varRefCls = requiredClass("dotty.tools.eval.Eval.VarRef")
       Apply(Select(ref.cast(varRefCls.typeRef), termName("get")), Nil)
 
     def varRefSet(ref: Tree, rhs: Tree): Tree =
-      val varRefCls = requiredClass("dotty.tools.repl.eval.Eval.VarRef")
+      val varRefCls = requiredClass("dotty.tools.eval.Eval.VarRef")
       Apply(Select(ref.cast(varRefCls.typeRef), termName("set")), rhs :: Nil)
 
     /** `enclosingClass` rather than `owner`: Scala 3 may re-own class

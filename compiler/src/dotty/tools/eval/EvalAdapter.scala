@@ -1,5 +1,4 @@
 package dotty.tools
-package repl
 package eval
 
 import java.util.UUID
@@ -53,7 +52,8 @@ class EvalAdapter:
       expectedType: String,
       enclosingSource: String,
       replClasspath: String = "",
-      evalLogDir: String = ""
+      evalLogDir: String = "",
+      standalone: Boolean = false
   ): Either[Eval.CompileFailure, Any] =
     // Per-invocation log files (when `-Xrepl-eval-log-dir` is set):
     // capture the enclosing source, the body the user submitted,
@@ -104,7 +104,8 @@ class EvalAdapter:
         bindingsKey = EvalAdapter.bindingsFingerprint(bindings),
         importsKey = replWrapperImports.mkString("\n"),
         settingsKey = compilerSettings.mkString(" "),
-        sessionLoader = classLoader
+        sessionLoader = classLoader,
+        standalone = standalone
       )
 
     if cacheKey != null then
@@ -148,10 +149,19 @@ class EvalAdapter:
     // any nested `eval(...)` call inside the body or alongside the
     // marker in the enclosing source, and harmless when the wrapper
     // never references `eval`.
-    val evalImport = "import dotty.tools.repl.eval.Eval.{eval, evalSafe}\n"
+    val evalImport = "import dotty.tools.eval.Eval.{eval, evalSafe}\n"
     val importBlock =
       if replWrapperImports.isEmpty then evalImport
       else evalImport + replWrapperImports.mkString("", "\n", "\n")
+
+    // No enclosing-source slice (a direct call to `Eval.eval`, or a
+    // call site compiled without the rewriter, e.g. without
+    // `-Xdynamic-eval`). Fall back to a minimal context so the body
+    // still has a marker to land in; it compiles without the call
+    // site's lexical scope, so only globally reachable names resolve.
+    val effectiveEnclosing =
+      if enclosingSource.nonEmpty then enclosingSource
+      else s"val __evalUnused__ : Any = { ${EvalContext.placeholder} }"
 
     // Wrap the enclosing source in a synthesised object so the
     // top-level statements (typically a `def` or `val`) become valid
@@ -159,7 +169,7 @@ class EvalAdapter:
     // tree-level splice phase.
     val wrappedSource =
       s"""${importBlock}object $wrapperName {
-         |$enclosingSource
+         |$effectiveEnclosing
          |}
          |""".stripMargin
 
@@ -171,7 +181,8 @@ class EvalAdapter:
       initialScope = initialScope,
       outerEnclosingSource = enclosingSource,
       evalLogDir = evalLogDir,
-      evalLogTimestamp = logTimestamp
+      evalLogTimestamp = logTimestamp,
+      standalone = standalone
     )
 
     val bridge = EvalCompilerBridge()
@@ -199,7 +210,7 @@ class EvalAdapter:
    *  `outDir` (so it can find the wrapper class) and delegates
    *  everything else to the session classloader's *1-arg* `loadClass`,
    *  which is what the REPL [[AbstractFileClassLoader]] override
-   *  implements its `dotty.tools.repl.*` → app-loader routing on. A
+   *  implements its `dotty.tools.eval.*` → app-loader routing on. A
    *  vanilla `AbstractFileClassLoader` (in either Enabled or Disabled
    *  mode) ends up delegating via the JVM's protected
    *  `loadClass(name, resolve)` machinery, which bypasses that
@@ -326,7 +337,7 @@ object EvalAdapter:
    *  class file in `outDir` and routes everything else to the parent's
    *  *1-arg* `loadClass`. The 1-arg form is what the REPL
    *  [[AbstractFileClassLoader]] override consults — the one that
-   *  routes `dotty.tools.repl.*` to the dotty-loaded copy and
+   *  routes `dotty.tools.eval.*` to the dotty-loaded copy and
    *  delegates user/library classes to its own already-loaded
    *  instances. Going through `parent.loadClass(name, false)` (the
    *  JVM's standard delegation primitive) bypasses that override and
@@ -339,8 +350,17 @@ object EvalAdapter:
    *  command, which still gets instrumented through the session
    *  loader.
    */
+  /** Extends `URLClassLoader` (with no URLs of its own; `findClass`
+   *  serves the wrapper class from the in-memory `outDir`) rather
+   *  than plain `ClassLoader` so `ClasspathFromClassloader` can walk
+   *  through it into the parent chain. A nested eval's caller frame
+   *  is a `__EvalExpression` class loaded by this loader; the
+   *  standalone adapter synthesises the inner compile's classpath
+   *  from that loader, and an unrecognised loader type would drop
+   *  the program's own classes from the classpath.
+   */
   private[eval] class WrapperLoader(outDir: AbstractFile, parent: ClassLoader)
-      extends ClassLoader(parent):
+      extends java.net.URLClassLoader(Array.empty[java.net.URL], parent):
 
     override def findClass(name: String): Class[?] =
       import scala.language.unsafeNulls
@@ -397,7 +417,8 @@ object EvalAdapter:
       bindingsKey: String,
       importsKey: String,
       settingsKey: String,
-      sessionLoader: ClassLoader
+      sessionLoader: ClassLoader,
+      standalone: Boolean
   )
 
   /** Cached output of a successful compile. Holds strong refs to the

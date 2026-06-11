@@ -109,6 +109,8 @@ scaladoc/output/
 # only used in local development
 .enable_bsp_all_projects
 
+__pycache__/
+
 log/
 session.repl
 runs/

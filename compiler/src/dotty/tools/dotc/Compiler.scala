@@ -40,6 +40,7 @@ class Compiler {
     List(new sbt.ExtractDependencies) :: // Sends information on classes' dependencies to sbt via callbacks
     List(new semanticdb.ExtractSemanticInfo) :: // Extract info into .semanticdb files
     List(new PostTyper) ::          // Additional checks and cleanups after type checking
+    List(new eval.EvalRewriteTyped) :: // Fill synthetic args of dynamic `eval` calls (only with -Xdynamic-eval)
     List(new UnrollDefinitions) ::  // Unroll annotated methods if detected in PostTyper
     List(new sjs.PrepJSInterop) ::  // Additional checks and transformations for Scala.js (Scala.js only)
     List(new SetRootTree) ::        // Set the `rootTreeOrProvider` on class symbols

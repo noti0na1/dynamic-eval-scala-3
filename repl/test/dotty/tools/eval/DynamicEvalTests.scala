@@ -1,9 +1,10 @@
 package dotty.tools
-package repl
 package eval
 
 import org.junit.Test
 import org.junit.Assert._
+
+import dotty.tools.repl.ReplTest
 
 private object DynamicEvalAssertions:
   def assertContains(needle: String, haystack: String): Unit =
@@ -1102,7 +1103,7 @@ class DynamicEvalTests extends ReplTest:
     // `List[Any]`). Before the rewriter alpha-renamed shadowed
     // tparams the wrapper would have captured `xs` as raw `Box`
     // (precision lost) and the body would compile silently.
-    run("""|import dotty.tools.repl.eval.EvalCompileException
+    run("""|import dotty.tools.eval.EvalCompileException
            |trait Box[T]:
            |  def set(v: T): Unit
            |def f[T](x: T) =
@@ -2097,7 +2098,7 @@ class DynamicEvalTests extends ReplTest:
     // try/catch surrounds eval. `EvalCompileException` is a normal
     // RuntimeException; user code can catch it just like any other.
     run(
-      """|import dotty.tools.repl.eval.EvalCompileException
+      """|import dotty.tools.eval.EvalCompileException
          |def safeEval(): String =
          |  try eval[Int]("undefinedSymbol").toString
          |  catch case _: EvalCompileException => "compile-failed"
@@ -2299,7 +2300,7 @@ class DynamicEvalTests extends ReplTest:
     // defined; what matters is that *at least one* error makes it
     // through and the EvalCompileException is catchable by name.
     run(
-      """|import dotty.tools.repl.eval.EvalCompileException
+      """|import dotty.tools.eval.EvalCompileException
          |val r: String =
          |  try
          |    eval[Int]("false")
@@ -3408,8 +3409,8 @@ class DynamicEvalTests extends ReplTest:
     // captured and resolves in the body) and `expectedType` (so the
     // body type-checks against `Int`).
     run(
-      """|import dotty.tools.repl.eval.Eval
-         |@dotty.tools.repl.eval.evalLike
+      """|import dotty.tools.eval.Eval
+         |@dotty.tools.eval.evalLike
          |def myEval[T](
          |    body: String,
          |    bindings: Array[Eval.Binding] = Array.empty[Eval.Binding],
@@ -3429,7 +3430,7 @@ class DynamicEvalTests extends ReplTest:
     // Rewriter must use named-param matching so the trailing param
     // keeps its caller-supplied value (here `42`, not the default 1).
     run(
-      """|import dotty.tools.repl.eval.{Eval, evalLike}
+      """|import dotty.tools.eval.{Eval, evalLike}
          |@evalLike
          |def withSeed[T](
          |    body: String,
@@ -3451,7 +3452,7 @@ class DynamicEvalTests extends ReplTest:
     // deliberate compile failure (referencing undefined `mystery`)
     // should surface as a failed `EvalResult` rather than throw.
     run(
-      """|import dotty.tools.repl.eval.{Eval, EvalResult, evalSafeLike}
+      """|import dotty.tools.eval.{Eval, EvalResult, evalSafeLike}
          |@evalSafeLike
          |def mySafe[T](
          |    body: String,
@@ -3470,7 +3471,7 @@ class DynamicEvalTests extends ReplTest:
     // matches by name, not by position. Here `enclosingSource`
     // comes before `bindings`, the opposite of the canonical layout.
     run(
-      """|import dotty.tools.repl.eval.{Eval, evalLike}
+      """|import dotty.tools.eval.{Eval, evalLike}
          |@evalLike
          |def myReorder[T](
          |    body: String,
@@ -3487,7 +3488,7 @@ class DynamicEvalTests extends ReplTest:
 
   @Test def shadowingEvalNotRewritten = initially {
     // A user-defined function literally named `eval` that is *not*
-    // owned by `dotty.tools.repl.eval.Eval` and *not* annotated with
+    // owned by `dotty.tools.eval.Eval` and *not* annotated with
     // `@evalLike` is left alone; it's just a regular method call.
     // `bindings`/etc. stay at their declared defaults.
     run(
@@ -3504,7 +3505,7 @@ class DynamicEvalTests extends ReplTest:
     // (not by name or owner), and the call site `repo.myEval[Int](...)`
     // gets the synthetic args filled.
     run(
-      """|import dotty.tools.repl.eval.{Eval, evalLike}
+      """|import dotty.tools.eval.{Eval, evalLike}
          |class Repo:
          |  @evalLike
          |  def myEval[T](
@@ -3529,7 +3530,7 @@ class DynamicEvalTests extends ReplTest:
     // slots by name; the using-param is left alone for the typer's
     // implicit-search machinery, so the caller's given still applies.
     run(
-      """|import dotty.tools.repl.eval.{Eval, evalLike}
+      """|import dotty.tools.eval.{Eval, evalLike}
          |trait Tag:
          |  def label: String
          |@evalLike
@@ -3563,7 +3564,7 @@ class DynamicEvalTests extends ReplTest:
     // confirms expectedType filling uses the wrapper's `[T]`, not
     // a placeholder.
     run(
-      """|import dotty.tools.repl.eval.{Eval, evalLike}
+      """|import dotty.tools.eval.{Eval, evalLike}
          |@evalLike
          |def myEvalT[T](
          |    body: String,
@@ -3585,13 +3586,13 @@ class DynamicEvalTests extends ReplTest:
     // encl that already wraps the marker in a `val __unused__`-style
     // form so the wrapper compile has a place to splice the body.
     run(
-      """|import dotty.tools.repl.eval.Eval
+      """|import dotty.tools.eval.Eval
          |val n = 99
          |val r: Int = Eval.eval[Int](
          |  "1 + 2",
          |  Array.empty[Eval.Binding],
          |  "Int",
-         |  s"val __unused__ : Any = { ${dotty.tools.repl.eval.EvalContext.placeholder} }"
+         |  s"val __unused__ : Any = { ${dotty.tools.eval.EvalContext.placeholder} }"
          |)""".stripMargin
     )
     assertContains("val r: Int = 3", storedOutput())
@@ -3604,7 +3605,7 @@ class DynamicEvalTests extends ReplTest:
     // `expectedType` / `enclosingSource` Idents alone so the original
     // capture (`x`) flows all the way through.
     run(
-      """|import dotty.tools.repl.eval.{Eval, evalLike}
+      """|import dotty.tools.eval.{Eval, evalLike}
          |@evalLike
          |def innerCall[T](
          |    body: String,
@@ -3634,7 +3635,7 @@ class DynamicEvalTests extends ReplTest:
     // two left-default slots would silently override whatever the
     // caller's partial set was meant to express.
     run(
-      """|import dotty.tools.repl.eval.{Eval, evalLike}
+      """|import dotty.tools.eval.{Eval, evalLike}
          |@evalLike
          |def myEval[T](
          |    body: String,
@@ -3654,7 +3655,7 @@ class DynamicEvalTests extends ReplTest:
     // module-level def, including the `__this__` synthetic for the
     // companion's own scope.
     run(
-      """|import dotty.tools.repl.eval.{Eval, evalLike}
+      """|import dotty.tools.eval.{Eval, evalLike}
          |object Repo:
          |  @evalLike
          |  def evalIt[T](
@@ -3677,7 +3678,7 @@ class DynamicEvalTests extends ReplTest:
     // but returning `T` directly is rejected so the caller doesn't
     // get a body that's silently double-wrapped.
     run(
-      """|import dotty.tools.repl.eval.{Eval, evalSafeLike}
+      """|import dotty.tools.eval.{Eval, evalSafeLike}
          |@evalSafeLike
          |def wrong[T](
          |    body: String,
@@ -3715,6 +3716,11 @@ class DynamicEvalTests extends ReplTest:
   //      Fixing this requires lifting module methods out of their containing
   //      ModuleDef the same way `SpliceEvalBody.ClassMethodExtractor` lifts
   //      class methods. (No test for this one yet; tracked in EVAL.md.)
+  //   5. `return` in the body targeting the method enclosing the eval call.
+  //      The body executes inside `__Expression.evaluate` at runtime, so the
+  //      target frame is gone by construction. ExtractEvalBody rejects it
+  //      with a deliberate diagnostic. A `return` from a def declared inside
+  //      the body itself still works (the def and its return move together).
   // ===========================================================================
 
   @Test def bodyDefinesCaseClassRejected = initially {
@@ -3777,6 +3783,47 @@ class DynamicEvalTests extends ReplTest:
       s"expected the eval call to fail with a 'Could not find proxy' diagnostic, got:\n$out",
       out.contains("Could not find proxy") || out.contains("EvalCompileException")
     )
+  }
+
+  @Test def returnFromEnclosingMethodInBodyRejected = initially {
+    // `return` in the body targets the method enclosing the eval call. The
+    // body executes inside `__Expression.evaluate` at runtime, so the target
+    // frame is gone by construction. ExtractEvalBody rejects it with a
+    // deliberate diagnostic instead of letting LambdaLift crash with
+    // "Could not find proxy for val nonLocalReturnKey...". The failure is an
+    // ordinary EvalCompileException, so the session survives.
+    run(
+      """|def f(): Int = eval[Int]("return 42")
+         |f()""".stripMargin
+    )
+  } andThen {
+    val out = storedOutput()
+    assertTrue(s"expected the documented `return` diagnostic, got:\n$out",
+      out.contains("eval failed to compile") &&
+        out.contains("cannot `return` from the method enclosing the eval call"))
+    assertTrue(s"the failure must not surface as an internal compiler error:\n$out",
+      !out.contains("Internal compiler error"))
+    // The session is still usable after the rejected call.
+    run("1 + 1")
+    assertContains(": Int = 2", storedOutput())
+  }
+
+  @Test def returnOutsideMethodInBodyRejected = initially {
+    // At the top level there is no enclosing method at all; the inner
+    // compile rejects the body with the standard typer diagnostic.
+    run("""val r: Int = eval[Int]("return 1")""")
+    val out = storedOutput()
+    assertTrue(s"expected a 'return outside method definition' diagnostic, got:\n$out",
+      out.contains("eval failed to compile") &&
+        out.contains("return outside method definition"))
+  }
+
+  @Test def returnInsideBodyLocalDefWorks = initially {
+    // The boundary of limitation 5: a `return` from a def declared *inside*
+    // the body stays a local return. The def moves into `evaluate` together
+    // with its return, so nothing crosses the method boundary.
+    run("""val r: Int = eval[Int]("def g(x: Int): Int = { if x > 0 then return x * 2; -1 }; g(21)")""")
+    assertContains("val r: Int = 42", storedOutput())
   }
 
 end DynamicEvalTests
@@ -4411,7 +4458,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
   @Test def closureFormSeesEnclosingSourceAndPlaceholder =
     initially {
       run(
-        """|import dotty.tools.repl.eval.EvalContext
+        """|import dotty.tools.eval.EvalContext
            |val r: Int = eval { (ctx: EvalContext) =>
            |  // The agent would inspect ctx.enclosingSource (and
            |  // ctx.placeholder for where to splice) to compose its
@@ -4428,7 +4475,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
   @Test def closureFormSeesBindingNames =
     initially {
       run(
-        """|import dotty.tools.repl.eval.EvalContext
+        """|import dotty.tools.eval.EvalContext
            |def add(x: Int, y: Int): Int =
            |  eval { (ctx: EvalContext) =>
            |    // The generator can see the in-scope names.
@@ -4449,7 +4496,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
     // just check the body composes correctly.
     initially {
       run(
-        """|import dotty.tools.repl.eval.EvalContext
+        """|import dotty.tools.eval.EvalContext
            |def greet(name: String): String =
            |  eval[String] { (ctx: EvalContext) =>
            |    s"\"hello, \" + name"
@@ -4488,7 +4535,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
     // bad and the second corrected.
     initially {
       run(
-        """|import dotty.tools.repl.eval.EvalContext
+        """|import dotty.tools.eval.EvalContext
            |var attempt: Int = 0
            |val r = evalSafe[Int] { (ctx: EvalContext) =>
            |  attempt += 1
@@ -4516,7 +4563,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
   @Test def evalSafeClosureFormSeesContext =
     initially {
       run(
-        """|import dotty.tools.repl.eval.EvalContext
+        """|import dotty.tools.eval.EvalContext
            |def f(x: Int) =
            |  evalSafe[Int] { (ctx: EvalContext) =>
            |    // The generator decides what to splice based on the
@@ -4549,7 +4596,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
            |    val r = evalSafe[Int]("eval[Int](\"undefinedSym + 1\")")
            |    if r.isFailure then "WRONG: outer evalSafe captured nested failure"
            |    else "WRONG: produced a value"
-           |  catch case _: dotty.tools.repl.eval.EvalCompileException =>
+           |  catch case _: dotty.tools.eval.EvalCompileException =>
            |    "OK: nested failure propagated through outer evalSafe"
            |println(outcome)""".stripMargin
       )
@@ -4583,7 +4630,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
     initially {
       val q3 = "\"\"\""
       val innerBody =
-        s"""${q3}eval[Int] { (innerCtx: dotty.tools.repl.eval.EvalContext) =>
+        s"""${q3}eval[Int] { (innerCtx: dotty.tools.eval.EvalContext) =>
            |      assert(innerCtx.bindings.map(_.name).toSet == Set("i"))
            |      assert(innerCtx.enclosingSource.contains("def f(i: Int)"),
            |        "inner should also see the def signature (chained from outer)")
@@ -4592,7 +4639,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
            |      "i + 1"
            |    }${q3}""".stripMargin
       run(
-        s"""|import dotty.tools.repl.eval.EvalContext
+        s"""|import dotty.tools.eval.EvalContext
             |def f(i: Int): Int =
             |  eval[Int] { (outerCtx: EvalContext) =>
             |    assert(outerCtx.bindings.map(_.name).toSet == Set("i"))
@@ -4619,7 +4666,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
       val q3 = "\"\"\""
       val innerBody =
         s"""${q3}val x = 5
-           |    val r1 = evalSafe[Int] { (ctx1: dotty.tools.repl.eval.EvalContext) =>
+           |    val r1 = evalSafe[Int] { (ctx1: dotty.tools.eval.EvalContext) =>
            |      assert(ctx1.bindings.map(_.name).toSet == Set("x", "i"),
            |        "first attempt should see [x, i]")
            |      assert(ctx1.enclosingSource.contains("val x = 5"),
@@ -4627,7 +4674,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
            |      "definitelyMissingSym + 1"
            |    }
            |    if r1.isSuccess then r1.get
-           |    else evalSafe[Int] { (ctx2: dotty.tools.repl.eval.EvalContext) =>
+           |    else evalSafe[Int] { (ctx2: dotty.tools.eval.EvalContext) =>
            |      assert(ctx2.bindings.map(_.name).toSet == Set("r1", "x", "i"),
            |        "retry sits below `val r1` so its bindings include r1, x, i")
            |      assert(ctx2.enclosingSource.contains("val x = 5"),
@@ -4635,7 +4682,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
            |      "x + i"
            |    }.get${q3}""".stripMargin
       run(
-        s"""|import dotty.tools.repl.eval.EvalContext
+        s"""|import dotty.tools.eval.EvalContext
             |def f(i: Int): Int =
             |  eval[Int] { (outerCtx: EvalContext) =>
             |    $innerBody
@@ -4665,7 +4712,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
       val q3 = "\"\"\""
       val innerBody =
         s"""${q3}val x = 5
-           |    eval[Int] { (innerCtx: dotty.tools.repl.eval.EvalContext) =>
+           |    eval[Int] { (innerCtx: dotty.tools.eval.EvalContext) =>
            |      assert(innerCtx.bindings.map(_.name).toSet == Set("x", "i"),
            |        "inner should capture both `x` and `i`")
            |      assert(innerCtx.enclosingSource.contains("def f(i: Int)"),
@@ -4677,7 +4724,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
            |      "x + i"
            |    }${q3}""".stripMargin
       run(
-        s"""|import dotty.tools.repl.eval.EvalContext
+        s"""|import dotty.tools.eval.EvalContext
             |def f(i: Int): Int =
             |  eval[Int] { (outerCtx: EvalContext) =>
             |    assert(outerCtx.bindings.map(_.name).toSet == Set("i"))
@@ -4762,7 +4809,7 @@ class DynamicEvalLogTests extends ReplTest(
   @Test def writesErrorLogOnCompileFailure =
     initially {
       clearLogDir()
-      run("""|import dotty.tools.repl.eval.EvalCompileException
+      run("""|import dotty.tools.eval.EvalCompileException
              |val r = try eval[Int]("undefinedSymbol + 1")
              |        catch case _: EvalCompileException => -1
              |r""".stripMargin)

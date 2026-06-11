@@ -440,6 +440,14 @@ private sealed trait XSettings:
     "pass `false` to disable bytecode instrumentation for interrupt handling in REPL, or `local` to limit interrupt support to only REPL-defined classes",
     "true"
   )
+  val XdynamicEval: Setting[Boolean] = BooleanSetting(
+    AdvancedSetting,
+    "Xdynamic-eval",
+    "Enable dynamic `eval` outside the REPL: rewrite `dotty.tools.eval.Eval.eval` / `evalSafe` " +
+      "(and user functions annotated `@evalLike` / `@evalSafeLike`) call sites so that at runtime " +
+      "the argument string is compiled and run in the call site's lexical context. " +
+      "The Scala 3 compiler must be on the program's runtime classpath. " +
+      "The REPL enables this rewriting unconditionally; the flag is only needed for regular compilation.")
   val XreplEvalLogDir: Setting[String] = StringSetting(
     AdvancedSetting,
     "Xrepl-eval-log-dir",

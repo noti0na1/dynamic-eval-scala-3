@@ -1,8 +1,9 @@
-# Dynamic `eval` in the Scala 3 REPL
+# Dynamic `eval` in Scala 3
 
 `eval[T](code: String): T` compiles and runs an arbitrary string of
-Scala source at runtime against the live REPL session, returning a
-value typed as `T`.
+Scala source at runtime against the live program, returning a value
+typed as `T`. It works in the REPL out of the box, and in any Scala
+program compiled with `-Xdynamic-eval`.
 
 ```scala
 scala> val r: Int = eval("1 + 2")
@@ -18,6 +19,75 @@ computable at runtime. Identifiers in scope at the call site
 (lambda parameters, block locals, method parameters, REPL line
 definitions, class members) are visible inside the body by their
 source name.
+
+## Outside the REPL: `-Xdynamic-eval`
+
+The same feature is available to ordinary programs. The eval
+machinery lives in the compiler (`dotty.tools.eval`), so a program
+that has the Scala 3 compiler on its runtime classpath can call
+`eval` directly:
+
+```scala
+// Square.scala, compiled with: scalac -Xdynamic-eval Square.scala
+import dotty.tools.eval.Eval.eval
+
+def square(x: Int): Int = eval[Int]("x * x")
+
+object Main:
+  def main(args: Array[String]): Unit =
+    val n = args(0).toInt
+    println(List(1, 2, 3).map(z => eval[Int]("z * z + n")))
+```
+
+Two pieces make this work:
+
+1. **Compile time.** `-Xdynamic-eval` enables the `EvalRewriteTyped`
+   phase in the main compiler pipeline (the REPL enables it
+   unconditionally). It fills each call's `bindings`,
+   `expectedType`, and `enclosingSource` from the typed scope, and
+   embeds the file's lexical context into the enclosing-source
+   slice: top-level imports, an `import <pkg>.{given, *}` for the
+   call site's package, and an `import <Obj>.{given, *}` for an
+   enclosing top-level object. That last import is the standalone
+   analogue of the REPL's `import rs$line$N.{given, *}` session
+   imports: sibling members resolve against the *runtime* module on
+   the classpath, so reads and writes hit live state.
+
+2. **Run time.** With no REPL driver installed, `Eval` falls back to
+   a self-initialising standalone adapter. It compiles the body with
+   a classpath synthesised from the calling frame's classloader plus
+   `java.class.path`, and loads the result next to the program's own
+   classes. Optional system properties tune it:
+
+   | Property                    | Meaning                                                            |
+   |-----------------------------|--------------------------------------------------------------------|
+   | `dotty.tools.eval.settings` | whitespace-separated compiler options for the body compile (pass the language options the program was compiled with, e.g. `-Yexplicit-nulls`) |
+   | `dotty.tools.eval.classpath`| explicit classpath for the body compile (overrides the synthesised one) |
+   | `dotty.tools.eval.logDir`   | per-invocation log directory (same files as `-Xrepl-eval-log-dir`) |
+
+Without `-Xdynamic-eval` the call still compiles (it is an ordinary
+method call), but the rewriter never runs: the body is compiled in
+an isolated context where only globally reachable names resolve, and
+a body mentioning a call-site local fails at runtime with a compile
+diagnostic.
+
+Known standalone limitations: a body cannot see `private` members of
+an *enclosing top-level object* (they come in through the embedded
+wildcard import, which, unlike the REPL's reflective class-member
+path, does not expose privates), and a nested (non-top-level)
+`object`'s state is re-elaborated rather than shared. Class members,
+including private ones, go through the same reflective machinery as
+in the REPL and behave identically.
+
+A limitation shared with the REPL: an eval body cannot `return` from
+the method enclosing the eval call. At runtime the body executes
+inside a separate `evaluate()` method, so the frame the `return`
+targets is gone by construction. The pipeline rejects such a body
+with a dedicated compile diagnostic ("the eval body cannot `return`
+from the method enclosing the eval call") rather than crashing, and
+the program can catch the `EvalCompileException` (or use `evalSafe`)
+and continue. A `return` from a def declared *inside* the body still
+works, since the def and its return move into `evaluate()` together.
 
 ## The idea
 
@@ -216,7 +286,7 @@ ordinary Scala. The wrapper compile sees:
 ```scala
 import rs$line$1.{given, *}
 import rs$line$2.{given, *}
-import dotty.tools.repl.eval.Eval.{eval, evalSafe}
+import dotty.tools.eval.Eval.{eval, evalSafe}
 
 object __EvalWrapper_<uuid>:
   // exact text of the user's enclosing method, with
@@ -318,7 +388,7 @@ the import does *not* trigger the rewriter; the warning instead
 says
 
 > `eval` here resolves to `Foo.eval`, not
-> `dotty.tools.repl.eval.Eval.eval`; the eval rewriter is leaving
+> `dotty.tools.eval.Eval.eval`; the eval rewriter is leaving
 > this call alone. If you intended a custom eval generator,
 > annotate the function with `@evalLike` (or `@evalSafeLike`).
 
@@ -821,7 +891,7 @@ This is why the public API uses JDK functional interfaces
 (`Supplier`, `Consumer`, `Function`) instead of Scala's
 `Function0` / `Function1` / `Function2`, and why `Eval.Binding`,
 `EvalContext`, `EvalResult`, and `VarRef` live in
-`dotty.tools.repl.eval`.
+`dotty.tools.eval`.
 
 ## Related approaches: staging and the debugger expression compiler
 
@@ -935,37 +1005,41 @@ sit on either side of a familiar split between observation
 
 ## Running the tests
 
-The REPL, the eval driver, and their tests all live in the
+The eval implementation lives in the compiler
+(`compiler/src/dotty/tools/eval/`); the REPL glue lives in the
 `scala3-repl` sbt subproject (`repl/` in the tree, wired up in
-`project/Build.scala`). The tests are ordinary JUnit `@Test`
-methods run through `junit-interface`, so the usual dotty
-`testOnly <fully.qualified.Class> -- *methodGlob` form applies.
+`project/Build.scala`). All eval tests (REPL end-to-end, standalone
+end-to-end, and pipeline unit tests) run from the `scala3-repl`
+project, which builds on the bootstrapped compiler. The tests are
+ordinary JUnit `@Test` methods run through `junit-interface`, so the
+usual dotty `testOnly <fully.qualified.Class> -- *methodGlob` form
+applies.
 
 Open an sbt shell (`sbt`) and run the commands below at the
 `sbt:scala3>` prompt, or pass them as a single quoted argument
 (`sbt "scala3-repl/testOnly ..."`).
 
-All eval tests live under the `dotty.tools.repl.eval` package (in
-`repl/test/dotty/tools/repl/eval/`), so a single package glob runs
+All eval tests live under the `dotty.tools.eval` package (in
+`repl/test/dotty/tools/eval/`), so a single package glob runs
 every one of them — the end-to-end REPL suites and the lower-level
 pipeline unit tests alike:
 
 ```
 # Every eval test (all suites in both tables below)
-scala3-repl/testOnly dotty.tools.repl.eval.*
+scala3-repl/testOnly dotty.tools.eval.*
 
 # One suite
-scala3-repl/testOnly dotty.tools.repl.eval.DynamicEvalTests
+scala3-repl/testOnly dotty.tools.eval.DynamicEvalTests
 
 # One test method (junit-interface glob on the method name)
-scala3-repl/testOnly dotty.tools.repl.eval.DynamicEvalTests -- *returnsInt
+scala3-repl/testOnly dotty.tools.eval.DynamicEvalTests -- *returnsInt
 
 # The whole REPL test suite (eval tests plus everything else)
 scala3-repl/test
 ```
 
 The eval tests are split into suites by axis. The end-to-end
-suites (in `repl/test/dotty/tools/repl/eval/DynamicEvalTests.scala`)
+suites (in `repl/test/dotty/tools/eval/DynamicEvalTests.scala`)
 drive the real REPL by feeding it source lines and asserting on
 the session output:
 
@@ -978,8 +1052,19 @@ the session output:
 | `DynamicEvalAgentApiTests`       | The `@evalLike` / `@evalSafeLike` wrapper API, the `eval { ctx => ... }` closure form, and `EvalContext`. | (defaults)                                    |
 | `DynamicEvalLogTests`            | The per-invocation log files written by `-Xrepl-eval-log-dir`.                 | `-Xrepl-eval-log-dir:<dir>`                   |
 
+`StandaloneEvalTests` (in
+`repl/test/dotty/tools/eval/StandaloneEvalTests.scala`) covers the
+standalone path end-to-end: each test compiles a complete program
+with the main `dotc` pipeline under `-Xdynamic-eval`, loads the
+classes, and invokes an entry point whose `eval(...)` calls go
+through the standalone adapter. It covers basics, captures of every
+kind, live module state, top-level definitions, named packages,
+class members, nested eval, compile-error reporting (including the
+`return` limitation), flag gating, and settings forwarding via
+`dotty.tools.eval.settings`.
+
 The lower-level unit tests (in
-`repl/test/dotty/tools/repl/eval/`) exercise the pipeline without
+`repl/test/dotty/tools/eval/`) exercise the pipeline without
 the full REPL:
 
 | Suite                      | What it covers                                                                                  |

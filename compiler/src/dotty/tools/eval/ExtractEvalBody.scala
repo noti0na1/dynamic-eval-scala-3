@@ -1,5 +1,4 @@
 package dotty.tools
-package repl
 package eval
 
 import dotty.tools.dotc.ast.tpd.*
@@ -179,6 +178,28 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
             tree.srcPos
           )
           super.transform(tree)
+
+      // `return` targeting a method *outside* the body can never be
+      // honoured: the body runs inside `__Expression.evaluate` at
+      // runtime, so the return's target method no longer encloses it.
+      // Without this check the tree survives to LambdaLift, which
+      // crashes with an internal error ("Could not find proxy for
+      // val nonLocalReturnKey..."). Reject it as a documented
+      // limitation instead. A `return` from a def declared *inside*
+      // the body is fine; the def moves into `evaluate` together
+      // with its return.
+      case tree: Return =>
+        val target = tree.from.symbol
+        if target.exists && !isLocalToBody(target) then
+          report.error(
+            "eval: the eval body cannot `return` from the method enclosing the " +
+              "eval call. At runtime the body executes in a separate `evaluate()` " +
+              "method, so there is no enclosing method frame to return from (known " +
+              "limitation). Restructure the body to yield its result as an expression.",
+            tree.srcPos
+          )
+          tree
+        else super.transform(tree)
 
       // Captured-var write: outer method-local `var x` gets `x = v`
       // routed through the bind site's `VarRef.set(v)`. Body-local
@@ -601,7 +622,7 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
     Set(termName("__refl_get__"), termName("__refl_set__"), termName("__refl_call__"))
 
   private def evalExpressionBaseClass(using Context): ClassSymbol =
-    requiredClass("dotty.tools.repl.eval.EvalExpressionBase")
+    requiredClass("dotty.tools.eval.EvalExpressionBase")
 
 private[eval] object ExtractEvalBody:
   val name: String = "extractEvalBody"

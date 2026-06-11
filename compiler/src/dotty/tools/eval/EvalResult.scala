@@ -1,5 +1,4 @@
 package dotty.tools
-package repl
 package eval
 
 /** The result of a non-throwing `evalSafe` call: either a successful
@@ -10,7 +9,7 @@ package eval
  *  feed the error text back into a generator and retry rather than
  *  handle a thrown exception.
  *
- *  Lives in `dotty.tools.repl` so the eval-output classloader routes
+ *  Lives in `dotty.tools.eval` so the eval-output classloader routes
  *  it through the parent loader and there's a single shared `Class`
  *  on both sides of the eval / REPL boundary (see README.md
  *  "Classloader bridging"). We deliberately avoid `scala.Either` on

@@ -1,5 +1,4 @@
 package dotty.tools
-package repl
 package eval
 
 import dotty.tools.dotc.core.Symbols.*

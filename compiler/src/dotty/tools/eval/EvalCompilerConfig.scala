@@ -1,5 +1,4 @@
 package dotty.tools
-package repl
 package eval
 
 import dotty.tools.dotc.core.Contexts.*
@@ -46,7 +45,15 @@ private[eval] case class EvalCompilerConfig(
      */
     outerEnclosingSource: String = "",
     evalLogDir: String = "",
-    evalLogTimestamp: String = ""
+    evalLogTimestamp: String = "",
+    /** True when the call comes from the standalone runtime path (an
+     *  ordinary program compiled with `-Xdynamic-eval`, no REPL
+     *  session). Turns on [[SpliceEvalBody]]'s class-method lift:
+     *  the program's classes are on the runtime classpath, exactly
+     *  like REPL line wrappers are during a session, so the wrapper
+     *  must not re-mint them.
+     */
+    standalone: Boolean = false
 ):
   val expressionClassName: TypeName = typeName(outputClassName)
 

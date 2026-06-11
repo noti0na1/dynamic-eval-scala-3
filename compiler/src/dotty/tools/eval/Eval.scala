@@ -1,5 +1,4 @@
 package dotty.tools
-package repl
 package eval
 
 // Enables the `@caps.assumeSafe` annotation on `object Eval` below: that
@@ -12,10 +11,12 @@ import scala.language.experimental.captureChecking
  *  `Eval.eval(code)` compiles and runs `code` at runtime, returning the
  *  result as the polymorphic type `T`. The argument can be any `String`.
  *
- *  The REPL compiler's [[EvalRewriteTyped]] phase injects bindings
+ *  The compiler's [[EvalRewriteTyped]] phase injects bindings
  *  automatically for every lambda parameter (and block-local val/def)
  *  in scope at the call site, so `xs.map(z => eval[Int]("z + 1"))`
- *  works without the user writing the bindings explicitly.
+ *  works without the user writing the bindings explicitly. The phase
+ *  is always active in the REPL; ordinary compilation enables it with
+ *  `-Xdynamic-eval`.
  *
  *  The public surface intentionally avoids any Scala-library types
  *  (`Seq`, `ClassTag`, etc.). User wrappers and `Eval` are loaded by
@@ -23,7 +24,10 @@ import scala.language.experimental.captureChecking
  *  objects across the boundary, causing `LinkageError`. We use only
  *  JVM-intrinsic types (`String`, `Object`, `Array`) on the API surface.
  *
- *  Outside an active REPL session this throws.
+ *  At runtime, a live REPL session installs its adapter via
+ *  [[withAdapter]]; outside a session the standalone
+ *  [[StandaloneAdapter]] kicks in, which requires the Scala 3
+ *  compiler on the program's runtime classpath.
  *
  *  Tagged `@caps.assumeSafe` so safe-mode user code can call `eval`,
  *  `evalSafe`, `bind`, etc. The eval driver re-compiles the user's body
@@ -64,7 +68,7 @@ object Eval:
    *  visible to every other piece of code that captured the same
    *  outer var.
    *
-   *  Lives in `dotty.tools.repl` so the eval-output classloader routes
+   *  Lives in `dotty.tools.eval` so the eval-output classloader routes
    *  the `Class` through the REPL infra loader (one shared `Class` on
    *  both sides of the eval boundary; see README.md "Classloader bridging").
    */
@@ -158,7 +162,7 @@ object Eval:
    *  `try { ... } catch case e: EvalCompileException => failure(e)`
    *  inside `evalSafe` would silently swallow nested-eval failures.
    *
-   *  Lives in `dotty.tools.repl` so the eval-output classloader
+   *  Lives in `dotty.tools.eval` so the eval-output classloader
    *  shares the `Class` with the REPL infra (see README.md
    *  "Classloader bridging").
    */
@@ -179,8 +183,9 @@ object Eval:
    *  body string back at that marker and type-checks the result
    *  inside the original lexical context, so identifiers resolve
    *  exactly as they would have at the call site. Empty when the
-   *  rewriter couldn't compute a slice; the runtime falls back to a
-   *  binding-only wrapper.
+   *  rewriter couldn't compute a slice (or didn't run); the runtime
+   *  falls back to a minimal isolated context in which only globally
+   *  reachable names resolve.
    *
    *  Returns either the body's value (`Right`) or a [[CompileFailure]]
    *  (`Left`) describing this call's own compile error. Body runtime
@@ -321,10 +326,10 @@ object Eval:
 
   private def activeAdapter(): Adapter =
     val a = active.get
-    if a == null then
-      throw new IllegalStateException(
-        "eval(...) requires an active dotty REPL session"
-      )
-    a
+    // No driver-installed adapter (i.e. not inside a REPL session):
+    // fall back to the self-initialising standalone adapter, so an
+    // ordinary program compiled with `-Xdynamic-eval` can call eval
+    // with only the compiler on its runtime classpath.
+    if a == null then StandaloneAdapter.instance else a
 
 end Eval

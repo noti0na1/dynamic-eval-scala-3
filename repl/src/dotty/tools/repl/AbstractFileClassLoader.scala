@@ -89,7 +89,7 @@ class AbstractFileClassLoader(root: AbstractFile, parent: ClassLoader, interrupt
           defineClass(name, bytes, 0, bytes.length)
         finally is.close()
       // Don't instrument REPL infrastructure classes. User wrappers
-      // reference them (e.g. `dotty.tools.repl.eval.Eval` for the runtime
+      // reference them (e.g. `dotty.tools.eval.Eval` for the runtime
       // `eval` callback) and need the *same* Class instance the driver
       // itself uses; otherwise object-level mutable state like
       // `Eval.active` (a ThreadLocal) splits into independent copies.
@@ -99,6 +99,13 @@ class AbstractFileClassLoader(root: AbstractFile, parent: ClassLoader, interrupt
       // `AbstractFileClassLoader` itself is necessarily the same one
       // the running ReplDriver uses.
       case s"dotty.tools.repl.$_" =>
+        classOf[AbstractFileClassLoader].getClassLoader.loadClass(name)
+      // Same routing for the eval infrastructure (`dotty.tools.eval.*`,
+      // which lives in the compiler jar): `Eval.active`, `Eval.Binding`,
+      // `EvalResult`, etc. must resolve to the single Class instances
+      // the driver uses, not to a copy redefined from the
+      // compiler-classpath URLClassLoader.
+      case s"dotty.tools.eval.$_" =>
         classOf[AbstractFileClassLoader].getClassLoader.loadClass(name)
       // Don't instrument the Scala or Dotty standard libraries. Values
       // produced by `eval` are passed back across classloader boundaries

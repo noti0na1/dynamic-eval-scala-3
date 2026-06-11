@@ -1,5 +1,4 @@
 package dotty.tools
-package repl
 package eval
 
 import dotc.Compiler
@@ -36,7 +35,15 @@ import dotc.core.Phases.Phase
 class EvalCompiler(config: EvalCompilerConfig) extends Compiler:
 
   override protected def frontendPhases: List[List[Phase]] =
-    val parser :: others = super.frontendPhases: @unchecked
+    val parser :: others0 = super.frontendPhases: @unchecked
+    // The base Compiler pipeline carries its own (flag-gated)
+    // EvalRewriteTyped instance; drop it so the config-carrying
+    // instance below is the only one (duplicate phase names in a
+    // single plan are rejected, and the inner compile may run with
+    // `-Xdynamic-eval` forwarded from the outer session).
+    val others = others0
+      .map(_.filterNot(_.phaseName == EvalRewriteTyped.name))
+      .filter(_.nonEmpty)
     // [[EvalRewriteTyped]] runs at the *end* of frontend (after
     // PostTyper, before any transformPhases like Inlining, macro
     // expansion, cc). At that point typed symbols are resolved (so

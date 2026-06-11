@@ -36,5 +36,5 @@ class CollectTopLevelImports extends Phase {
   }
 
   private def isSyntheticEvalImport(imp: Import)(using Context): Boolean =
-    imp.expr.symbol.fullName.toString == "dotty.tools.repl.eval.Eval"
+    imp.expr.symbol.fullName.toString == "dotty.tools.eval.Eval"
 }
