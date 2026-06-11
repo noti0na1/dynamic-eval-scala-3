@@ -2,7 +2,7 @@ package dotty.tools
 package eval
 
 import dotty.tools.dotc.ast.tpd.*
-import dotty.tools.dotc.core.Constants.Constant
+import dotty.tools.dotc.core.Constants.{ClazzTag, Constant}
 import dotty.tools.dotc.core.Contexts.*
 import dotty.tools.dotc.core.Decorators.*
 import dotty.tools.dotc.core.DenotTransformers.InfoTransformer
@@ -187,6 +187,20 @@ private[eval] class ResolveEvalAccess(config: EvalCompilerConfig, store: EvalSto
           val gen = new Gen(This(config.expressionClass))
           gen.getRaw(EvalNames.moduleBinding(store.linkedModules(tree.symbol)))
 
+        // `classOf[C']` constant of a linked class. User code can
+        // write it directly, but the main producer is chained mode:
+        // a *nested* eval call inside this body gets its own
+        // `__evalClass_C__` bind value injected as `classOf[C']` of
+        // the re-elaborated class, which would otherwise survive as
+        // an `ldc` of a class that never reaches the runtime
+        // classpath. Forward this call's own linked class object
+        // instead, so the next eval level links to the same original
+        // class.
+        case tree @ Literal(c)
+            if c.tag == ClazzTag && store.linkedClassName(c.typeValue).isDefined =>
+          val gen = new Gen(This(config.expressionClass))
+          gen.linkedClassOf(store.linkedClassName(c.typeValue).get)
+
         case _ => super.transform(tree)
 
     /** Member of a linked local class or linked local module's class.
@@ -233,6 +247,13 @@ private[eval] class ResolveEvalAccess(config: EvalCompilerConfig, store: EvalSto
     def castLinked(qualifier: Tree, sourceName: String): Tree =
       callOnThis("castLinked",
         boxed(qualifier) :: Literal(Constant(sourceName)) :: Nil)
+
+    /** `linkedClass("C")`: the original runtime `Class` of the
+     *  linked local class `C`, replacing a `classOf[C']` constant of
+     *  the re-elaborated class.
+     */
+    def linkedClassOf(sourceName: String): Tree =
+      callOnThis("linkedClass", Literal(Constant(sourceName)) :: Nil)
 
     /** Box a primitive-typed tree. The sweep runs after erasure, so
      *  adaptation that the erasure phase would normally insert has

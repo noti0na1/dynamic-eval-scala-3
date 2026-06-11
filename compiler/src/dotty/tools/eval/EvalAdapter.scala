@@ -96,11 +96,17 @@ class EvalAdapter:
     // Skip caching when `enclosingSource` is empty: that's either a
     // direct caller (no rewriter) or a runtime-rewritten nested eval,
     // and we don't have a tight enough discriminator to cache safely.
+    // `expectedType` is part of the key: the marker erases the call's
+    // `[T]` argument from the enclosing-source slice, so two call
+    // sites can share (code, enclosingSource, ...) yet pin different
+    // expected types, and the expected type shapes the wrapper's
+    // `val __evalResult: <tpe>` ascription.
     val cacheKey: EvalAdapter.WrapperKey | Null =
       if enclosingSource.isEmpty then null
       else EvalAdapter.WrapperKey(
         code = code,
         enclosingSource = enclosingSource,
+        expectedType = expectedType,
         bindingsKey = EvalAdapter.bindingsFingerprint(bindings),
         importsKey = replWrapperImports.mkString("\n"),
         settingsKey = compilerSettings.mkString(" "),
@@ -414,6 +420,7 @@ object EvalAdapter:
   private[eval] case class WrapperKey(
       code: String,
       enclosingSource: String,
+      expectedType: String,
       bindingsKey: String,
       importsKey: String,
       settingsKey: String,

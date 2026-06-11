@@ -3808,6 +3808,131 @@ class DynamicEvalTests extends ReplTest:
     assertContains("val res0: Int = 11", storedOutput())
   }
 
+  // -- Local classes across *nested* evals (chained mode). ------------------
+  //
+  //    The inner eval call is rewritten during the outer body's wrapper
+  //    compile, where the class in scope is the wrapper's re-elaborated
+  //    copy; its runtime artifacts must still link back to the one
+  //    original lifted class. Instances must flow original scope ->
+  //    outer body -> inner body and back, all sharing one JVM class.
+
+  @Test def localClassSharedAcrossNestedEvals = initially {
+    // `c` is built in the original scope, `d` in the outer body via
+    // the ctor factory, `new C(100)` in the inner body; the inner
+    // body reads members of all three.
+    run("""|def f(): Int =
+           |  class C(val x: Int)
+           |  val c = new C(1)
+           |  eval[Int]("val d = new C(10); eval[Int](\"c.x + d.x + new C(100).x\")")
+           |f()""".stripMargin)
+    val out = storedOutput()
+    assertTrue(s"no compile failure expected, got:\n$out",
+      !out.contains("eval failed to compile"))
+    assertContains("val res0: Int = 111", out)
+  }
+
+  @Test def localClassInstanceReturnedThroughNestedEvals = initially {
+    // The instance is constructed two eval levels deep and consumed
+    // at the original call site: both the inner-to-outer and the
+    // outer-to-call-site boundary crossings checkcast against the
+    // original class.
+    run("""|def f(): Int =
+           |  class C(val x: Int)
+           |  val c: C = eval[C]("eval[C](\"new C(21)\")")
+           |  c.x * 2
+           |f()""".stripMargin)
+    val out = storedOutput()
+    assertTrue(s"no compile failure expected, got:\n$out",
+      !out.contains("eval failed to compile"))
+    assertContains("val res0: Int = 42", out)
+  }
+
+  @Test def localCaseClassCompanionAcrossNestedEvals = initially {
+    // The companion's `apply` runs in the outer body and the
+    // `unapply` (pattern match) in the inner body, both through the
+    // live `__evalModule_Pt__` link; `p` from the original scope is
+    // still visible two levels deep.
+    run("""|def f(): Int =
+           |  case class Pt(x: Int, y: Int)
+           |  val p = Pt(1, 2)
+           |  eval[Int]("val q = Pt(p.y, 30); eval[Int](\"q match { case Pt(a, b) => a + b + p.x }\")")
+           |f()""".stripMargin)
+    val out = storedOutput()
+    assertTrue(s"no compile failure expected, got:\n$out",
+      !out.contains("eval failed to compile"))
+    assertContains("val res0: Int = 33", out)
+  }
+
+  @Test def localObjectLiveStateAcrossNestedEvals = initially {
+    // Both eval levels mutate the same live module instance; the
+    // writes from each level must land on the original module, not
+    // on a re-elaborated copy.
+    run("""|def f(): Int =
+           |  object Counter:
+           |    var n = 0
+           |  Counter.n = 1
+           |  eval[Unit]("Counter.n += 10; eval[Unit](\"Counter.n += 100\")")
+           |  Counter.n
+           |f()""".stripMargin)
+    val out = storedOutput()
+    assertTrue(s"no compile failure expected, got:\n$out",
+      !out.contains("eval failed to compile"))
+    assertContains("val res0: Int = 111", out)
+  }
+
+  // -- Classes *born inside* an eval body, used by a nested eval. -----------
+  //
+  //    Here the outer wrapper's class is itself the original: the
+  //    inner call's rewriter (running in the outer wrapper compile)
+  //    bundles classOf / ctor factories of that class, and the inner
+  //    wrapper links to it exactly like a method-local class.
+
+  @Test def bodyDefinesPlainClassAndUsesIt = initially {
+    // Baseline for the nested variants below: a *plain* class
+    // declared in the body is a fresh wrapper-owned class (no
+    // linking involved) and is constructible in the same body. (A
+    // *case* class in the body is still rejected; see
+    // `bodyDefinesCaseClassRejected`.)
+    run("""val r: Int = eval[Int]("class D(val x: Int); new D(11).x")""")
+    assertContains("val r: Int = 11", storedOutput())
+  }
+
+  @Test def classDefinedInOuterEvalUsedInInnerEval = initially {
+    // `d` built in the outer body, `new D(10)` in the inner body;
+    // both must be instances of the outer wrapper's one D.
+    run("""val r: Int = eval[Int]("class D(val x: Int); val d = new D(1); eval[Int](\"d.x + new D(10).x\")")""")
+    val out = storedOutput()
+    assertTrue(s"no compile failure expected, got:\n$out",
+      !out.contains("eval failed to compile"))
+    assertContains("val r: Int = 11", out)
+  }
+
+  @Test def classDefinedInOuterEvalInstanceReturnedFromInnerEval = initially {
+    // The inner eval constructs the instance through the ctor-factory
+    // link and the outer body checkcasts it against its own D: one
+    // class on both sides.
+    run("""val r: Int = eval[Int]("class D(val x: Int); val d: D = eval[D](\"new D(21)\"); d.x * 2")""")
+    val out = storedOutput()
+    assertTrue(s"no compile failure expected, got:\n$out",
+      !out.contains("eval failed to compile"))
+    assertContains("val r: Int = 42", out)
+  }
+
+  @Test def originalScopeAndOuterBodyClassesMixedInInnerEval = initially {
+    // Two locals of *different birth scopes* meet in the inner body:
+    // `C` from the original method (linked through two compiles) and
+    // `D` from the outer eval body (linked through one).
+    run("""|def f(): Int =
+           |  class C(val x: Int)
+           |  val c = new C(1)
+           |  eval[Int]("class D(val y: Int); val d = new D(10); eval[Int](\"c.x + d.y\")")
+           |f()""".stripMargin)
+    val out = storedOutput()
+    assertTrue(s"no compile failure expected, got:\n$out",
+      !out.contains("eval failed to compile"))
+    assertContains("val res0: Int = 11", out)
+  }
+
   // ===========================================================================
   // 39. Non-local `return` from the eval body.
   //
@@ -3934,6 +4059,250 @@ class DynamicEvalTests extends ReplTest:
     // the body stays a local return. The def moves into `evaluate` together
     // with its return, so nothing crosses the method boundary.
     run("""val r: Int = eval[Int]("def g(x: Int): Int = { if x > 0 then return x * 2; -1 }; g(21)")""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  // ===========================================================================
+  // 40. Inferred `[T]`: the expectedType slot falls back to the call's
+  //     prototype.
+  //
+  //     `val a: A = eval("...")` gives the typer only the constraint
+  //     `T <: A`, so interpolation minimizes `T := Nothing` and the
+  //     typed type argument carries no information. A hook at the end
+  //     of the typer's `typedApply` records the call's expected type
+  //     (the source of that constraint) on the tree, and the rewriter
+  //     renders it into the `expectedType` slot instead, resolving any
+  //     type variables it mentions against the final instantiations.
+  //     This covers every position the typer propagates a prototype
+  //     into: val/def results, ascriptions, if/match branches, block
+  //     results, and argument positions (including arguments of
+  //     generic methods, where the prototype is the callee's own type
+  //     variable).
+  // ===========================================================================
+
+  @Test def inferredExpectedTypeWidensPrimitive = initially {
+    // Without the recovered `Long` ascription the body's `21 + 21`
+    // compiles as `Int`, and unboxing the returned `Integer` into
+    // the `Long` val fails at runtime with a ClassCastException.
+    run("""val a: Long = eval("21 + 21")""")
+    assertContains("val a: Long = 42", storedOutput())
+  }
+
+  @Test def inferredExpectedTypeDrivesLambdaParamInference = initially {
+    // `x => x + 1` has no parameter type; it only compiles when the
+    // recovered `Int => Int` reaches the body as its expected type.
+    run(
+      """|val f: Int => Int = eval("x => x + 1")
+         |val r: Int = f(41)""".stripMargin
+    )
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def inferredExpectedTypeFromDefResultType = initially {
+    // Same shape as `returnsCurriedClosureBuiltDynamically`, minus
+    // the explicit `[Int => Int => Int]` type argument: the def's
+    // declared result type supplies it.
+    run(
+      """|def mkOp(op: String): Int => Int => Int =
+         |  eval(s"i => j => i $op j")
+         |val r: Int = mkOp("*")(6)(7)""".stripMargin
+    )
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def inferredExpectedTypeFromAscription = initially {
+    run("""val r: Int = (eval("x => x * 2"): Int => Int)(21)""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def evalCallDirectlyFollowedByColonSplicesCleanly = initially {
+    // Regression for the marker lexing: the marker text ends in `_`,
+    // and an eval call directly followed by an operator character
+    // (here the ascription colon) used to glue in the slice into the
+    // single identifier `__evalBodyPlaceholder__:`, breaking the
+    // wrapper parse. Explicit `[T]` so this exercises only the slice
+    // machinery, not the expected-type fallback.
+    run("""val n = (eval[Long]("21 + 21"): Long) / 2""")
+    assertContains("val n: Long = 21", storedOutput())
+  }
+
+  @Test def inferredExpectedTypeReachesIfBranches = initially {
+    run(
+      """|def pick(b: Boolean): Int => Int =
+         |  if b then eval("x => x + 1") else identity
+         |val r: Int = pick(true)(41)""".stripMargin
+    )
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def inferredExpectedTypeReachesMatchCases = initially {
+    run(
+      """|val f: Int => Int = "double" match
+         |  case "double" => eval("x => x * 2")
+         |  case _        => identity
+         |val r: Int = f(21)""".stripMargin
+    )
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def inferredExpectedTypeThroughBlockResult = initially {
+    run(
+      """|val f: Int => Int = {
+         |  val inc = 1
+         |  eval("x => x + inc")
+         |}
+         |val r: Int = f(41)""".stripMargin
+    )
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def inferredExpectedTypeUnwrapsEvalResultForSafeFlavor = initially {
+    // `evalSafe` returns `EvalResult[T]` (covariant), so the same
+    // minimization applies; the recovered expected type is the
+    // `EvalResult` type argument, not the full `EvalResult[...]`.
+    run(
+      """|import dotty.tools.eval.EvalResult
+         |val r: EvalResult[Int => Int] = evalSafe("x => x + 1")
+         |val v: Int = r.get(41)""".stripMargin
+    )
+    assertContains("val v: Int = 42", storedOutput())
+  }
+
+  @Test def explicitTypeArgStillWinsOverContext = initially {
+    // An explicit `[T]` is informative and is rendered as before;
+    // the declared `Any` on the val plays no part.
+    run(
+      """|val a: Any = eval[Long]("21 + 21")
+         |val isLong = a.isInstanceOf[Long]""".stripMargin
+    )
+    assertContains("val isLong: Boolean = true", storedOutput())
+  }
+
+  @Test def inferredExpectedTypeInArgumentPosition = initially {
+    // The eval call is an argument; its prototype is `twice`'s
+    // declared parameter type `Int => Int`, which the lambda body
+    // needs for parameter inference.
+    run(
+      """|def twice(f: Int => Int): Int = f(f(7))
+         |val r: Int = twice(eval("x => x * 3"))""".stripMargin
+    )
+    assertContains("val r: Int = 63", storedOutput())
+  }
+
+  @Test def inferredExpectedTypeResolvesCalleeTypeVariable = initially {
+    // The eval call is an argument of a *generic* method, so its
+    // prototype at typing time is `pick`'s uninstantiated type
+    // variable `U`. The other argument and the val's declared type
+    // drive `U := Int => Int`, and the recorded prototype resolves
+    // to that final instance when the rewriter renders it.
+    run(
+      """|def pick[U](x: U, y: U): U = x
+         |val f: Int => Int = pick(eval("x => x + 1"), identity[Int])
+         |val r: Int = f(41)""".stripMargin
+    )
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def inferredExpectedTypeThroughUsingClauseEvalLike = initially {
+    // A user eval-like with a trailing using clause: the typer
+    // inserts the implicit application *around* the Apply that
+    // carries the recorded prototype, so the rewriter must find it
+    // down the Apply chain.
+    run(
+      """|import dotty.tools.eval.{Eval, evalLike}
+         |@evalLike
+         |def myCtxEval[T](
+         |    body: String,
+         |    bindings: Array[Eval.Binding] = Array.empty[Eval.Binding],
+         |    expectedType: String = "",
+         |    enclosingSource: String = ""
+         |)(using DummyImplicit): T =
+         |  Eval.eval[T](body, bindings, expectedType, enclosingSource)
+         |val f: Int => Int = myCtxEval("x => x + 1")
+         |val r: Int = f(41)""".stripMargin
+    )
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def inferredExpectedTypeThroughMultiLevelIf = initially {
+    // The prototype reaches every leaf of a two-level if chain; each
+    // lambda body relies on it for parameter inference.
+    run(
+      """|def grade(n: Int): Int => Int =
+         |  if n > 10 then
+         |    if n > 100 then eval("x => x * 100") else eval("x => x * 10")
+         |  else eval("x => x + 1")
+         |val r1: Int = grade(200)(2)
+         |val r2: Int = grade(50)(2)
+         |val r3: Int = grade(5)(2)""".stripMargin
+    )
+    val out = storedOutput()
+    assertContains("val r1: Int = 200", out)
+    assertContains("val r2: Int = 20", out)
+    assertContains("val r3: Int = 3", out)
+  }
+
+  @Test def inferredExpectedTypeMatchInsideIf = initially {
+    // A match expression as an if branch: the prototype flows
+    // if-branch -> match -> case body.
+    run(
+      """|val f: Int => Int =
+         |  if true then
+         |    "inc" match
+         |      case "inc" => eval("x => x + 1")
+         |      case _     => identity
+         |  else identity
+         |val r: Int = f(41)""".stripMargin
+    )
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def inferredExpectedTypeThroughNestedMatchWithGuard = initially {
+    // Two nested match levels, the outer case guarded. The `Long`
+    // result type must reach the innermost case body: the body's
+    // `20 + 22` compiles as `Int` without it and the call site's
+    // unboxing fails.
+    run(
+      """|def pick(tag: String, n: Int): Long =
+         |  tag match
+         |    case "a" if n > 0 =>
+         |      n match
+         |        case 1 => eval("20 + 22")
+         |        case _ => 0L
+         |    case _ => -1L
+         |val r: Long = pick("a", 1)""".stripMargin
+    )
+    assertContains("val r: Long = 42", storedOutput())
+  }
+
+  @Test def inferredExpectedTypeInTryAndCatchPositions = initially {
+    // The prototype reaches both the try expression and the handler
+    // case bodies.
+    run(
+      """|val f: Int => Int =
+         |  try eval("x => x + 1")
+         |  catch case _: Throwable => identity
+         |val r1: Int = f(41)
+         |def boom(): Int => Int =
+         |  try throw new RuntimeException("boom")
+         |  catch case _: RuntimeException => eval("x => x * 2")
+         |val r2: Int = boom()(21)""".stripMargin
+    )
+    val out = storedOutput()
+    assertContains("val r1: Int = 42", out)
+    assertContains("val r2: Int = 42", out)
+  }
+
+  @Test def inferredExpectedTypeBlockInsideIfBranch = initially {
+    // A block as an if branch: the prototype flows to the block's
+    // result expression, and the block-local `k` is still captured
+    // as a binding.
+    run(
+      """|val f: Int => Int =
+         |  if true then { val k = 2; eval("x => x * k") }
+         |  else identity
+         |val r: Int = f(21)""".stripMargin
+    )
     assertContains("val r: Int = 42", storedOutput())
   }
 
@@ -4234,6 +4603,30 @@ class DynamicEvalCaptureCheckingTests extends ReplTest(
           && !out.contains("not included in the allowed capture set")
       )
       assertContains("val r: Classified[Int]", out)
+    }
+
+  @Test def bindingTypesKeepCaptureAnnotations =
+    // With capture checking enabled in the live session, the
+    // binding-type renderer keeps capture annotations, so a
+    // binding's `tpe` string carries the declared capability shape
+    // (`IO^`, `() ->{io} Int`) rather than the erased underlying
+    // type.
+    initially {
+      run(
+        """|import dotty.tools.eval.EvalContext
+           |import caps.*
+           |class IO extends SharedCapability
+           |def f(io: IO^, g: () ->{io} Int): Int =
+           |  eval[Int] { (ctx: EvalContext) =>
+           |    val tpes = ctx.bindings.map(b => b.name -> b.tpe).toMap
+           |    assert(tpes("io") == "IO^", s"io: '${tpes("io")}'")
+           |    assert(tpes("g") == "() ->{io} Int", s"g: '${tpes("g")}'")
+           |    "g()"
+           |  }
+           |val io = new IO
+           |println(s"f=${f(io, () => 41 + 1)}")""".stripMargin
+      )
+      assertContains("f=42", storedOutput())
     }
 end DynamicEvalCaptureCheckingTests
 
@@ -4597,6 +4990,154 @@ class DynamicEvalAgentApiTests extends ReplTest:
            |println(s"add(7, 35)=${add(7, 35)}")""".stripMargin
       )
       assertContains("add(7, 35)=42", storedOutput())
+    }
+
+  @Test def closureFormSeesBindingTypes =
+    initially {
+      run(
+        """|import dotty.tools.eval.EvalContext
+           |def outer(x: Int, s: String): String =
+           |  def helper(a: Int): Int = a + 1
+           |  var count = 0
+           |  eval[String] { (ctx: EvalContext) =>
+           |    // The generator can see the call site's expected type
+           |    // and each binding's static type, rendered from the
+           |    // typer (not the value's runtime class).
+           |    assert(ctx.expectedType == "String",
+           |      s"expectedType: '${ctx.expectedType}'")
+           |    val tpes = ctx.bindings.map(b => b.name -> b.tpe).toMap
+           |    assert(tpes("x") == "Int", s"x: '${tpes("x")}'")
+           |    assert(tpes("s") == "String", s"s: '${tpes("s")}'")
+           |    assert(tpes("count") == "Int", s"count: '${tpes("count")}'")
+           |    assert(tpes("helper") == "(a: Int): Int", s"helper: '${tpes("helper")}'")
+           |    "s + helper(x).toString"
+           |  }
+           |println(outer(41, "r="))""".stripMargin
+      )
+      assertContains("r=42", storedOutput())
+    }
+
+  @Test def closureFormSeesComplexBindingTypes =
+    // The full surface syntax survives in the rendered binding
+    // types: applied types, tuples, wildcards, unions,
+    // intersections, annotated types, and path-dependent types on
+    // another binding's path.
+    initially {
+      run(
+        """|import dotty.tools.eval.EvalContext
+           |trait A
+           |trait B
+           |class Box { type Elem = Int }
+           |def shapes(
+           |    xs: List[Int], t: (Int, String), w: List[?],
+           |    u: Int | String, ab: A & B)(c: Box)(x: c.Elem): Int =
+           |  val a: Int @unchecked = 1
+           |  eval[Int] { (ctx: EvalContext) =>
+           |    val tpes = ctx.bindings.map(b => b.name -> b.tpe).toMap
+           |    def chk(n: String, expected: String) =
+           |      assert(tpes(n) == expected,
+           |        s"$n: '${tpes(n)}' (expected '$expected')")
+           |    chk("xs", "List[Int]")
+           |    chk("t", "(Int, String)")
+           |    chk("w", "List[?]")
+           |    chk("u", "Int | String")
+           |    chk("ab", "A & B")
+           |    chk("c", "Box")
+           |    chk("x", "c.Elem")
+           |    chk("a", "Int @unchecked")
+           |    "xs.sum + x + a"
+           |  }
+           |val r = shapes(List(1, 2), (3, "three"), List("a"), 4, new A with B {})(new Box)(38)
+           |println(s"shapes=$r")""".stripMargin
+      )
+      assertContains("shapes=42", storedOutput())
+    }
+
+  @Test def closureFormSeesLocallyScopedBindingTypes =
+    // Binding types are informational, rendered as code at the call
+    // site could write them. Locally-scoped classes, local type
+    // aliases, and enclosing method type parameters are all in scope
+    // there, so they render by name instead of bailing out to the
+    // empty string.
+    initially {
+      run(
+        """|import dotty.tools.eval.EvalContext
+           |def mk(): String =
+           |  case class P(x: Int, y: Int)
+           |  type Alias = Int
+           |  val p: P = P(1, 2)
+           |  val a: Alias = 3
+           |  eval[String] { (ctx: EvalContext) =>
+           |    val tpes = ctx.bindings.map(b => b.name -> b.tpe).toMap
+           |    assert(tpes("p") == "P", s"p: '${tpes("p")}'")
+           |    assert(tpes("a") == "Alias", s"a: '${tpes("a")}'")
+           |    "p.x.toString + a.toString"
+           |  }
+           |def poly[T](x: T): String =
+           |  eval[String] { (ctx: EvalContext) =>
+           |    val tpes = ctx.bindings.map(b => b.name -> b.tpe).toMap
+           |    assert(tpes("x") == "T", s"x: '${tpes("x")}'")
+           |    "x.toString"
+           |  }
+           |println(s"mk=${mk()} poly=${poly(42)}")""".stripMargin
+      )
+      assertContains("mk=13 poly=42", storedOutput())
+    }
+
+  @Test def closureFormSeesLocallyScopedExpectedType =
+    // `expectedType` is rendered informationally when an
+    // enclosing-source slice exists: the runtime re-typechecks the
+    // string at the marker position inside the slice, where the
+    // local class resolves, so an explicit `eval[Q]` reports "Q"
+    // even for a method-local `Q`.
+    initially {
+      run(
+        """|import dotty.tools.eval.EvalContext
+           |def mkQ(): String =
+           |  case class Q(n: Int)
+           |  val q: Q = eval[Q] { (ctx: EvalContext) =>
+           |    assert(ctx.expectedType == "Q",
+           |      s"explicit expectedType: '${ctx.expectedType}'")
+           |    "Q(7)"
+           |  }
+           |  val q2: Q = eval { (ctx: EvalContext) =>
+           |    // Without an explicit `[Q]` the typer minimises the
+           |    // call's `T` to `Nothing` (the val's expected type
+           |    // only bounds it from above); the rewriter recovers
+           |    // the val's declared `Q` as the expected type, so
+           |    // the inferred form reports the same string as the
+           |    // explicit one.
+           |    assert(ctx.expectedType == "Q",
+           |      s"inferred expectedType: '${ctx.expectedType}'")
+           |    "Q(35)"
+           |  }
+           |  (q.n + q2.n).toString
+           |println(s"mkQ=${mkQ()}")""".stripMargin
+      )
+      assertContains("mkQ=42", storedOutput())
+    }
+
+  @Test def closureFormSeesPathDependentTypeOnOuterVal =
+    // Path-dependent type whose path is a session-level val rather
+    // than a sibling binding: the rendered string keeps the
+    // user-visible path (`h.T`), with the REPL wrapper prefix
+    // omitted by the printer.
+    initially {
+      run(
+        """|import dotty.tools.eval.EvalContext
+           |class Holder:
+           |  type T = String
+           |  val value: T = "ok"
+           |val h = new Holder
+           |def len(x: h.T): Int =
+           |  eval[Int] { (ctx: EvalContext) =>
+           |    val tpes = ctx.bindings.map(b => b.name -> b.tpe).toMap
+           |    assert(tpes("x") == "h.T", s"x: '${tpes("x")}'")
+           |    "x.length"
+           |  }
+           |println(s"len=${len(h.value)}")""".stripMargin
+      )
+      assertContains("len=2", storedOutput())
     }
 
   @Test def closureFormCaptureCheckingStillFires =
