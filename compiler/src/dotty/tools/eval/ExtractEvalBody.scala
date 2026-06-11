@@ -50,14 +50,39 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
    */
   override def transformPhase(using Context): Phase = this.next
 
-  /** Re-own symbols whose owner was the spliced `__evalResult` val to
-   *  `__Expression.evaluate`. Identified by name so this is a no-op
-   *  on units that don't carry the marker.
+  /** Two denotation-level adjustments:
+   *
+   *    1. Re-own symbols whose owner was the spliced `__evalResult`
+   *       val to `__Expression.evaluate`, so body-local definitions
+   *       survive the move. Identified by name so this is a no-op on
+   *       units that don't carry the marker.
+   *    2. For body-local symbols whose *info* mentions a linked
+   *       local class, substitute that class with `Object`. The
+   *       runtime values flowing through those positions belong to
+   *       the *original* lifted class, not the wrapper's
+   *       re-elaborated copy, so a compiled descriptor naming the
+   *       copy would force a `checkcast` against the wrong class.
+   *       Member accesses on the now-`Object`-typed values are
+   *       lowered reflectively (by symbol) in the body rewrite and
+   *       the post-erasure sweep, so no information is lost.
    */
   override def transform(ref: SingleDenotation)(using Context): SingleDenotation =
     ref match
-      case ref: SymDenotation if isExpressionVal(ref.symbol.maybeOwner) =>
-        ref.copySymDenotation(owner = config.evaluateMethod)
+      case ref: SymDenotation =>
+        val reOwned = isExpressionVal(ref.symbol.maybeOwner)
+        val mappedInfo =
+          if store.hasLinked
+            && !ref.symbol.isClass
+            && isLocalToBodySym(ref.symbol)
+            && store.mentionsLinkedRef(ref.info)
+          then store.eraseLinkedRefs(ref.info)
+          else null
+        if reOwned || (mappedInfo != null) then
+          ref.copySymDenotation(
+            owner = if reOwned then config.evaluateMethod else ref.symbol.owner,
+            info = if mappedInfo != null then mappedInfo else ref.info
+          )
+        else ref
       case _ => ref
 
   override protected def newTransformer(using Context): Transformer =
@@ -65,6 +90,59 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
 
   private def isExpressionVal(sym: Symbol)(using Context): Boolean =
     sym.exists && sym.name == SpliceEvalBody.EvalResultName
+
+  /** True when `sym` is declared inside the eval body (its owner
+   *  chain passes through the spliced val, `evaluate`, or the
+   *  expression class). Phase-level twin of the transformer's
+   *  `isLocalToBody`.
+   */
+  private def isLocalToBodySym(sym: Symbol)(using Context): Boolean =
+    val valSym = store.symbol
+    if !sym.exists || valSym == null then false
+    else sym.ownersIterator.exists(o =>
+      o == valSym || o == config.evaluateMethod || o == config.expressionClass
+    )
+
+  /** True when `sym` is owned (possibly transitively through other
+   *  classes) by a term, i.e. a class/module declared inside a method.
+   */
+  private def isTermOwnedSym(sym: Symbol)(using Context): Boolean =
+    sym.exists && sym.maybeOwner.exists && sym.maybeOwner.isTerm
+
+  /** Record the wrapper's re-elaborated local classes/modules whose
+   *  call-site synthetic bindings exist, keyed by symbol (stable
+   *  across phases). A term-owned class `C` is *linked* iff the
+   *  bindings carry `__evalClass_C__`; a module val `M` iff they
+   *  carry `__evalModule_M__`. Body-local declarations are excluded:
+   *  classes declared *inside* the eval body are genuinely fresh and
+   *  keep the wrapper's identity.
+   */
+  private def collectLinkedEntities(trees: List[Tree])(using Context): Unit =
+    val classes = Map.newBuilder[Symbol, String]
+    val modules = Map.newBuilder[Symbol, String]
+    val traverser = new TreeTraverser:
+      def traverse(tree: Tree)(using Context): Unit =
+        tree match
+          case td: TypeDef if td.isClassDef =>
+            val sym = td.symbol
+            if sym.isClass && !sym.is(ModuleClass)
+              && isTermOwnedSym(sym) && !isLocalToBodySym(sym)
+            then
+              val src = sym.name.toString
+              if config.bindingNames.contains(EvalNames.classBinding(src)) then
+                classes += sym -> src
+          case vd: ValDef if vd.symbol.is(Module) =>
+            val sym = vd.symbol
+            if isTermOwnedSym(sym) && !isLocalToBodySym(sym) then
+              val src = vd.name.toString
+              if config.bindingNames.contains(EvalNames.moduleBinding(src)) then
+                modules += sym -> src
+                modules += sym.moduleClass -> src
+          case _ =>
+        traverseChildren(tree)
+    trees.foreach(traverser.traverse)
+    store.linkedClasses = classes.result()
+    store.linkedModules = modules.result()
 
   /** True iff `sym` is the wrapper module class or its companion val.
    *  The wrapper is synthesised in `EvalAdapter` and always carries
@@ -96,11 +174,17 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
       tree match
         case PackageDef(pid, stats) =>
           // Walk `__Expression` last so its `evaluate` method sees a
-          // populated `bodyTree`.
+          // populated `bodyTree`. The linked-entity scan runs in
+          // between: it needs `store.symbol` (set when the spliced
+          // val is found in the wrapper walk) to exclude body-local
+          // declarations, and must complete before the body rewrite
+          // consults the maps.
           val (exprClassDef, others) = stats.partition { stat =>
             stat.symbol.exists && stat.symbol == config.expressionClass
           }
-          val transformedStats = (others ++ exprClassDef).map(transform)
+          val transformedOthers = others.map(transform)
+          collectLinkedEntities(others)
+          val transformedStats = transformedOthers ++ exprClassDef.map(transform)
           // Drop the wrapper module from the package when it holds only
           // dead members (helper stubs retargeted away by
           // `ExtractTransformer`, plus renamed `__eval_<name>__` defs
@@ -179,27 +263,57 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
           )
           super.transform(tree)
 
-      // `return` targeting a method *outside* the body can never be
-      // honoured: the body runs inside `__Expression.evaluate` at
-      // runtime, so the return's target method no longer encloses it.
-      // Without this check the tree survives to LambdaLift, which
-      // crashes with an internal error ("Could not find proxy for
-      // val nonLocalReturnKey..."). Reject it as a documented
-      // limitation instead. A `return` from a def declared *inside*
-      // the body is fine; the def moves into `evaluate` together
-      // with its return.
+      // `return` targeting a method *outside* the body cannot be an
+      // ordinary JVM return: the body runs inside
+      // `__Expression.evaluate` at runtime, so the target frame is
+      // several reflective frames up. When the call site passed a
+      // return key (`__evalReturnKey__`; the rewriter wraps every
+      // eval call that sits directly inside a real method in a
+      // `try ... catch case ex: EvalNonLocalReturn ...` handler),
+      // lower the return into a throw of that control exception; the
+      // call-site catch turns it back into a real `return`. Without
+      // the key (a direct `Eval.eval` call, or a hand-rolled
+      // enclosing source), keep the documented diagnostic. A
+      // `return` from a def declared *inside* the body is unaffected;
+      // the def moves into `evaluate` together with its return.
       case tree: Return =>
         val target = tree.from.symbol
         if target.exists && !isLocalToBody(target) then
-          report.error(
-            "eval: the eval body cannot `return` from the method enclosing the " +
-              "eval call. At runtime the body executes in a separate `evaluate()` " +
-              "method, so there is no enclosing method frame to return from (known " +
-              "limitation). Restructure the body to yield its result as an expression.",
-            tree.srcPos
-          )
-          tree
+          if config.hasReturnKey then
+            val keyRead = buildReflectEvalCast(
+              tree, nullLiteral,
+              ReflectEvalStrategy.BindingValue(EvalNames.ReturnKeyBinding),
+              Nil, defn.ObjectType)
+            val expr = if tree.expr.isEmpty then unitLiteral else transform(tree.expr)
+            Throw(New(evalNonLocalReturnClass.typeRef, List(keyRead, expr))).withSpan(tree.span)
+          else
+            report.error(
+              "eval: the eval body cannot `return` from the method enclosing the " +
+                "eval call. At runtime the body executes in a separate `evaluate()` " +
+                "method, so there is no enclosing method frame to return from (known " +
+                "limitation). Restructure the body to yield its result as an expression.",
+              tree.srcPos
+            )
+            tree
         else super.transform(tree)
+
+      // Constructor call on a *linked* local class (`new C(...)`,
+      // including secondary constructors). Replace with the
+      // call-site factory closure stored under `__evalNew_C__$i`, so
+      // the instance belongs to the *original* lifted class. The
+      // constructor index is computed with the same ordering rule as
+      // the rewriter (primary first, secondaries in source order);
+      // both compiles elaborate the same class source.
+      case tree: Apply
+          if tree.symbol.isClassConstructor
+            && store.linkedClasses.contains(tree.symbol.owner) =>
+        val cls = tree.symbol.owner.asClass
+        val src = store.linkedClasses(cls)
+        val idx = ctorIndexOf(cls, tree.symbol)
+        val args = transformedMethodArgs(tree)
+        buildReflectEvalCast(tree, nullLiteral,
+          ReflectEvalStrategy.ConstructLocal(EvalNames.ctorBinding(src, idx)),
+          args, defn.ObjectType)
 
       // Captured-var write: outer method-local `var x` gets `x = v`
       // routed through the bind site's `VarRef.set(v)`. Body-local
@@ -213,6 +327,14 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
       case tree @ Assign(lhs, rhs) if isInaccessibleField(lhs) =>
         setField(tree, transformedQualifier(lhs), lhs.symbol.asTerm, transform(rhs))
 
+      // Write to a (public) field of a term-owned class/module, e.g.
+      // `Counter.n = v` on a linked local object. Must be intercepted
+      // at the Assign node: descending into the lhs Select would
+      // rewrite it to a reflective *read*, leaving `Assign(<apply>, v)`
+      // for Getters to choke on.
+      case tree @ Assign(lhs, rhs) if isTermOwnedClassFieldAccess(lhs) =>
+        setField(tree, transformedQualifier(lhs), lhs.symbol.asTerm, transform(rhs))
+
       case tree: Ident =>
         val sym = tree.symbol
         if !sym.exists || isLocalToBody(sym) || isGloballyAccessible(sym) then
@@ -224,6 +346,20 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
           // Codegen lowers this to a static path reachable from
           // any caller, so no rewrite is needed.
           super.transform(tree)
+        else if store.linkedModules.contains(sym) then
+          // Linked local module (a local `object`, or the companion
+          // of a local class): read the *live* module instance
+          // captured at the call site as `__evalModule_<M>__`.
+          // Member calls on it (`M.x`, `C.apply`, `C.unapply`,
+          // constructor default getters) go through the term-owned
+          // receiver-class reflection path with this read as the
+          // qualifier, so module state is shared rather than
+          // re-elaborated. Also unblocks LambdaLift: a surviving
+          // reference to the wrapper's lazy module val (declared in
+          // the dead lifted method) has no proxy to thread.
+          buildReflectEvalCast(tree, nullLiteral,
+            ReflectEvalStrategy.BindingValue(EvalNames.moduleBinding(store.linkedModules(sym))),
+            Nil, defn.ObjectType)
         else if isTermOwnedModule(sym) then
           // Companion module of a method-local class (e.g. the
           // implicit companion of `case class C` inside `def f`).
@@ -301,6 +437,22 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
       // This, outer Ident) are handled above on the qualifier.
       case _ => super.transform(tree)
     end transform
+
+    /** Index of `ctor` among `cls`'s constructors, ordered primary
+     *  first then secondaries by source position, mirroring
+     *  [[EvalRewriteTyped]]'s factory-binding numbering (both
+     *  compiles elaborate the same class source, so the index
+     *  identifies the same constructor).
+     */
+    private def ctorIndexOf(cls: ClassSymbol, ctor: Symbol)(using Context): Int =
+      val primary = cls.primaryConstructor
+      if ctor == primary then 0
+      else
+        val secondaries = cls.info.decls.toList
+          .filter(s => s.isConstructor && s != primary)
+          .sortBy(_.span.start)
+        val i = secondaries.indexOf(ctor)
+        if primary.exists then i + 1 else i
 
     private def getLocalValue(tree: Tree, sym: TermSymbol)(using Context): Tree =
       // For a binding whose declared type is a term-owned class, the
@@ -623,6 +775,9 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
 
   private def evalExpressionBaseClass(using Context): ClassSymbol =
     requiredClass("dotty.tools.eval.EvalExpressionBase")
+
+  private def evalNonLocalReturnClass(using Context): ClassSymbol =
+    requiredClass("dotty.tools.eval.EvalNonLocalReturn")
 
 private[eval] object ExtractEvalBody:
   val name: String = "extractEvalBody"

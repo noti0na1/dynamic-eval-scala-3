@@ -30,14 +30,13 @@ package eval
  *                         Empty when the rewriter couldn't compute a
  *                         slice (e.g. a programmatic call to
  *                         `Eval.eval` from outside the REPL).
- *  @param bindings        The bindings the rewriter captured at the
- *                         call site (lambda parameters, block-local
- *                         vals, etc.). Useful for an agent that wants
- *                         to mention the in-scope names by name.
+ *  @param allBindings     Every binding the rewriter captured at the
+ *                         call site, including the compiler-only
+ *                         synthetic ones ([[Eval.Binding.isSynthetic]]).
  */
 final class EvalContext(
     val enclosingSource: String,
-    val bindings: Array[Eval.Binding]
+    val allBindings: Array[Eval.Binding]
 ):
   /** The string the rewriter substituted into `enclosingSource` at the
    *  eval call's location. An agent that wants to splice generated
@@ -46,8 +45,18 @@ final class EvalContext(
    */
   def placeholder: String = EvalContext.placeholder
 
+  /** The user-nameable bindings in scope at the call site (lambda
+   *  parameters, block-local vals, etc.): the list an agent should
+   *  show to an LLM as "names in scope". Compiler-only synthetic
+   *  bindings (`__this__*`, local-class links, constructor factories,
+   *  the return key) are filtered out; see [[allBindings]] for the
+   *  raw array.
+   */
+  def bindings: Array[Eval.Binding] =
+    allBindings.filter(b => !b.isSynthetic)
+
   override def toString: String =
-    s"EvalContext(enclosingSource=${enclosingSource.length} chars, bindings=${bindings.length})"
+    s"EvalContext(enclosingSource=${enclosingSource.length} chars, bindings=${allBindings.length})"
 
 object EvalContext:
   /** The marker the [[EvalRewriteTyped]] rewriter substitutes into

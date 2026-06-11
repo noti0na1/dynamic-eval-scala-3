@@ -319,31 +319,54 @@ class StandaloneEvalTests:
     assertEquals("arithmetic", r)
 
   // ===========================================================================
-  // Known limitation: `return` in the body
+  // Non-local `return` from the body
   // ===========================================================================
 
-  @Test def returnFromEnclosingMethodIsRejected(): Unit =
-    // A body cannot `return` from the method enclosing the eval call:
-    // at runtime the body executes inside `__Expression.evaluate`, so
-    // the target frame is gone by construction. The pipeline rejects it
-    // with a deliberate diagnostic (not an internal compiler error, and
-    // not a crash), and the program can catch and continue.
+  @Test def returnFromEnclosingMethod(): Unit =
+    // The body's `return` targets the method enclosing the eval call.
+    // The rewriter wrapped the call in a `try/catch` keyed on the
+    // per-execution `__evalReturnKey__` binding; the body's return
+    // lowers to an `EvalNonLocalReturn` throw that the call-site catch
+    // turns back into an ordinary `return`. (Previously rejected with
+    // a deliberate diagnostic.)
     val r = compileAndRun(
       """import dotty.tools.eval.Eval.eval
-        |import dotty.tools.eval.EvalCompileException
         |object Main:
-        |  // Check `e.errors` (the diagnostics alone), not `e.getMessage`:
-        |  // the message also embeds the generated source, which contains
-        |  // this very catch block and its string literals.
-        |  def f(): Int =
-        |    try eval[Int]("return 42")
-        |    catch case e: EvalCompileException =>
-        |      if e.errors.exists(_.contains("Internal compiler error")) then -2
-        |      else if e.errors.exists(_.contains("cannot `return` from the method enclosing the eval call")) then -1
-        |      else -3
+        |  def f(): Int = eval[Int]("return 42")
         |  def run(): Any = f()
         |""".stripMargin)
-    assertEquals(-1, r)
+    assertEquals(42, r)
+
+  @Test def conditionalReturnFromEnclosingMethod(): Unit =
+    // The non-return path falls through to the rest of the method.
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |object Main:
+        |  def f(x: Int): Int =
+        |    eval[Unit]("if x > 0 then return x * 2")
+        |    -1
+        |  def run(): Any = (f(21), f(0))
+        |""".stripMargin)
+    assertEquals((42, -1), r)
+
+  @Test def localObjectLiveStateStandalone(): Unit =
+    // A local `object`'s state is shared with the body through the
+    // `__evalModule_Counter__` binding. The `+=` exercises the typer's
+    // prefix-lift temp (`val $1$ = Counter`), whose info is erased to
+    // Object so no checkcast against the wrapper's re-minted module
+    // class is emitted.
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |object Main:
+        |  def f(): Int =
+        |    object Counter:
+        |      var n = 0
+        |    Counter.n = 1
+        |    eval[Unit]("Counter.n += 10")
+        |    Counter.n
+        |  def run(): Any = f()
+        |""".stripMargin)
+    assertEquals(11, r)
 
   @Test def returnInsideBodyLocalDefWorks(): Unit =
     // The boundary of the limitation: a `return` from a def declared

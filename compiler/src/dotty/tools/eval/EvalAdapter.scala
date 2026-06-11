@@ -461,8 +461,12 @@ object EvalAdapter:
   /** Stable fingerprint of the binding *names* and *kinds* for cache
    *  keying. Binding values change across calls (that's the point of
    *  caching) and aren't part of compile output; names and kinds
-   *  (val / var / given) are — they shape the wrapper's parameter
-   *  clauses.
+   *  (val / var / given / synthetic) are: they shape the wrapper's
+   *  parameter clauses and the linked-class lowering. Synthetic
+   *  binding *values* (classOf, factory closures, module instances,
+   *  the return key) never affect the wrapper bytecode either: the
+   *  lowered code only ever does `getRaw(name)`, so the key stays
+   *  value-free.
    */
   private[eval] def bindingsFingerprint(bindings: Array[Eval.Binding]): String =
     val sb = new StringBuilder
@@ -472,6 +476,6 @@ object EvalAdapter:
       sb ++= bindings(i).name
       sb += ':'
       val b = bindings(i)
-      sb += (if b.isVar then 'v' else if b.isGiven then 'g' else 'l')
+      sb += (if b.isVar then 'v' else if b.isGiven then 'g' else if b.isSynthetic then 's' else 'l')
       i += 1
     sb.toString
