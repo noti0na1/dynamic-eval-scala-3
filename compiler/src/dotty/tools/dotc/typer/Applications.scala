@@ -1560,7 +1560,9 @@ trait Applications extends Compatibility {
       case _ =>
         app1
     }
-    ConstFold(app2)
+    val app3 = ConstFold(app2)
+    eval.EvalRewriteTyped.recordEvalProto(app3, pt) // support for -Xdynamic-eval, no-op for other calls
+    app3
   }
 
   /** Typecheck an Apply node with a typed function and possibly-typed arguments coming from `proto` */

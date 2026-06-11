@@ -79,15 +79,16 @@ path, does not expose privates), and a nested (non-top-level)
 including private ones, go through the same reflective machinery as
 in the REPL and behave identically.
 
-A limitation shared with the REPL: an eval body cannot `return` from
-the method enclosing the eval call. At runtime the body executes
-inside a separate `evaluate()` method, so the frame the `return`
-targets is gone by construction. The pipeline rejects such a body
-with a dedicated compile diagnostic ("the eval body cannot `return`
-from the method enclosing the eval call") rather than crashing, and
-the program can catch the `EvalCompileException` (or use `evalSafe`)
-and continue. A `return` from a def declared *inside* the body still
-works, since the def and its return move into `evaluate()` together.
+An eval body *can* `return` from the method enclosing the eval call.
+At runtime the body executes inside a separate `evaluate()` method,
+so the return cannot be an ordinary JVM return; instead the rewriter
+wraps every eval call that sits directly inside a method in a
+`try`/`catch` keyed on a per-execution `__evalReturnKey__` synthetic
+binding, and the body's `return` compiles to an `EvalNonLocalReturn`
+control throw that the call-site catch turns back into a real
+`return`. A `return` at a position where source code couldn't return
+either (top level, inside a lambda) is still rejected with the
+standard diagnostic.
 
 ## The idea
 
@@ -710,23 +711,50 @@ typed tree carries resolved symbols. For every call classified as
    (`eval[T]({ ctx => ... })`) to the four argument overload.
 2. Builds an `Array[Eval.Binding]` from the typed scope. The
    walker maintains a stack of in scope frames as it descends
-   through `Block`, `DefDef`, and `Template` nodes. Captures
-   cover:
+   through `Block`, `DefDef`, and `Template` nodes. Bindings come
+   in two kinds. *Visible* bindings are user nameable values:
    * block local vals, vars, defs, and givens
    * method val parameters (including by name, lifted to a thunk
      so that post `ElimByName` `apply()` works)
    * lambda parameters
-   * `__this__` and `__this__<ClassName>` synthetics for the
-     enclosing class chain (the body's `this` references rewrite
-     against these)
-   * class members, emitted as `Eval.bind("x", this.x)` to keep
-     the member alive across the method lift / DCE pipeline that
-     the inner compile does
+
+   *Synthetic* bindings (flagged `isSynthetic`, reserved
+   `__eval*__` / `__this__*` names) carry values the *compiler*
+   needs to link the body's generated code back to the live
+   program; the body never names them directly:
+   * `__this__` and `__this__<ClassName>` for the enclosing class
+     chain (the body's `this` references rewrite against these)
+   * class members, emitted as `bindSynthetic("x", this.x)` to
+     keep the member alive across the method lift / DCE pipeline
+     that the inner compile does
+   * per local (method scoped) class `C`: `__evalClass_C__` =
+     `classOf[C]` (type tests against the *original* lifted
+     class) and `__evalNew_C__$i` = one factory closure per
+     constructor (so `new C(...)` in the body constructs the
+     original class, with `C`'s captured environment threaded by
+     LambdaLift through the closure)
+   * per local `object M` (including synthesized companions):
+     `__evalModule_M__` = the live module instance, so module
+     state is shared rather than re elaborated
+   * `__evalReturnKey__`: a fresh key object for non local
+     `return` (see above)
 3. Renders the `[T]` argument back to source for `expectedType`,
    keeping capture annotations when capture checking is enabled
    in the live session, and dropping degenerate types
    (`Nothing`/`Null`, error types, types referencing locally
-   scoped symbols the wrapper could not resolve).
+   scoped symbols the wrapper could not resolve). When `[T]` was
+   left to inference in a context that only bounds it from above
+   (`val a: A = eval("...")` constrains `T <: A`, which the typer
+   minimizes to `Nothing`), the rewriter renders the call's
+   *prototype* instead: a small hook at the end of the typer's
+   `Applications.typedApply` attaches the expected type of every
+   eval-like call to its tree (inference itself is untouched), and
+   the rewriter resolves that type against the final
+   instantiations. This covers argument positions too: an eval
+   passed to a generic method records the method's type variable,
+   which resolves to whatever inference settled on. Prototypes
+   that don't fully resolve degrade to the empty string; for safe
+   flavour calls the `EvalResult[...]` wrapper is unwrapped first.
 4. Slices the source of the enclosing top level statement,
    replaces the eval call's span with the placeholder, and stores
    the result as `enclosingSource`. For safe flavour calls
@@ -778,10 +806,25 @@ reference into a `reflectEval(...)` placeholder carrying a
 | `FieldAssign`        | private/protected field write     | `setField(qual, className, fieldName, v)` or setter call     |
 | `MethodCall`         | private/protected method call     | `callMethod(qual, className, name, paramTpes, retTpe, args)` |
 | `MethodCapture`      | outer block local def call        | `getValue(name).asInstanceOf[FunctionN].apply(args*)`        |
+| `ConstructLocal`     | `new C(...)` on a linked local class | `getValue("__evalNew_C__$i").asInstanceOf[FunctionN].apply(args*)` |
+| `BindingValue`       | linked module read / return key   | `getRaw("__evalModule_M__")` / `getRaw("__evalReturnKey__")` |
 
 Anchored after `cc` so capture checking sees the body in its
 original lexical context, with the original `^` annotations on def
-parameters intact, before the body is moved.
+parameters intact, before the body is moved. A body `return`
+targeting the enclosing method lowers here to
+`throw new EvalNonLocalReturn(<key>, expr)`, and body local symbols
+whose signature mentions a linked local class have that class
+substituted with `Object` at the denotation level (the runtime
+values belong to the *original* class, so a descriptor naming the
+wrapper's re elaborated copy would force a wrong `checkcast`).
+
+`ResolveEvalAccess` additionally runs a post erasure sweep over
+`__Expression`: type tests and casts that PatternMatcher generated
+against a re elaborated local class lower to `isLinkedInstance` /
+`castLinked` (backed by the `__evalClass_C__` binding), and member
+accesses on linked receivers lower to receiver class reflection, so
+no emitted bytecode references the re minted class.
 
 #### `ResolveEvalAccess` (post erasure)
 

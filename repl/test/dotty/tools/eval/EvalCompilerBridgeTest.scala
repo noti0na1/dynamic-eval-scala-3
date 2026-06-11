@@ -273,7 +273,7 @@ class EvalCompilerBridgeTest:
   private def runWithIntBinding(body: String, enclosing: String, name: String, value: Int): Any =
     val r = runSplice(body, enclosing)
     assertTrue(s"compile failed:\n${r.errors}", r.ok)
-    val binding = new Eval.Binding(name, java.lang.Integer.valueOf(value), false, false)
+    val binding = new Eval.Binding(name, java.lang.Integer.valueOf(value))
     loadAndInvoke(r.outputDir, r.outputClassName, Array(binding))
 
   @Test def evaluatesMethodParamCapture(): Unit =
@@ -315,8 +315,8 @@ class EvalCompilerBridgeTest:
     val r = runSplice(body = "a * b + 1", enclosing = enclosing)
     assertTrue(s"compile failed:\n${r.errors}", r.ok)
     val bindings: Array[Eval.Binding] = Array(
-      new Eval.Binding("a", java.lang.Integer.valueOf(6), false, false),
-      new Eval.Binding("b", java.lang.Integer.valueOf(7), false, false)
+      new Eval.Binding("a", java.lang.Integer.valueOf(6)),
+      new Eval.Binding("b", java.lang.Integer.valueOf(7))
     )
     val result = loadAndInvoke(r.outputDir, r.outputClassName, bindings)
     assertEquals(java.lang.Integer.valueOf(43), result)
@@ -343,7 +343,7 @@ class EvalCompilerBridgeTest:
          |""".stripMargin
     val r = runSplice(body = "name.length", enclosing = enclosing)
     assertTrue(s"compile failed:\n${r.errors}", r.ok)
-    val binding = new Eval.Binding("name", "hello world", false, false)
+    val binding = new Eval.Binding("name", "hello world")
     val result = loadAndInvoke(r.outputDir, r.outputClassName, Array(binding))
     assertEquals(java.lang.Integer.valueOf(11), result)
 
@@ -409,7 +409,7 @@ class EvalCompilerBridgeTest:
          |  def f(n: Int): Int = ({ ${EvalContext.placeholder} })
          |}
          |""".stripMargin
-    val binding = new Eval.Binding("n", java.lang.Integer.valueOf(7), false, false)
+    val binding = new Eval.Binding("n", java.lang.Integer.valueOf(7))
     val (_, result) = runWithHolder(
       body = "mult * n",
       enclosing = enclosing,
@@ -643,8 +643,8 @@ class EvalCompilerBridgeTest:
     assertTrue(s"compile failed:\n${r.errors}", r.ok)
     val totalRef = new IntVarRef(0)
     val bindings: Array[Eval.Binding] = Array(
-      new Eval.Binding("factor", java.lang.Integer.valueOf(5), false, false),
-      new Eval.Binding("total", totalRef, true, false)
+      new Eval.Binding("factor", java.lang.Integer.valueOf(5)),
+      new Eval.Binding("total", totalRef, isVar = true)
     )
     val result = loadAndInvoke(r.outputDir, r.outputClassName, bindings)
     assertEquals(java.lang.Integer.valueOf(36), result)
@@ -685,7 +685,7 @@ class EvalCompilerBridgeTest:
       .getDeclaredConstructor(classOf[Int])
       .newInstance(java.lang.Integer.valueOf(42))
       .asInstanceOf[AnyRef]
-    val binding = new Eval.Binding("c", helperInstance, false, false)
+    val binding = new Eval.Binding("c", helperInstance)
     val result = invoke(loaded, Array(binding), null)
     assertEquals(java.lang.Integer.valueOf(43), result)
 
@@ -715,7 +715,7 @@ class EvalCompilerBridgeTest:
       .getDeclaredConstructor(classOf[Int])
       .newInstance(java.lang.Integer.valueOf(7))
       .asInstanceOf[AnyRef]
-    val binding = new Eval.Binding("c", helperInstance, false, false)
+    val binding = new Eval.Binding("c", helperInstance)
     val result = invoke(loaded, Array(binding), null)
     // The runtime instance is HelperC, so its `describe` method —
     // not the wrapper's `C.describe` — gets called.
@@ -749,7 +749,7 @@ class EvalCompilerBridgeTest:
       .getDeclaredConstructor(classOf[Int])
       .newInstance(java.lang.Integer.valueOf(7))
       .asInstanceOf[AnyRef]
-    val binding = new Eval.Binding("c", helperInstance, false, false)
+    val binding = new Eval.Binding("c", helperInstance)
     val result = invoke(loaded, Array(binding), null)
     // 3 * 4 + 7 = 19
     assertEquals(java.lang.Integer.valueOf(19), result)
@@ -778,7 +778,7 @@ class EvalCompilerBridgeTest:
     val loaded = loadExpression(r.outputDir, r.outputClassName)
     val helperCls = loaded.loader.loadClass("PhaseSixPolyCurried$HelperC")
     val helperInstance = helperCls.getDeclaredConstructor().newInstance().asInstanceOf[AnyRef]
-    val binding = new Eval.Binding("c", helperInstance, false, false)
+    val binding = new Eval.Binding("c", helperInstance)
     val result = invoke(loaded, Array(binding), null)
     assertEquals("7-x", result)
 
@@ -810,7 +810,7 @@ class EvalCompilerBridgeTest:
       .getDeclaredConstructor(classOf[Int])
       .newInstance(java.lang.Integer.valueOf(10))
       .asInstanceOf[AnyRef]
-    val binding = new Eval.Binding("c", helperInstance, false, false)
+    val binding = new Eval.Binding("c", helperInstance)
     val result = invoke(loaded, Array(binding), null)
     // HelperCounter(10).add(5) = 15
     assertEquals(java.lang.Integer.valueOf(15), result)
@@ -843,7 +843,7 @@ class EvalCompilerBridgeTest:
       .getDeclaredConstructor(classOf[Int])
       .newInstance(java.lang.Integer.valueOf(0))
       .asInstanceOf[AnyRef]
-    val binding = new Eval.Binding("c", helperInstance, false, false)
+    val binding = new Eval.Binding("c", helperInstance)
     val result = invoke(loaded, Array(binding), null)
     assertEquals(java.lang.Integer.valueOf(9), result)
 
@@ -914,7 +914,7 @@ class EvalCompilerBridgeTest:
     val r = runSplice(body = "t._1 * t._2", enclosing = enclosing)
     assertTrue(s"compile failed:\n${r.errors}", r.ok)
     val tuple = scala.Tuple2(java.lang.Integer.valueOf(6), java.lang.Integer.valueOf(7))
-    val binding = new Eval.Binding("t", tuple.asInstanceOf[Object], false, false)
+    val binding = new Eval.Binding("t", tuple.asInstanceOf[Object])
     val result = loadAndInvoke(r.outputDir, r.outputClassName, Array(binding))
     assertEquals(java.lang.Integer.valueOf(42), result)
 
@@ -931,7 +931,7 @@ class EvalCompilerBridgeTest:
     val r = runSplice(body = "p._1 + p._2", enclosing = enclosing)
     assertTrue(s"compile failed:\n${r.errors}", r.ok)
     val tuple = scala.Tuple2(java.lang.Integer.valueOf(10), java.lang.Integer.valueOf(11))
-    val binding = new Eval.Binding("p", tuple.asInstanceOf[Object], false, false)
+    val binding = new Eval.Binding("p", tuple.asInstanceOf[Object])
     val result = loadAndInvoke(r.outputDir, r.outputClassName, Array(binding))
     assertEquals(java.lang.Integer.valueOf(21), result)
 
@@ -951,7 +951,7 @@ class EvalCompilerBridgeTest:
          |""".stripMargin
     val r = runSplice(body = "s + s", enclosing = enclosing)
     assertTrue(s"compile failed:\n${r.errors}", r.ok)
-    val binding = new Eval.Binding("s", java.lang.Integer.valueOf(21), false, false)
+    val binding = new Eval.Binding("s", java.lang.Integer.valueOf(21))
     val result = loadAndInvoke(r.outputDir, r.outputClassName, Array(binding))
     assertEquals(java.lang.Integer.valueOf(42), result)
 
@@ -991,7 +991,7 @@ class EvalCompilerBridgeTest:
     val loaded = loadExpression(r.outputDir, r.outputClassName)
     val boxCls = loaded.loader.loadClass("PhaseSevenTypeMemberConcrete$IntBox")
     val box = boxCls.getDeclaredConstructor(classOf[Int]).newInstance(java.lang.Integer.valueOf(41)).asInstanceOf[AnyRef]
-    val binding = new Eval.Binding("b", box, false, false)
+    val binding = new Eval.Binding("b", box)
     val result = invoke(loaded, Array(binding), null)
     assertEquals(java.lang.Integer.valueOf(42), result)
 
@@ -1018,7 +1018,7 @@ class EvalCompilerBridgeTest:
       .getDeclaredConstructor(classOf[String])
       .newInstance("World")
       .asInstanceOf[AnyRef]
-    val binding = new Eval.Binding("g", greeterInstance, false, false)
+    val binding = new Eval.Binding("g", greeterInstance)
     val result = invoke(loaded, Array(binding), null)
     assertEquals("Hi, World!", result)
 

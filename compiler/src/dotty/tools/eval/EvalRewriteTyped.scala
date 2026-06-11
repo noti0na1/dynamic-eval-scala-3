@@ -19,7 +19,7 @@ import dotc.core.Symbols.*
 import dotc.core.Types.*
 import dotc.report
 import dotc.transform.MacroTransform
-import dotc.util.SourceFile
+import dotc.util.{Property, SourceFile}
 import dotc.util.Spans.{NoSpan, Span}
 
 /** Post-PostTyper phase that fills the `bindings`, `expectedType`,
@@ -48,7 +48,13 @@ import dotc.util.Spans.{NoSpan, Span}
  *      synthetics for the enclosing class chain, and class-member
  *      DCE-keepers for the body's reflective lookups).
  *    - expectedType: render the typed `[T]` argument back to source
- *      with cc-aware annotations.
+ *      with cc-aware annotations. When `[T]` was inferred and
+ *      minimized to `Nothing` (e.g. `val a: A = eval("...")`, whose
+ *      only constraint is `T <: A`), render the call's prototype
+ *      instead, recorded during typing by the
+ *      [[EvalRewriteTyped.recordEvalProto]] hook in
+ *      `Applications.typedApply` and resolved here against the
+ *      final instantiations.
  *    - enclosingSource: slice the current top-level statement's
  *      source with the eval call's span replaced by the marker.
  *      For safe-flavor (`evalSafe` / `agentSafe`) calls, also wrap
@@ -635,9 +641,14 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
             else
               ref(fourArgSym).withSpan(fun.span)
           val span = app.span
-          val tArg = extractTypeArg(fun)
-          val rendered = if tArg eq null then "" else EvalRewriteTyped.renderType(tArg)
           val encl = computeEnclosingSource(span)
+          // Same renderer split as [[fillEvalArgs]]: informational
+          // with a slice, strict without one.
+          val tArg = effectiveTypeArg(app, kind)
+          val rendered =
+            if tArg eq null then ""
+            else if encl.nonEmpty then EvalRewriteTyped.renderTypeInfo(tArg)
+            else EvalRewriteTyped.renderType(tArg)
           val wrappedEncl =
             if kind.isSafe && encl.contains(EvalContext.placeholder) then
               encl.replace(
@@ -791,11 +802,6 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       // All three default — fill them in from the typed scope.
       val argsBuf = args.toBuffer
 
-      // expectedType: rendered from the typed `[T]`.
-      val tArg = extractTypeArg(app.fun)
-      val renderedTpe = if tArg eq null then "" else EvalRewriteTyped.renderType(tArg)
-      argsBuf(expIdx) = Literal(Constant(renderedTpe)).withSpan(argsBuf(expIdx).span)
-
       // enclosingSource: slice from the current top-level statement.
       // Safe-flavor wraps the placeholder in `handleCompileError`.
       val encl = computeEnclosingSource(span)
@@ -807,6 +813,21 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
           )
         else encl
       argsBuf(enclIdx) = Literal(Constant(wrappedEncl)).withSpan(argsBuf(enclIdx).span)
+
+      // expectedType: rendered from the typed `[T]`, falling back to
+      // the typer-recorded prototype when `[T]` was minimized to
+      // `Nothing` (see [[effectiveTypeArg]]). The string is
+      // re-typechecked at the marker position inside the spliced
+      // slice, where locally-scoped names resolve, so a slice gets
+      // the informational rendering. Without a slice the wrapper's
+      // isolated fallback context only sees global names, so the
+      // strict resolvable-only rendering applies.
+      val tArg = effectiveTypeArg(app, kind)
+      val renderedTpe =
+        if tArg eq null then ""
+        else if encl.nonEmpty then EvalRewriteTyped.renderTypeInfo(tArg)
+        else EvalRewriteTyped.renderType(tArg)
+      argsBuf(expIdx) = Literal(Constant(renderedTpe)).withSpan(argsBuf(expIdx).span)
 
       // bindings: rebuilt from the typed scope, plus the non-local-
       // return key when the call sits directly inside a real method.
@@ -951,6 +972,93 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       case Apply(inner, _) => extractTypeArg(inner)
       case _ => null
 
+    /** The type to render into the `expectedType` slot: the call's
+     *  typed `[T]` argument when it is informative, otherwise the
+     *  call's prototype recorded by the typer hook
+     *  ([[EvalRewriteTyped.recordEvalProto]]).
+     *
+     *  The fallback recovers the inference case: in
+     *  `val a: A = eval("...")` the typer's only constraint on `T`
+     *  is `T <: A`, so interpolation minimizes `T := Nothing` and
+     *  the constraint's upper bound survives only as the recorded
+     *  pt. Safe-flavor calls return `EvalResult[T]`, so there the
+     *  body's type is the pt's `EvalResult` argument, not the pt
+     *  itself.
+     */
+    private def effectiveTypeArg(app: Apply, kind: EvalKind)(using Context): Type | Null =
+      val tArg = extractTypeArg(app.fun)
+      if isInformativeType(tArg) then tArg
+      else
+        val recorded = recordedProto(app)
+        val fallback =
+          if !recorded.exists then NoType
+          else if !kind.isSafe then recorded
+          else recorded.baseType(EvalRewriteTyped.evalResultClass) match
+            case AppliedType(_, arg :: Nil) if !arg.isInstanceOf[TypeBounds] => arg
+            case _ => NoType
+        if isInformativeType(fallback) then fallback else tArg
+
+    /** The prototype attached to this call by the typer hook,
+     *  resolved against the final state of inference; `NoType` when
+     *  absent or not fully resolvable.
+     *
+     *  The attachment is looked up along the Apply chain, not just
+     *  on `app` itself: a using-clause application is inserted by
+     *  the typer's `adapt` *around* the node `typedApply` attached
+     *  to, so for `myEval(body)(using ctx)` the pt sits on the inner
+     *  `myEval(body)`.
+     */
+    private def recordedProto(app: Apply)(using Context): Type =
+      def find(t: Tree): Type = t match
+        case t: Apply =>
+          t.getAttachment(EvalRewriteTyped.EvalProto) match
+            case Some(pt) => pt
+            case None => find(t.fun)
+        case TypeApply(fn, _) => find(fn)
+        case _ => NoType
+      resolveRecordedProto(find(app))
+
+    /** Resolve a recorded prototype to a renderable type.
+     *
+     *  The pt was captured during typing, so it can mention type
+     *  variables that were uninstantiated at that point: an eval
+     *  call in argument position of a generic method is typed
+     *  against that method's type parameter (`pick(eval("..."), x)`
+     *  records `U`). By this phase every variable the run solved
+     *  carries its permanent instance, so variables are replaced by
+     *  their instances, transitively. Anything that did not resolve
+     *  to a concrete type (an uninstantiated variable, a raw
+     *  `TypeParamRef`, a skolem from dependent-method typing) makes
+     *  the whole pt unusable: bail to `NoType` rather than render a
+     *  type the splice cannot re-typecheck.
+     */
+    private def resolveRecordedProto(pt: Type)(using Context): Type =
+      if !pt.exists then NoType
+      else
+        var ok = true
+        val resolver = new TypeMap:
+          def apply(t: Type): Type =
+            if !ok then t
+            else t match
+              case tv: TypeVar =>
+                if tv.isPermanentlyInstantiated then apply(tv.stripTypeVar)
+                else { ok = false; t }
+              case _: TypeParamRef | _: SkolemType =>
+                ok = false
+                t
+              case _ => mapOver(t)
+        val resolved = resolver(pt)
+        if ok then resolved else NoType
+
+    /** False for types the renderer suppresses anyway: missing,
+     *  erroneous, `Nothing`, or `Null`.
+     */
+    private def isInformativeType(tpe: Type | Null)(using Context): Boolean =
+      (tpe ne null) && tpe.exists && !tpe.isError && {
+        val widened = tpe.widen
+        widened.exists && !widened.isError && !EvalRewriteTyped.isUselessType(widened)
+      }
+
     /** Slice the current top-level statement's source text, replacing
      *  the eval-call's span with `EvalBodyPlaceholder.Marker`. The
      *  result is the `enclosingSource` the wrapper compile uses to
@@ -985,8 +1093,16 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       val topLen = topLevelEnd - topLevelStart
       if relStart < 0 || relEnd > topLen || relStart > relEnd then return ""
       val topSrc = String.valueOf(src, topLevelStart, topLen)
+      // The marker ends in `_`, and the lexer absorbs operator
+      // characters after a trailing underscore (`foo_:` is one
+      // identifier). A call directly followed by an operator char,
+      // e.g. the ascription `(eval("..."): Long)`, would glue into
+      // `__evalBodyPlaceholder__:`, so pad with a trailing space.
+      // (A space never affects parsing here, and never a leading
+      // one: indentation is leading whitespace only, and nothing
+      // glues into the marker's front.)
       val withMarker =
-        topSrc.substring(0, relStart) + markerText + topSrc.substring(relEnd)
+        topSrc.substring(0, relStart) + markerText + " " + topSrc.substring(relEnd)
       // Prepend the recorded lexical-context imports (file imports,
       // package import, enclosing-object import) so the wrapper
       // compile resolves the same names the original file saw. All
@@ -1006,8 +1122,10 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       val s = innerSpan.start
       val e = innerSpan.end
       if s < 0 || e > outerBody.length || s > e then return ""
+      // Trailing space for the same lexer-gluing reason as the
+      // direct slice above.
       val outerBodyWithInnerMarker =
-        outerBody.substring(0, s) + EvalBodyPlaceholder.Marker + outerBody.substring(e)
+        outerBody.substring(0, s) + EvalBodyPlaceholder.Marker + " " + outerBody.substring(e)
       outerEncl.replace(
         EvalBodyPlaceholder.Marker,
         EvalBodyPlaceholder.emit(outerBodyWithInnerMarker)
@@ -1046,7 +1164,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       val nameLit = Literal(Constant(EvalNames.ReturnKeyBinding)).withSpan(span)
       discardUses:
         ref(EvalRewriteTyped.bindSyntheticSym)
-          .appliedTo(nameLit, ref(keySym).withSpan(span))
+          .appliedTo(nameLit, ref(keySym).withSpan(span), bindingTpeLit(null, span))
           .withSpan(span)
 
     /** Wrap a filled eval call so a `return` inside the body can
@@ -1101,6 +1219,12 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
      *                        captures: the enclosing-`this` chain and the
      *                        DCE-keeper class-member reads)
      *    - default         → `Eval.bind(name, value)`
+     *
+     *  Every form also passes a trailing type-string argument (see
+     *  [[Eval.Binding.tpe]]): the rendered static type of the
+     *  captured name, or the empty string for the compiler-link
+     *  synthetics (classOf, constructor factories, the return key)
+     *  whose value type is not a user-facing concept.
      */
     private def buildBind(c: CapturedSym, span: Span)(using Context): Tree =
       if c.isVar then buildBindVar(c, span)
@@ -1113,10 +1237,16 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
         val bindFn =
           if c.isSyntheticBinding then EvalRewriteTyped.bindSyntheticSym
           else EvalRewriteTyped.bindSym
+        // `__this__` synthetics carry no symbol; their static type is
+        // the class itself. Everything else reads the captured
+        // symbol's declared type.
+        val capturedTpe: Type | Null = c.selfThisCls match
+          case Some(cls) => cls.typeRef
+          case None => if c.sym.exists then c.sym.info else null
         val nameLit = Literal(Constant(c.sourceName)).withSpan(span)
         discardUses:
           ref(bindFn)
-            .appliedTo(nameLit, readRef(c, span))
+            .appliedTo(nameLit, readRef(c, span), bindingTpeLit(capturedTpe, span))
             .withSpan(span)
 
     /** `Eval.bindSynthetic("__evalClass_C__", classOf[C])`. Type
@@ -1131,7 +1261,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       val nameLit = Literal(Constant(c.sourceName)).withSpan(span)
       discardUses:
         ref(EvalRewriteTyped.bindSyntheticSym)
-          .appliedTo(nameLit, clsOf(clsTpe).withSpan(span))
+          .appliedTo(nameLit, clsOf(clsTpe).withSpan(span), bindingTpeLit(null, span))
           .withSpan(span)
 
     /** `Eval.bindSynthetic("__evalNew_C__$i", (p1…pn) => new C(p1…pn))`.
@@ -1191,7 +1321,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       ).withSpan(span)
       discardUses:
         ref(EvalRewriteTyped.bindSyntheticSym)
-          .appliedTo(nameLit, factory)
+          .appliedTo(nameLit, factory, bindingTpeLit(null, span))
           .withSpan(span)
 
     /** Stamp the `Eval.bind*(...)` call with [[CheckCaptures.DiscardUses]]
@@ -1238,12 +1368,25 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
             case Some(cls) => This(cls).select(c.sym).withSpan(span)
             case None => ref(c.sym).withSpan(span)
 
+    /** String literal carrying the source rendering of a binding's
+     *  static type, fed to the trailing `tpe` parameter of the
+     *  `Eval.bind*` methods. Uses the informational
+     *  [[EvalRewriteTyped.renderTypeInfo]] (not `expectedType`'s
+     *  strict `renderType`): the string is never spliced into a
+     *  wrapper compile, so locally-scoped classes, local aliases,
+     *  and enclosing type parameters render as the names code at
+     *  the call site would use.
+     */
+    private def bindingTpeLit(tpe: Type | Null, span: Span)(using Context): Tree =
+      val rendered = if tpe == null then "" else EvalRewriteTyped.renderTypeInfo(tpe)
+      Literal(Constant(rendered)).withSpan(span)
+
     /** `Eval.bindGiven(name, value)` for given-val captures. */
     private def buildBindGiven(c: CapturedSym, span: Span)(using Context): Tree =
       val nameLit = Literal(Constant(c.sourceName)).withSpan(span)
       discardUses:
         ref(EvalRewriteTyped.bindGivenSym)
-          .appliedTo(nameLit, readRef(c, span))
+          .appliedTo(nameLit, readRef(c, span), bindingTpeLit(c.sym.info, span))
           .withSpan(span)
 
     /** `Eval.bind(name, () => name)` for a by-name parameter capture.
@@ -1261,9 +1404,11 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
         case other => other
       val methTpe = MethodType(Nil, resultTpe)
       val fn = Lambda(methTpe, _ => readRef(c, span)).withSpan(span)
+      // The recorded type is the by-name result type: that's what
+      // the body's bare `name` reference has.
       discardUses:
         ref(EvalRewriteTyped.bindSym)
-          .appliedTo(nameLit, fn)
+          .appliedTo(nameLit, fn, bindingTpeLit(resultTpe, span))
           .withSpan(span)
 
     /** `Eval.bind(name, eta-expansion)` for a captured def.
@@ -1368,9 +1513,12 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
             val grouped = regroup(callArgs, clauseInfos.map(_.length))
             applyTypeArgs(ref(defSym)).appliedToArgss(grouped)
           ).withSpan(span)
+      // The recorded type is the def's declared signature (e.g.
+      // `(x: Int): String`), not the `Any`-typed eta-expansion the
+      // value actually carries.
       discardUses:
         ref(EvalRewriteTyped.bindSym)
-          .appliedTo(nameLit, etaTree)
+          .appliedTo(nameLit, etaTree, bindingTpeLit(defSym.info, span))
           .withSpan(span)
 
     /** `Eval.bindVar(name, Eval.varRef[T](getter, setter))` where
@@ -1413,9 +1561,11 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
         .withSpan(span)
 
       val nameLit = Literal(Constant(c.sourceName)).withSpan(span)
+      // The recorded type is the var's element type (the `T` of
+      // `VarRef[T]`), matching what the body's reads/writes see.
       discardUses:
         ref(EvalRewriteTyped.bindVarSym)
-          .appliedTo(nameLit, varRef)
+          .appliedTo(nameLit, varRef, bindingTpeLit(elemTpe, span))
           .withSpan(span)
 
   end EvalRewriteTransformer
@@ -1425,6 +1575,106 @@ end EvalRewriteTyped
 object EvalRewriteTyped:
 
   val name: String = "evalRewriteTyped"
+
+  /** Attachment key carrying the prototype (the typer's expected
+   *  type) of an eval-like call, recorded by [[recordEvalProto]] at
+   *  the end of `Applications.typedApply`. Sticky: only sticky
+   *  attachments survive the tree copies phases make between Typer
+   *  and this rewriter (`withAttachmentsFrom` drops plain keys).
+   *
+   *  This is how the rewriter learns the constraint upper bound of
+   *  an inferred `[T]`: `val a: A = eval("...")` constrains `T` only
+   *  by `T <: A`, so interpolation minimizes `T := Nothing` and the
+   *  bound is gone from the typed tree. The pt at the call *is* that
+   *  bound (the call's `T` occurs only in result position, so its
+   *  entire constraint comes from `constrainResult` against pt).
+   *  Recording pt instead of touching instantiation keeps inference
+   *  byte-identical; the recorded type is resolved against the final
+   *  instantiations when the rewriter consumes it.
+   */
+  private[eval] val EvalProto: Property.StickyKey[Type] = Property.StickyKey()
+
+  private val EvalMethodName: TermName = termName("eval")
+  private val EvalSafeMethodName: TermName = termName("evalSafe")
+
+  /** Typer-side identification of an eval-like callee, mirroring the
+   *  rewriter's `classifyCall` (symbol identity for `Eval.eval` /
+   *  `Eval.evalSafe`, annotation for user generators). Resilient to
+   *  the eval API being absent from the compile classpath (plain
+   *  compiles must not crash): lookups go through `get*IfDefined`.
+   *
+   *  The name / has-annotations pre-filters keep the per-Apply cost
+   *  of the hook to a couple of reference comparisons; the symbol
+   *  lookups behind them are deliberately *not* cached here. Any
+   *  static cache would need to key on the context base AND the run
+   *  (REPL sessions create fresh context bases whose run ids
+   *  restart, and test suites run many sessions per JVM, possibly
+   *  concurrently), so stale or torn entries would silently disable
+   *  the hook. The lookups are a few cached-denotation accesses and
+   *  only happen for callees that pass the pre-filters.
+   */
+  private def isEvalLikeRef(sym: Symbol)(using Context): Boolean =
+    sym.exists && {
+      val n = sym.name
+      if (n eq EvalMethodName) || (n eq EvalSafeMethodName) then
+        val mod = getModuleIfDefined("dotty.tools.eval.Eval")
+        mod.exists && sym.maybeOwner == mod.moduleClass
+      else if sym.annotations.nonEmpty then
+        val like = getClassIfDefined("dotty.tools.eval.evalLike")
+        like.exists && sym.hasAnnotation(like) || {
+          val safeLike = getClassIfDefined("dotty.tools.eval.evalSafeLike")
+          safeLike.exists && sym.hasAnnotation(safeLike)
+        }
+      else false
+    }
+
+  /** Only record prototypes the typer actually constrained the call's
+   *  result against, in a shape the rewriter can later render:
+   *
+   *    - proto types (`FunProto` when the result is applied further,
+   *      `SelectionProto` for `eval(...).member`, `IgnoredProto`,
+   *      view/poly protos) carry structure, not a result type, and
+   *      `constrainResult` does not establish a plain `T <: pt` for
+   *      them;
+   *    - `WildcardType` is the no-expectation case (statements);
+   *    - a repeated-param type leaks the vararg formal, which is not
+   *      legal ascription source.
+   *
+   *  The pt may freely contain *type variables* (an eval argument to
+   *  a generic method is typed against that method's uninstantiated
+   *  type parameter): those resolve through their permanent
+   *  instantiations when the rewriter reads the attachment.
+   */
+  private def isRecordablePt(pt: Type)(using Context): Boolean = pt match
+    case _: ProtoType | _: WildcardType => false
+    case _ => pt.exists && !pt.isError && pt.isValueType && !pt.isRepeatedParam
+
+  /** Hook called at the end of `Applications.typedApply` with the
+   *  final typed application and its prototype. Attaches the pt to
+   *  the Apply node of eval-like calls.
+   *
+   *  Placement at the *end* of typedApply matters for overloading
+   *  and implicit search: overload resolution, `tryEither` retries,
+   *  and implicit-on-qualifier insertion have all settled by then,
+   *  so the attachment lands on the surviving alternative only
+   *  (discarded speculative attempts die with their trees). The
+   *  using-clause application, if any, is inserted later by `adapt`
+   *  *around* this node, which is why the rewriter looks the
+   *  attachment up along the Apply chain rather than on the
+   *  outermost node. Named/default-arg lifting can wrap the call in
+   *  a Block, hence the strip. Re-typing after Typer (ReTyper,
+   *  TreeChecker) must not overwrite a recorded pt with a synthetic
+   *  one, hence the `isAfterTyper` guard.
+   */
+  def recordEvalProto(tree: Tree, pt: Type)(using Context): Unit =
+    if ctx.isAfterTyper then return
+    def strip(t: Tree): Tree = t match
+      case Block(_, expr) => strip(expr)
+      case t => t
+    strip(tree) match
+      case app: Apply if isEvalLikeRef(methPart(app).symbol) && isRecordablePt(pt) =>
+        app.putAttachment(EvalProto, pt)
+      case _ =>
 
   /** Canonical parameter name for the "bindings" synthetic slot.
    *  Both `Eval.eval` and user eval-like signatures must declare
@@ -1478,12 +1728,17 @@ object EvalRewriteTyped:
   private def consumerClass(using Context): ClassSymbol =
     requiredClass("java.util.function.Consumer")
 
-  /** Render `tpe` as a Scala source string suitable for splicing
-   *  back into the wrapper's `val __evalResult: <tpe> = ...`
-   *  annotation. Returns the empty string when the type is
-   *  degenerate (`Nothing`, `Null`, error type) or mentions a symbol
-   *  the wrapper wouldn't be able to resolve — an enclosing
-   *  method's type parameter, or a locally-scoped class.
+  /** Strict rendering of `tpe` as a Scala source string. Returns
+   *  the empty string when the type is degenerate (`Nothing`,
+   *  `Null`, error type) or mentions a symbol that only resolves in
+   *  the call site's local scope — an enclosing method's type
+   *  parameter, or a locally-scoped class.
+   *
+   *  Used for `expectedType` only when the rewriter could not
+   *  compute an enclosing-source slice: the wrapper compile then
+   *  types the body in an isolated fallback context where only
+   *  globally reachable names resolve, so a local name in the
+   *  ascription would fail the compile.
    *
    *  Capture annotations (`^`, `^{...}`) are kept when capture
    *  checking is enabled in the live session, so the inner verify
@@ -1492,19 +1747,47 @@ object EvalRewriteTyped:
    *  the underlying erased shape.
    */
   private[eval] def renderType(tpe: Type)(using Context): String =
+    renderTypeImpl(tpe, strict = true)
+
+  /** Informational rendering: the type exactly as code written at
+   *  the call site could name it. Locally-scoped classes, local
+   *  type aliases, and enclosing method type parameters are all in
+   *  scope there, so they are kept rather than bailed out on; empty
+   *  only for degenerate types (`Nothing`, `Null`, errors) or a
+   *  failed printer.
+   *
+   *  Used for [[Eval.Binding.tpe]] (display only) and for
+   *  `expectedType` whenever an enclosing-source slice exists: the
+   *  runtime re-typechecks the string as the spliced
+   *  `val __evalResult: <tpe>` ascription at the marker position
+   *  inside the slice, where exactly these names resolve.
+   */
+  private[eval] def renderTypeInfo(tpe: Type)(using Context): String =
+    renderTypeImpl(tpe, strict = false)
+
+  private def renderTypeImpl(tpe: Type, strict: Boolean)(using Context): String =
     if tpe == null || !tpe.exists || tpe.isError then return ""
     val widened = tpe.widen
     if !widened.exists || widened.isError then return ""
+    // `Nothing` / `Null` are suppressed in both modes: an eval call
+    // in an unconstrained position infers `T := Nothing`, and an
+    // expectedType of "Nothing" would force the wrapper's
+    // `val __evalResult: Nothing = <body>` ascription onto bodies
+    // that compile fine without it.
     if isUselessType(widened) then return ""
-    val resolved = dealiasLocalAliases(widened)
-    if mentionsLocallyScopedSymbol(resolved) then return ""
+    val resolved = if strict then dealiasLocalAliases(widened) else widened
+    if strict && mentionsLocallyScopedSymbol(resolved) then return ""
     val cleaned =
       if ctx.settings.YccNew.value || ctx.settings.language.value.contains("experimental.captureChecking")
       then resolved
       else stripCaptureAnnotations(resolved)
     val printCtx = ctx.fresh.setSetting(ctx.settings.color, "never")
     try
-      cleaned.show(using printCtx).replace(".this.", "#")
+      val shown = cleaned.show(using printCtx)
+      // The `A#B` rewrite is a splice-resolvability hack; `A.this.B`
+      // is already legal source at the call site, so the
+      // informational form keeps it.
+      if strict then shown.replace(".this.", "#") else shown
     catch case _: Throwable => ""
 
   private def stripCaptureAnnotations(tpe: Type)(using Context): Type =

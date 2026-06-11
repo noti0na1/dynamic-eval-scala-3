@@ -232,9 +232,12 @@ abstract class EvalExpressionBase(
    *  wrapper compile re-elaborates the class declaration so the body
    *  typechecks, but every runtime artifact must refer to the
    *  *original* lifted class; this accessor is how the lowered code
-   *  reaches it.
+   *  reaches it. Protected (not private) because
+   *  [[ResolveEvalAccess]] also lowers `classOf[C]` constants of
+   *  linked classes to direct calls of this accessor from the
+   *  synthesised subclass.
    */
-  private final def linkedClass(sourceName: String): Class[?] =
+  protected final def linkedClass(sourceName: String): Class[?] =
     getRaw(EvalNames.classBinding(sourceName)) match
       case c: Class[?] => c
       case other => throw new IllegalStateException(

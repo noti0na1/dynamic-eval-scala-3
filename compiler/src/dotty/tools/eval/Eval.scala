@@ -46,6 +46,18 @@ object Eval:
    *                     bindings).
    *  @param value       runtime value, or for var captures a [[VarRef]]
    *                     facade closing over the outer var.
+   *  @param tpe         source-level rendering of the binding's
+   *                     static type as the typer saw it at the call
+   *                     site (for vars, the element type of the
+   *                     [[VarRef]]; for defs, the method signature),
+   *                     not the value's runtime class. Informational:
+   *                     it shows the type exactly as code written at
+   *                     the call site could name it, including
+   *                     locally-scoped classes, local type aliases,
+   *                     and enclosing method type parameters, which
+   *                     are all in scope there. Empty for
+   *                     compiler-link synthetics and for direct
+   *                     programmatic calls that didn't supply one.
    *  @param isVar       `var` capture.
    *  @param isGiven     `given` capture. The runtime emits given bindings
    *                     as members of a `(using ...)` clause on the
@@ -63,12 +75,13 @@ object Eval:
   final class Binding(
       val name: String,
       val value: Any,
-      val isVar: Boolean,
+      val tpe: String = "",
+      val isVar: Boolean = false,
       val isGiven: Boolean = false,
       val isSynthetic: Boolean = false
   ):
     override def toString =
-      s"Binding($name, $value, isVar=$isVar, isGiven=$isGiven, isSynthetic=$isSynthetic)"
+      s"Binding($name, $value, tpe=$tpe, isVar=$isVar, isGiven=$isGiven, isSynthetic=$isSynthetic)"
 
   /** Live getter/setter facade over a captured `var`. The rewriter
    *  emits a `varRef(() => x, v => x = v)` at every `bindVar` site:
@@ -110,24 +123,30 @@ object Eval:
       def get(): T = getFn.get()
       def set(v: T): Unit = setFn.accept(v)
 
-  /** Capture an immutable binding. */
-  def bind(name: String, value: Any): Binding =
-    new Binding(name, value, isVar = false)
+  /** Capture an immutable binding. `tpe` is the source rendering of
+   *  the binding's static type; see [[Binding.tpe]].
+   */
+  def bind(name: String, value: Any, tpe: String = ""): Binding =
+    new Binding(name, value, tpe)
 
   /** Capture a mutable (`var`) binding via a [[VarRef]] facade. The
    *  body's reads/writes are routed through `ref.get()` / `ref.set(v)`
-   *  so they stay live with respect to the outer scope.
+   *  so they stay live with respect to the outer scope. `tpe` is the
+   *  source rendering of the var's element type (the `T` of
+   *  `VarRef[T]`); see [[Binding.tpe]].
    */
-  def bindVar(name: String, ref: VarRef[?]): Binding =
-    new Binding(name, ref, isVar = true)
+  def bindVar(name: String, ref: VarRef[?], tpe: String = ""): Binding =
+    new Binding(name, ref, tpe, isVar = true)
 
   /** Capture a `given` binding. The runtime emits it as a member of a
    *  `(using ...)` clause on the synthesised wrapper so `summon[T]`
    *  resolves. Named givens are also reachable by name; anonymous
-   *  givens get a synthetic name and are only summonable.
+   *  givens get a synthetic name and are only summonable. `tpe` is
+   *  the source rendering of the given's declared type; see
+   *  [[Binding.tpe]].
    */
-  def bindGiven(name: String, value: Any): Binding =
-    new Binding(name, value, isVar = false, isGiven = true)
+  def bindGiven(name: String, value: Any, tpe: String = ""): Binding =
+    new Binding(name, value, tpe, isGiven = true)
 
   /** Capture a synthetic (compiler-only) binding. Used by the
    *  [[EvalRewriteTyped]] rewriter for values the generated code
@@ -135,8 +154,8 @@ object Eval:
    *  class, constructor factory closures, local module instances,
    *  and the non-local-return key. See [[Binding.isSynthetic]].
    */
-  def bindSynthetic(name: String, value: Any): Binding =
-    new Binding(name, value, isVar = false, isSynthetic = true)
+  def bindSynthetic(name: String, value: Any, tpe: String = ""): Binding =
+    new Binding(name, value, tpe, isSynthetic = true)
 
   /** Synthetic verification-compile shim for `evalSafe[T]` /
    *  `agentSafe[T]` calls. The eval driver's verification compile
@@ -288,7 +307,7 @@ object Eval:
       expectedType: String,
       enclosingSource: String
   ): T =
-    val ctx = new EvalContext(enclosingSource, bindings)
+    val ctx = new EvalContext(bindings, expectedType, enclosingSource)
     evalImpl[T](gen.apply(ctx), bindings, expectedType, enclosingSource)
 
   /** Non-throwing variant of [[eval]]. Returns [[EvalResult]] with
@@ -318,7 +337,7 @@ object Eval:
       expectedType: String,
       enclosingSource: String
   ): EvalResult[T] =
-    val ctx = new EvalContext(enclosingSource, bindings)
+    val ctx = new EvalContext(bindings, expectedType, enclosingSource)
     evalSafeImpl[T](gen.apply(ctx), bindings, expectedType, enclosingSource)
 
   private def evalImpl[T](

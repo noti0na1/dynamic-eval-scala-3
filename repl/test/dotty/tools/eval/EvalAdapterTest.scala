@@ -41,7 +41,7 @@ class EvalAdapterTest:
 
   @Test def evaluatesBodyWithCapturedLocal(): Unit =
     val enclosing = s"def f(arg: Int): Int = ({ ${EvalContext.placeholder} })"
-    val binding = new Eval.Binding("arg", java.lang.Integer.valueOf(40), false, false)
+    val binding = new Eval.Binding("arg", java.lang.Integer.valueOf(40))
     val r = call("arg + 2", enclosing, Array(binding))
     assertEquals(Right(java.lang.Integer.valueOf(42)), r)
 
@@ -71,8 +71,8 @@ class EvalAdapterTest:
   @Test def cachesCompiledClassAcrossIdenticalCalls(): Unit =
     EvalAdapter.clearCache()
     val enclosing = s"def f(arg: Int): Int = ({ ${EvalContext.placeholder} })"
-    val b1 = new Eval.Binding("arg", java.lang.Integer.valueOf(10), false, false)
-    val b2 = new Eval.Binding("arg", java.lang.Integer.valueOf(20), false, false)
+    val b1 = new Eval.Binding("arg", java.lang.Integer.valueOf(10))
+    val b2 = new Eval.Binding("arg", java.lang.Integer.valueOf(20))
     assertEquals(Right(java.lang.Integer.valueOf(11)), call("arg + 1", enclosing, Array(b1)))
     val sizeAfterFirst = EvalAdapter.cache.size
     assertEquals("first call should add exactly one cache entry", 1, sizeAfterFirst)
