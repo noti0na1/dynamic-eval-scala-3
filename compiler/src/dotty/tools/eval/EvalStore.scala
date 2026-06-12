@@ -38,6 +38,14 @@ private[eval] class EvalStore:
    */
   var linkedModules: Map[Symbol, String] = Map.empty
 
+  /** Classes declared *inside* the eval body. Recorded at extract
+   *  time (symbol identity is stable across phases): by the time
+   *  [[ResolveEvalAccess]] runs, LambdaLift/Flatten have moved them
+   *  out of `__Expression`, so the placeholder sweep can no longer
+   *  find them by position and consults this set instead.
+   */
+  var bodyLocalClasses: Set[Symbol] = Set.empty
+
   /** Source name of the linked class `tpe` refers to, if any. */
   def linkedClassName(tpe: Type)(using Context): Option[String] =
     if linkedClasses.isEmpty then None

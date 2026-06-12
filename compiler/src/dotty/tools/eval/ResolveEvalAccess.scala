@@ -39,7 +39,8 @@ private[eval] class ResolveEvalAccess(config: EvalCompilerConfig, store: EvalSto
    */
   def transformInfo(tp: Type, sym: Symbol)(using Context): Type =
     if !infoMayChange(sym) then tp
-    else if !sym.ownersIterator.contains(config.expressionClass) then tp
+    else if !sym.ownersIterator.exists(o =>
+      o == config.expressionClass || store.bodyLocalClasses.contains(o)) then tp
     else if !store.mentionsLinkedRef(tp) then tp
     else store.eraseLinkedRefs(tp)
 
@@ -47,8 +48,13 @@ private[eval] class ResolveEvalAccess(config: EvalCompilerConfig, store: EvalSto
     store.hasLinked && !sym.isClass && sym.maybeOwner.exists
 
   override def transformTypeDef(tree: TypeDef)(using Context): Tree =
-    if tree.symbol == config.expressionClass then
-      ExpressionTransformer.transform(tree)
+    // Body-local classes carry placeholders of their own (a method of
+    // a body-declared class can reference outer captures); by this
+    // phase LambdaLift/Flatten have moved them out of `__Expression`,
+    // so they are matched by the symbols recorded at extract time.
+    if tree.symbol == config.expressionClass
+      || store.bodyLocalClasses.contains(tree.symbol)
+    then ExpressionTransformer.transform(tree)
     else tree
 
   private object ExpressionTransformer extends TreeMap:

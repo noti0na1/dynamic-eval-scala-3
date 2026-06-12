@@ -419,18 +419,25 @@ class EvalCompilerBridgeTest:
     assertEquals(java.lang.Integer.valueOf(42), result)
 
   // ===========================================================================
-  // Phase 5b: Outer-chain navigation for nested-class eval bodies.
+  // Phase 5b: Outer-instance access for nested-class eval bodies. The
+  // immediate `this` arrives as the constructor's thisObject; an
+  // *outer* enclosing instance is read from the `__this__<ClassName>`
+  // binding the rewriter captures at the call site (a `$outer` field
+  // walk would only work when the original class happened to need an
+  // outer pointer of its own).
   // ===========================================================================
 
-  /** Instantiate an inner-class instance via reflection. The Scala 3
-   *  inner-class constructor takes the outer instance as its first
-   *  argument; both classes must be loaded through the same loader.
+  /** Instantiate an outer-class instance and one of its inner-class
+   *  instances via reflection. The Scala 3 inner-class constructor
+   *  takes the outer instance as its first argument; both classes
+   *  must be loaded through the same loader.
    */
-  private def newInnerInstance(loader: URLClassLoader, outerName: String, innerName: String): AnyRef =
+  private def newOuterAndInner(loader: URLClassLoader, outerName: String, innerName: String): (AnyRef, AnyRef) =
     val outerCls = loader.loadClass(outerName)
     val outer = outerCls.getDeclaredConstructor().newInstance().asInstanceOf[AnyRef]
     val innerCls = loader.loadClass(innerName)
-    innerCls.getDeclaredConstructor(outerCls).newInstance(outer).asInstanceOf[AnyRef]
+    val inner = innerCls.getDeclaredConstructor(outerCls).newInstance(outer).asInstanceOf[AnyRef]
+    (outer, inner)
 
   @Test def evaluatesOuterClassMemberFromNestedClass(): Unit =
     val enclosing =
@@ -442,8 +449,9 @@ class EvalCompilerBridgeTest:
     val r = runSplice(body = "outerVal + 1", enclosing = enclosing)
     assertTrue(s"compile failed:\n${r.errors}", r.ok)
     val loaded = loadExpression(r.outputDir, r.outputClassName)
-    val inner = newInnerInstance(loaded.loader, "PhaseFiveBOuter", "PhaseFiveBOuter$Inner")
-    val result = invoke(loaded, Array.empty, inner)
+    val (outer, inner) = newOuterAndInner(loaded.loader, "PhaseFiveBOuter", "PhaseFiveBOuter$Inner")
+    val outerBinding = new Eval.Binding("__this__PhaseFiveBOuter", outer)
+    val result = invoke(loaded, Array(outerBinding), inner)
     assertEquals(java.lang.Integer.valueOf(6), result)
 
   @Test def evaluatesOuterClassMethodFromNestedClass(): Unit =
@@ -456,14 +464,15 @@ class EvalCompilerBridgeTest:
     val r = runSplice(body = "factor * 7", enclosing = enclosing)
     assertTrue(s"compile failed:\n${r.errors}", r.ok)
     val loaded = loadExpression(r.outputDir, r.outputClassName)
-    val inner = newInnerInstance(loaded.loader, "PhaseFiveBOuterMethod", "PhaseFiveBOuterMethod$Inner")
-    val result = invoke(loaded, Array.empty, inner)
+    val (outer, inner) = newOuterAndInner(loaded.loader, "PhaseFiveBOuterMethod", "PhaseFiveBOuterMethod$Inner")
+    val outerBinding = new Eval.Binding("__this__PhaseFiveBOuterMethod", outer)
+    val result = invoke(loaded, Array(outerBinding), inner)
     assertEquals(java.lang.Integer.valueOf(21), result)
 
   @Test def evaluatesNestedAndImmediateClassMix(): Unit =
-    // Body references `outerVal` from PhaseFiveBMix (outer step) AND
-    // `innerVal` from Inner (immediate-this); validates that the
-    // chain length is computed per This target.
+    // Body references `outerVal` from PhaseFiveBMix (outer binding)
+    // AND `innerVal` from Inner (immediate-this); validates that each
+    // This target picks its own access path.
     val enclosing =
       s"""class PhaseFiveBMix {
          |  val outerVal: Int = 10
@@ -476,8 +485,9 @@ class EvalCompilerBridgeTest:
     val r = runSplice(body = "outerVal + innerVal", enclosing = enclosing)
     assertTrue(s"compile failed:\n${r.errors}", r.ok)
     val loaded = loadExpression(r.outputDir, r.outputClassName)
-    val inner = newInnerInstance(loaded.loader, "PhaseFiveBMix", "PhaseFiveBMix$Inner")
-    val result = invoke(loaded, Array.empty, inner)
+    val (outer, inner) = newOuterAndInner(loaded.loader, "PhaseFiveBMix", "PhaseFiveBMix$Inner")
+    val outerBinding = new Eval.Binding("__this__PhaseFiveBMix", outer)
+    val result = invoke(loaded, Array(outerBinding), inner)
     assertEquals(java.lang.Integer.valueOf(42), result)
 
   // ===========================================================================

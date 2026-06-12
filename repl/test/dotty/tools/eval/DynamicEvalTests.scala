@@ -3808,6 +3808,462 @@ class DynamicEvalTests extends ReplTest:
     assertContains("val res0: Int = 11", storedOutput())
   }
 
+  // -- Evals *inside* a session-level object. --------------------------------
+  //
+  //    The eval call sits inside a method of a REPL-defined `object`,
+  //    so the enclosing-source slice is the whole object. The wrapper
+  //    compile used to re-elaborate it (body writes landed on a fresh
+  //    module; a nested case class minted a second JVM class).
+  //    SpliceEvalBody's module lift now drops the declaration and
+  //    hoists the marker-bearing def next to an
+  //    `import <Obj>.{given, *}`, so the body links against the live
+  //    session module; privates reroute through the reflective
+  //    helpers with the object itself as receiver.
+
+  @Test def sessionObjectVarMutatedFromInsideEval = initially {
+    run("""|object A:
+           |  var n: Int = 0
+           |  def bump(): Unit = eval[Unit]("n += 10")
+           |A.n = 1
+           |A.bump()
+           |val r = A.n""".stripMargin)
+    assertContains("val r: Int = 11", storedOutput())
+  }
+
+  @Test def sessionObjectCaseClassFromBody = initially {
+    // The body's `Pt(3, 4)` constructs the *session's* `A.Pt`, so the
+    // call site's checkcast against `A.Pt` passes.
+    run("""|object A:
+           |  case class Pt(x: Int, y: Int)
+           |  def mk(): Pt = eval[Pt]("Pt(3, 4)")
+           |val p: A.Pt = A.mk()
+           |val r = p.x + p.y""".stripMargin)
+    assertContains("val r: Int = 7", storedOutput())
+  }
+
+  @Test def sessionObjectNestedObjectLiveState = initially {
+    // The body touches an object nested *inside* the lifted one;
+    // `Counter` resolves through the injected `import A.{given, *}`
+    // to the live session module.
+    run("""|object A:
+           |  object Counter:
+           |    var n: Int = 0
+           |  def bump(): Unit = eval[Unit]("Counter.n += 10")
+           |A.Counter.n = 1
+           |A.bump()
+           |val r = A.Counter.n""".stripMargin)
+    assertContains("val r: Int = 11", storedOutput())
+  }
+
+  @Test def sessionObjectPrivateVarMutatedFromInsideEval = initially {
+    // Reads and writes of the object's private var reroute through
+    // the reflective helpers against the live module (previously the
+    // write landed on a re-elaborated copy and was silently lost).
+    run("""|object A:
+           |  private var hidden: Int = 1
+           |  def bump(): Unit = eval[Unit]("hidden = hidden + 10")
+           |  def current: Int = hidden
+           |A.bump()
+           |val r = A.current""".stripMargin)
+    assertContains("val r: Int = 11", storedOutput())
+  }
+
+  @Test def sessionObjectMethodRecursionThroughEval = initially {
+    // The hoisted def is renamed, so the body's `fact(n - 1)`
+    // resolves through the import to the live `A.fact` and recursion
+    // re-enters the real method.
+    run("""|object A:
+           |  def fact(n: Int): Int = if n <= 1 then 1 else eval[Int]("n * fact(n - 1)")
+           |val r = A.fact(5)""".stripMargin)
+    assertContains("val r: Int = 120", storedOutput())
+  }
+
+  @Test def sessionObjectThisInBody = initially {
+    // A singleton's `this` *is* the module: plain `this` in the body
+    // rewrites to the object's own name.
+    run("""|object A:
+           |  val base: Int = 20
+           |  def calc(): Int = eval[Int]("this.base + A.base + 2")
+           |val r = A.calc()""".stripMargin)
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  // -- Evals *inside* a local class's methods. -------------------------------
+  //
+  //    The eval call sits in a method of a class declared inside an
+  //    enclosing method. The body's bare member references type-check
+  //    against the wrapper's re-elaborated copy with an implicit
+  //    `this` prefix; they lower through the captured `__this__`
+  //    (the live instance) with receiver-class reflection, the same
+  //    route as explicit-qualifier access on linked local classes.
+
+  @Test def evalInsideLocalClassMethod = initially {
+    // Bare `k` in the body is an Ident with an implicit `L.this`
+    // prefix; the qualifier is synthesised from the captured `this`
+    // chain and the read goes through receiver-class reflection on
+    // the live instance.
+    run(
+      """|def make(): Int =
+         |  class L(val k: Int):
+         |    def reach: Int = eval[Int]("k * 3")
+         |  (new L(11)).reach
+         |make()""".stripMargin
+    )
+    assertContains("val res0: Int = 33", storedOutput())
+  }
+
+  @Test def evalInsideLocalClassMethodCallsSibling = initially {
+    // A parameterless sibling method named bare in the body takes
+    // the same implicit-`this` route as a field read.
+    run(
+      """|def make(): Int =
+         |  class L(val k: Int):
+         |    def twice: Int = k * 2
+         |    def reach: Int = eval[Int]("twice + k")
+         |  (new L(11)).reach
+         |make()""".stripMargin
+    )
+    assertContains("val res0: Int = 33", storedOutput())
+  }
+
+  @Test def evalInsideLocalClassMethodPrivateMember = initially {
+    // Private members of the local class reroute through the
+    // inaccessible-member reflective path with the synthesised
+    // `this` qualifier.
+    run(
+      """|def make(): Int =
+         |  class L(private val k: Int):
+         |    def reach: Int = eval[Int]("k * 3")
+         |  (new L(11)).reach
+         |make()""".stripMargin
+    )
+    assertContains("val res0: Int = 33", storedOutput())
+  }
+
+  @Test def evalInsideLocalClassMethodMutatesOuterVar = initially {
+    // The body reaches *past* the local class to a var of the
+    // enclosing method, captured as an ordinary VarRef binding.
+    run(
+      """|def make(): Int =
+         |  var acc = 0
+         |  class L(val k: Int):
+         |    def bump(): Unit = eval[Unit]("acc += k")
+         |  new L(5).bump()
+         |  new L(37).bump()
+         |  acc
+         |make()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def evalInsideLocalCaseClassMethod = initially {
+    // The local-class and case-class machinery compose: the eval
+    // sits inside a method of a local *case* class and reads its
+    // constructor fields.
+    run(
+      """|def make(): Int =
+         |  case class P(a: Int, b: Int):
+         |    def m: Int = eval[Int]("a * b")
+         |  P(6, 7).m
+         |make()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  // -- More eval-inside-class shapes. ----------------------------------------
+  //
+  //    Session-level classes go through the untyped class lift in
+  //    SpliceEvalBody; method-local classes go through the typed
+  //    reflective path. Each shape below exercises one class feature
+  //    at the eval call site.
+
+  @Test def insideClassSelfAlias = initially {
+    // A declared self alias (`self =>`): the body names the alias
+    // explicitly alongside a bare member read.
+    run(
+      """|class A(val x: Int):
+         |  self =>
+         |  def m(): Int = eval[Int]("self.x + x")
+         |new A(21).m()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideLocalClassSelfAlias = initially {
+    run(
+      """|def make(): Int =
+         |  class A(val x: Int):
+         |    self =>
+         |    def m(): Int = eval[Int]("self.x + x")
+         |  new A(21).m()
+         |make()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideClassRecursion = initially {
+    // The body re-enters the enclosing method through the live
+    // instance; each level runs its own eval call.
+    run(
+      """|class F:
+         |  def fact(n: Int): Int = if n <= 1 then 1 else eval[Int]("n * fact(n - 1)")
+         |new F().fact(5)""".stripMargin
+    )
+    assertContains("val res0: Int = 120", storedOutput())
+  }
+
+  @Test def insideLocalClassRecursion = initially {
+    run(
+      """|def make(): Int =
+         |  class F:
+         |    def fact(n: Int): Int = if n <= 1 then 1 else eval[Int]("n * fact(n - 1)")
+         |  new F().fact(5)
+         |make()""".stripMargin
+    )
+    assertContains("val res0: Int = 120", storedOutput())
+  }
+
+  @Test def insideClassMethodDefaultArg = initially {
+    // The eval sits in a method with a defaulted parameter; `d` is an
+    // ordinary param capture whichever way the call supplied it.
+    run(
+      """|class B(val base: Int):
+         |  def add(d: Int = 10): Int = eval[Int]("base + d")
+         |new B(1).add() + new B(1).add(30)""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideClassBodyCallsDefaultArgMethod = initially {
+    // The *body* calls a sibling method relying on its default
+    // argument; the synthesised `add$default$1` resolves on the live
+    // class.
+    run(
+      """|class B(val base: Int):
+         |  def add(d: Int = 10): Int = base + d
+         |  def viaEval(): Int = eval[Int]("add() + add(30)")
+         |new B(1).viaEval()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideClassGenericClass = initially {
+    // Class type parameter: the lifted def carries `T` so the
+    // `__this__: Box[T]` annotation and the body's `T`-typed reads
+    // type-check.
+    run(
+      """|class Box[T](val v: T):
+         |  def get(): T = eval[T]("v")
+         |new Box[Int](42).get()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideLocalClassGenericClass = initially {
+    run(
+      """|def make(): Int =
+         |  class Box[T](val v: T):
+         |    def get(): T = eval[T]("v")
+         |  new Box[Int](42).get()
+         |make()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideClassGenericMethod = initially {
+    // Method-level type parameter used by the body and the expected
+    // type.
+    run(
+      """|class P:
+         |  def pair[T](a: T): (T, T) = eval[(T, T)]("(a, a)")
+         |new P().pair(21)""".stripMargin
+    )
+    assertContains("val res0: (Int, Int) = (21, 21)", storedOutput())
+  }
+
+  @Test def insideClassOverrideMethod = initially {
+    // The marker-bearing def is an `override`; the hoisted host
+    // drops the modifier (its parent is gone after the lift).
+    run(
+      """|class Base:
+         |  def m(): Int = 0
+         |class Sub extends Base:
+         |  override def m(): Int = eval[Int]("41 + 1")
+         |new Sub().m()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideObjectSelfAlias = initially {
+    // A self alias declared on a session *object* maps to the object
+    // itself in the module lift.
+    run(
+      """|object A:
+         |  self =>
+         |  val x: Int = 21
+         |  def m(): Int = eval[Int]("self.x + x")
+         |A.m()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideClassLazyValMember = initially {
+    // Lazy member: the body read forces it on the live instance.
+    run(
+      """|class L:
+         |  lazy val z: Int = 7
+         |  def m(): Int = eval[Int]("z * 6")
+         |new L().m()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideClassInheritedMember = initially {
+    // The body names a member inherited from the parent class.
+    run(
+      """|class Base:
+         |  val inherited: Int = 41
+         |class Sub extends Base:
+         |  def m(): Int = eval[Int]("inherited + 1")
+         |new Sub().m()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideTraitMethod = initially {
+    // The eval sits in a trait's concrete method; `__this__` is the
+    // mixed-in instance.
+    run(
+      """|trait T:
+         |  val offset: Int = 2
+         |  def tm(): Int = eval[Int]("offset + 40")
+         |class CT extends T
+         |new CT().tm()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideClassValInitializer = initially {
+    // The eval call sits in a member *val initializer*, so it runs
+    // during construction of the instance. The lift hoists the
+    // initializer as a def so the marker survives the class drop.
+    run(
+      """|class I(val x: Int):
+         |  val y: Int = eval[Int]("x + 1")
+         |new I(41).y""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideClassLazyValInitializer = initially {
+    // Same, with the eval running lazily at the first member read.
+    run(
+      """|class I(val x: Int):
+         |  lazy val y: Int = eval[Int]("x + 1")
+         |new I(41).y""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideNestedClassValInitializerOuterThis = initially {
+    // The eval sits in a *val initializer* of a nested class and
+    // names the outer instance with the qualified `A.this` form: the
+    // initializer is hoisted as a def carrying both `__this__A` and
+    // `__this__`, and the qualified `this` rewrites to the outer
+    // parameter.
+    run(
+      """|class A(val ax: Int):
+         |  class B:
+         |    val x: Int = eval[Int]("A.this.ax + 1")
+         |val a = new A(41)
+         |val b = new a.B
+         |b.x""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideNestedClassValInitializerOuterThisWrite = initially {
+    // Same position, writing through the outer instance.
+    run(
+      """|class A:
+         |  var n: Int = 1
+         |  class B:
+         |    val unused: Unit = eval[Unit]("A.this.n += 41")
+         |val a = new A
+         |val b = new a.B
+         |a.n""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideNestedClassOuterSelfAlias = initially {
+    // The *outer* class declares a self alias; the body inside the
+    // nested class names the alias instead of `A.this`.
+    run(
+      """|class A(val ax: Int):
+         |  outer =>
+         |  class B(val bx: Int):
+         |    def m(): Int = eval[Int]("outer.ax + bx + 1")
+         |val a = new A(20)
+         |new a.B(21).m()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideLocalNestedClassOuterThis = initially {
+    // Method-local nesting: both classes live in a def, and the body
+    // reaches the outer instance through the qualified `A.this` form
+    // (typed path: outer chain through getOuter on the captured
+    // `this`).
+    run(
+      """|def make(): Int =
+         |  class A(val ax: Int):
+         |    class B(val bx: Int):
+         |      def m(): Int = eval[Int]("A.this.ax + bx + 1")
+         |  val a = new A(20)
+         |  new a.B(21).m()
+         |make()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideLocalClassValInitializer = initially {
+    run(
+      """|def make(): Int =
+         |  class I(val x: Int):
+         |    val y: Int = eval[Int]("x + 1")
+         |  new I(41).y
+         |make()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def insideClassVarCompoundAssign = initially {
+    // Compound assignment to a public var member from the body.
+    run(
+      """|class V:
+         |  var n: Int = 0
+         |  def bump(): Unit = eval[Unit]("n += 21")
+         |val v = new V
+         |v.bump()
+         |v.bump()
+         |v.n""".stripMargin
+    )
+    assertContains("val res2: Int = 42", storedOutput())
+  }
+
+  @Test def insideClassSecondaryCtorFromBody = initially {
+    // The body constructs a sibling instance through the secondary
+    // constructor of the enclosing (session) class.
+    run(
+      """|class S(val x: Int):
+         |  def this() = this(7)
+         |  def m(): Int = eval[Int]("new S().x * 6")
+         |new S(0).m()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
   // -- Local classes across *nested* evals (chained mode). ------------------
   //
   //    The inner eval call is rewritten during the outer body's wrapper
@@ -3890,11 +4346,99 @@ class DynamicEvalTests extends ReplTest:
   @Test def bodyDefinesPlainClassAndUsesIt = initially {
     // Baseline for the nested variants below: a *plain* class
     // declared in the body is a fresh wrapper-owned class (no
-    // linking involved) and is constructible in the same body. (A
-    // *case* class in the body is still rejected; see
-    // `bodyDefinesCaseClassRejected`.)
+    // linking involved) and is constructible in the same body.
     run("""val r: Int = eval[Int]("class D(val x: Int); new D(11).x")""")
     assertContains("val r: Int = 11", storedOutput())
+  }
+
+  @Test def bodyDefinesClassWithMemberMethod = initially {
+    // The method's bare `x` reads type-check as `D.this.x`: a `this`
+    // of a class declared *inside* the body is an ordinary same-class
+    // reference (the class moves into `evaluate` with the body), not
+    // an outer-`this` to thread through the captured chain.
+    run("""val r: Int = eval[Int]("class D(val x: Int) { def dbl: Int = x * 2 }; new D(21).dbl")""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def bodyDefinesCaseClassAndUsesIt = initially {
+    // A *case* class declared in the body: the synthesised members
+    // (companion `apply`, accessors, `copy$default$n`) carry
+    // `Local.this` references that previously tripped the
+    // outer-`this` check. The whole bundle (class + companion) is
+    // body-local and moves into `evaluate` together.
+    run(
+      """|val r: Int = eval[Int](
+         |  "case class Local(a: Int, b: Int); val l = Local(7, 8); l.a * l.b"
+         |)""".stripMargin
+    )
+    assertContains("val r: Int = 56", storedOutput())
+  }
+
+  @Test def bodyDefinesCaseClassPatternMatch = initially {
+    // Companion `unapply` and the case-class accessor path, all on
+    // the body-local class.
+    run("""val r: Int = eval[Int]("case class P(a: Int, b: Int); P(20, 22) match { case P(x, y) => x + y }")""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def bodyDefinesCaseClassCopy = initially {
+    // `copy` with a defaulted parameter exercises the synthesised
+    // `copy$default$1` (a `P.this.a` read on the body-local class).
+    run("""val r: Int = eval[Int]("case class P(a: Int, b: Int); val q = P(1, 2).copy(b = 40); q.a + q.b")""")
+    assertContains("val r: Int = 41", storedOutput())
+  }
+
+  @Test def bodyDefinesClassUsingOuterThis = initially {
+    // The body (inside a method of session class A) declares a class
+    // whose member reaches the *enclosing* instance with the
+    // qualified `A.this` form. Plain `this` inside the body-local
+    // class stays B's own; the qualified form redirects at the
+    // receiver of the dropped layer.
+    run(
+      """|class A(val ax: Int):
+         |  def m(): Int = eval[Int]("class B { def v: Int = A.this.ax + 1 }; new B().v")
+         |new A(41).m()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def bodyDefinesClassUsingBareOuterMember = initially {
+    // Same shape with a *bare* member reference: it resolves through
+    // the lifted def's `import __this__.*`, which is in scope inside
+    // the body-local class.
+    run(
+      """|class A(val ax: Int):
+         |  def m(): Int = eval[Int]("class B { def v: Int = ax + 1 }; new B().v")
+         |new A(41).m()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def bodyDefinesClassUsingOuterThisInLocalClass = initially {
+    // Typed-path twin: the enclosing class is method-local, so
+    // `A.this` inside the body-local class lowers through the
+    // captured `this` chain instead of the lift's receiver param.
+    run(
+      """|def make(): Int =
+         |  class A(val ax: Int):
+         |    def m(): Int = eval[Int]("class B { def v: Int = A.this.ax + 1 }; new B().v")
+         |  new A(41).m()
+         |make()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def bodyDefinesClassUsingEnclosingObjectThis = initially {
+    // Module-lift twin: `A.this` inside the body-local class
+    // redirects at the object's own name (a singleton's `this` is
+    // the module).
+    run(
+      """|object A:
+         |  val ax: Int = 41
+         |  def m(): Int = eval[Int]("class B { def v: Int = A.this.ax + 1 }; new B().v")
+         |A.m()""".stripMargin
+    )
+    assertContains("val res0: Int = 42", storedOutput())
   }
 
   @Test def classDefinedInOuterEvalUsedInInnerEval = initially {
@@ -3983,18 +4527,15 @@ class DynamicEvalTests extends ReplTest:
   // test to assert the success result and move it into the relevant section
   // above.
   //
-  // Open limitations:
-  //   1. Body that defines a fresh case class (synthesised companion methods
-  //      reference the new class's `this`, unreachable from the wrapper).
-  //   2. Eval inside a method of a *local* class (member references can't
-  //      thread through the wrapper-class boundary).
-  //   3. Private *val* on a session-level object accessed from the body via
-  //      a method on that same object. The V2 compile re-declares the object
-  //      inside `__EvalWrapper_*` and Scala 3's nested-object lowering drops
-  //      the private val, so reflective `getField` walks a stripped class.
-  //      Fixing this requires lifting module methods out of their containing
-  //      ModuleDef the same way `SpliceEvalBody.ClassMethodExtractor` lifts
-  //      class methods. (No test for this one yet; tracked in EVAL.md.)
+  // Open limitations: none currently pinned. The narrower edges that
+  // remain (documented in EVAL-BINDINGS-DESIGN.md) are: a body-local
+  // class extending a *linked* local class; by-name constructor params
+  // of linked classes evaluating eagerly at the factory boundary; a
+  // user-defined `unapply` on a local module; eval inside an object
+  // nested in a *class* (instance-dependent module); and markers
+  // outside a def (an object-level val initializer, an extension
+  // method) or in a `private` object, which take the old
+  // re-elaboration path.
   //
   // Lifted (now covered by success tests above):
   //   - *Local* case-class apply/unapply from the body: section 38
@@ -4003,46 +4544,19 @@ class DynamicEvalTests extends ReplTest:
   //     (non-local return via `__evalReturnKey__`). A `return` at the REPL
   //     top level is still rejected with the standard typer diagnostic
   //     (`returnOutsideMethodInBodyRejected` below).
+  //   - Private members of a session-level (or nested) object accessed from
+  //     a body inside that object's methods: the module lift in
+  //     SpliceEvalBody drops the re-declared object and reroutes privates
+  //     reflectively against the live module
+  //     (`sessionObjectPrivateVarMutatedFromInsideEval` above;
+  //     `StandaloneEvalTests.privateValOfNestedObject`).
+  //   - Body that defines a fresh case class: `this` of a body-local class
+  //     is an ordinary same-class reference, not an outer-`this`
+  //     (`bodyDefinesCaseClassAndUsesIt` and friends above).
+  //   - Eval inside a method of a *local* class: bare member Idents lower
+  //     through the synthesised `this` qualifier with receiver-class
+  //     reflection (`evalInsideLocalClassMethod` and friends above).
   // ===========================================================================
-
-  @Test def bodyDefinesCaseClassRejected = initially {
-    // Body declares a fresh case class. Synthesised companion methods
-    // (`apply`, `unapply`) reference the new class's `this`, which the
-    // ExtractEvalBody walk can't reach from `__Expression.evaluate`'s
-    // captured owner chain. Surfaces as a fail-fast diagnostic.
-    run(
-      """|val r: Int = eval[Int](
-         |  "case class Local(a: Int, b: Int); val l = Local(7, 8); l.a * l.b"
-         |)""".stripMargin
-    )
-    val out = storedOutput()
-    assertTrue(s"expected a 'cannot reach outer this' diagnostic, got:\n$out",
-      out.contains("eval failed to compile") &&
-        out.contains("cannot reach outer `this` of class `Local`"))
-  }
-
-  @Test def evalInsideLocalClassMethodKnownLimitation = initially {
-    // Eval call placed inside a method of a *local* class (a class defined
-    // inside an enclosing method). The rewriter reports `cannot reference
-    // outer symbol <member> (owner: class <Local>)` because the body's
-    // reference to a local-class member can't be threaded through the
-    // wrapper-class boundary. Local-class *instances* held in outer-method
-    // vals do work; the eval-inside-local-class-method case still needs the
-    // synthetic helpers routed through the same reflective dispatch path.
-    run(
-      """|def make(): Int =
-         |  class L(val k: Int):
-         |    def reach: Int = eval[Int]("k * 3")
-         |  (new L(11)).reach
-         |make()""".stripMargin
-    )
-    val out = storedOutput()
-    assertTrue(
-      s"expected eval compile failure with outer-symbol diagnostic, got:\n$out",
-      out.contains("cannot reference outer symbol")
-        || out.contains("EvalCompileException")
-    )
-  }
 
   @Test def returnOutsideMethodInBodyRejected = initially {
     // At the top level there is no enclosing method at all; the inner

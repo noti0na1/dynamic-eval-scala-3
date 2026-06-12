@@ -277,6 +277,16 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       val n = sym.name.toString
       n.startsWith(dotc.core.StdNames.str.REPL_SESSION_LINE) || n.contains(ExtractEvalBody.WrapperMarker)
 
+    /** True iff every owner from `cls` up to the enclosing package is
+     *  a module class: the object is reachable at runtime by a static
+     *  path, which is what the wrapper compile's module lift links
+     *  against.
+     */
+    private def isStaticModuleChain(cls: Symbol)(using Context): Boolean =
+      val owner = cls.maybeOwner
+      owner.is(Flags.Package)
+        || (owner.is(Flags.ModuleClass) && isStaticModuleChain(owner))
+
     private def withScope[T](caps: List[CapturedSym])(action: => T): T =
       val pushed = caps.nonEmpty
       if pushed then frameStack.push(caps)
@@ -460,6 +470,26 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
 
         case impl: Template
             if ctx.owner.isClass
+            && ctx.owner.is(Flags.Module)
+            && !ctx.owner.maybeOwner.is(Flags.Package)
+            && isStaticModuleChain(ctx.owner) =>
+          // A *nested* static `object` (every enclosing layer up to
+          // the package is also a module; the top-level case is
+          // handled above). Eval calls inside it go through the
+          // wrapper compile's module lift, which reroutes the
+          // object's private members through runtime reflection.
+          // Like class members, those members need a typed reference
+          // at the call site to survive DCE: an unreferenced
+          // `private val` of an object is otherwise elided from the
+          // emitted module class, and the runtime lookup misses it.
+          // No `__this__` synthetics: the lift reaches the live
+          // module by its static path, not through a captured
+          // instance.
+          val members = collectClassMembers(impl, ctx.owner.asClass)
+          withScope(members)(super.transform(impl))
+
+        case impl: Template
+            if ctx.owner.isClass
             && !ctx.owner.is(Flags.Module)
             && !ctx.owner.is(Flags.Package) =>
           val classSym = ctx.owner.asClass
@@ -527,7 +557,14 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
     private def collectClassMembers(impl: Template, classSym: ClassSymbol)(using Context): List[CapturedSym] =
       val out = mutable.ListBuffer.empty[CapturedSym]
       def addMember(vd: ValDef): Unit =
-        if vd.symbol.exists && !vd.name.isEmpty && !vd.symbol.is(Flags.Synthetic) then
+        // Lazy vals are skipped twice over: their self-referencing
+        // accessor keeps the slot alive without our help, and the
+        // keep-alive *read* would force them at the call site (a
+        // self-deadlock when the eval call sits inside the lazy
+        // val's own initializer).
+        if vd.symbol.exists && !vd.name.isEmpty
+          && !vd.symbol.is(Flags.Synthetic) && !vd.symbol.is(Flags.Lazy)
+        then
           out += CapturedSym(
             vd.symbol, vd.name.toString, isVar = false,
             classMemberOf = Some(classSym)
