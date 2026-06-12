@@ -57,6 +57,18 @@ class ReplCompiler extends Compiler:
     List(UnrollDefinitions()),
   )
 
+  /** The inherited plan carries the main pipeline's flag-gated
+   *  [[EvalCaptureInlined]]; eval is always on in the REPL, so swap
+   *  in an always-enabled instance (mirroring `EvalRewriteTyped`
+   *  above).
+   */
+  override protected def transformPhases: List[List[Phase]] =
+    super.transformPhases.map(_.map {
+      case p if p.phaseName == EvalCaptureInlined.name =>
+        new EvalCaptureInlined(alwaysEnabled = true)
+      case p => p
+    })
+
   def newRun(initCtx: Context, state: State): Run =
     new Run(this, initCtx):
       /** Import previous runs and user defined imports */

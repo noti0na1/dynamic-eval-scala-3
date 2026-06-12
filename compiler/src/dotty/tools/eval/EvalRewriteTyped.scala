@@ -136,14 +136,18 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       classMemberOf: Option[ClassSymbol] = None,
       localClassOf: Option[ClassSymbol] = None,
       ctorFactory: Option[(ClassSymbol, Symbol)] = None,
-      isModuleRef: Boolean = false
+      isModuleRef: Boolean = false,
+      /** An `Inlined` node's binding (inline-expansion value);
+       *  `sourceName` is the reserved `__evalInlined_<name>__` form.
+       */
+      isInlined: Boolean = false
   ):
     /** Compiler-only binding (reserved name, emitted via
      *  `Eval.bindSynthetic`); never resolved by a body identifier.
      */
     def isSyntheticBinding: Boolean =
       selfThisCls.isDefined || classMemberOf.isDefined ||
-        localClassOf.isDefined || ctorFactory.isDefined || isModuleRef
+        localClassOf.isDefined || ctorFactory.isDefined || isModuleRef || isInlined
 
   /** What kind of top-level shape encloses an eval call. The verify
    *  compile wraps `Expression` shapes in a synthetic
@@ -432,6 +436,42 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
           finally
             fileImports = savedFileImports
             packageImports = savedPackageImports
+
+        case tree: Inlined =>
+          // Inline calls expand at the *typer* (`Inlines.inlineCall`
+          // in adapt), so this phase sees post-expansion trees in
+          // both the outer and the wrapper compile, and the
+          // expansion-introduced names agree on the two sides (both
+          // elaborate the same source through the same deterministic
+          // expansion). The bindings the inliner hangs on the node
+          // (parameter proxies, the inline def's own locals, e.g.
+          // `scala.util.boundary.apply`'s label `val local`) are in
+          // scope for the expansion exactly like block locals, and a
+          // body can reach them through its *own* expansions (a body
+          // `break(42)` beta-reduces to a reference to the call
+          // site's label). Hygiene makes them un-nameable from
+          // source, so they are captured as synthetic bindings under
+          // the reserved `__evalInlined_<name>__` form;
+          // [[ExtractEvalBody]] emits the same name for symbols it
+          // finds on the wrapper's Inlined nodes, keeping them
+          // distinct from a user local that shares the inline def's
+          // internal name.
+          val inlinedCaps: List[CapturedSym] = tree.bindings.flatMap {
+            case vd: ValDef
+                if !vd.name.isEmpty
+                && !vd.symbol.isOneOf(Flags.Erased | Flags.Module) =>
+              CapturedSym(vd.symbol, EvalNames.inlinedBinding(vd.name),
+                isVar = vd.symbol.is(Flags.Mutable),
+                isLazy = vd.symbol.is(Flags.Lazy),
+                isInlined = true) :: Nil
+            case _ =>
+              // DefDef bindings (by-name argument proxies) are not
+              // captured: their eta-expansion plumbing is not worth
+              // the rarity, and ExtractEvalBody diagnoses an
+              // unmatched reference cleanly.
+              Nil
+          }
+          withScope(inlinedCaps)(super.transform(tree))
 
         case Block(stats, expr) =>
           // Pre-scan defs: block-local defs are visible from any

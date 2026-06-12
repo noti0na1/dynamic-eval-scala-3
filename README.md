@@ -124,19 +124,30 @@ travels as a control exception, a body's own catch-all handler
 that position would return uncatchably; `NonFatal` handlers are
 transparent to it as usual.
 
+Inline expansion at the call site composes with eval. Both compiles
+expand the same inline calls identically, and values the inliner
+introduces around the call site (parameter proxies, an inline def's
+own locals) are captured as synthetic `__evalInlined_<name>__`
+bindings. `scala.util.boundary` is the flagship case: a body
+`break(42)` links back to the *live* label of the call site's
+`boundary` (which arrives through `boundary.apply`'s inlined
+`val local`), the `Break` control throw crosses `evaluate()`
+transparently, and the enclosing boundary catches it by label
+identity. Hygiene is preserved: the body is spliced and typed before
+the wrapper's own inlining runs, so an inline def's internals are
+*not nameable* from the body (`f { eval("println(l)") }` fails with
+the same "Not found: l" that source at that position gets); the
+synthetic bindings are reachable only through the inliner's
+substitution of names the source could legitimately use, such as a
+context parameter. A body reference that still cannot link (for
+example a by-name argument proxy of an inline call) is rejected with
+a diagnostic at body-compile time rather than failing at runtime.
+
 Other diagnosed limitations: an `Array` of a method-local class
 cannot cross the eval boundary (rejected with a diagnostic; use a
 `List`), and an eval call written inside an `inline def` warns that
 expansion sites will see the unrewritten call (the inline body is
-recorded before the rewriter runs). Values that reach the body only
-through *inline expansion around the call site* cannot cross either:
-bindings are captured before inlining, but the wrapper extracts the
-body after it, where such references have been substituted with the
-expansion's internal names. The visible case is `scala.util.boundary`:
-a `boundary`/`break` pair written entirely inside the body works,
-while a body `break` targeting a boundary at the call site (whose
-`Label` arrives through `boundary.apply`'s inlined `val local`) is
-rejected with a known-limitation diagnostic. In the REPL, an eval body that
+recorded before the rewriter runs). In the REPL, an eval body that
 names a session val *redefined* on a later line fails with an
 ambiguity error: the wrapper compile sees the session lines as
 same-scope wildcard imports, which do not shadow each other the way
@@ -825,6 +836,18 @@ outer eval call (chained mode), `enclosingSource` is composed
 against the outer call's `enclosingSource` so each level of
 nesting carries the full lexical context down.
 
+A small companion phase, `EvalCaptureInlined`, runs after the
+`Inlining` phase in the same pipelines. The rewriter runs before
+inlining (its captures carry the names the user's source elaborates
+to), but the inliner then substitutes references inside beta-reduced
+lambda arguments with expansion-internal values, e.g.
+`scala.util.boundary.apply`'s `val local` label. The companion phase
+appends `__evalInlined_<name>__` synthetic bindings for those values
+to each filled call's bindings array. Both compiles expand the same
+source identically, so the wrapper side lowers body references to
+the same reserved names; this is what makes a body `break(42)` reach
+the call site's live `boundary` label.
+
 ### Inner compile
 
 `EvalCompiler` is a `Compiler` subclass that installs the eval
@@ -895,6 +918,11 @@ catch-all with explicit `isInstanceOf` tests here too: the JVM's
 exception table would otherwise name the re-elaborated class.
 Arrays of linked classes cannot cross the boundary; the phase
 rejects them with a known-limitation diagnostic (use a `List`).
+Body references to values introduced by inline expansion (the
+wrapper re-expands the same inline calls the call site did) lower
+to reads of the matching `__evalInlined_<name>__` bindings; a
+reference with no matching binding is rejected with a diagnostic
+naming the inline origin.
 
 `ResolveEvalAccess` additionally runs a post erasure sweep over
 `__Expression`: type tests and casts that PatternMatcher generated

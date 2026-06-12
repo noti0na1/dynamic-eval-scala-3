@@ -5186,23 +5186,33 @@ class DynamicEvalTests extends ReplTest:
   }
 
   // ===========================================================================
-  // 43. `scala.util.boundary` and the eval boundary.
+  // 43. `scala.util.boundary` and inline expansion at the call site.
   //
-  //     A boundary/break pair living entirely inside the body works:
-  //     `boundary.apply` is inlined into the wrapper, the `Break`
-  //     control exception is thrown and caught inside `evaluate()`,
-  //     and the stdlib classes are shared across the loaders.
-  //
-  //     A body `break` targeting a boundary at the *call site* is a
-  //     diagnosed limitation. `boundary.apply` is an `inline def`:
-  //     bindings are collected before `Inlining` runs, so the label
-  //     is captured under its context-parameter name, but the body is
-  //     extracted after `Inlining`, where the reference has been
-  //     substituted with the expansion's internal `val local`. The
-  //     names can never agree, so `ExtractEvalBody` rejects the
-  //     reference with a known-limitation diagnostic instead of
-  //     letting it fail at runtime.
+  //     Inline calls expand at the typer, so both compiles see the
+  //     same expansion, and values the inliner introduces around the
+  //     call site (parameter proxies, the inline def's own locals,
+  //     e.g. `boundary.apply`'s `val local` label) are captured as
+  //     synthetic `__evalInlined_<name>__` bindings. A body `break`
+  //     therefore links back to the *live* label at the call site:
+  //     `boundary` matches it by `eq`, the `Break` control exception
+  //     propagates out of `evaluate()` (transparent to `NonFatal` and
+  //     to the non-local-return wrap), and the stdlib classes are
+  //     shared across the loaders.
   // ===========================================================================
+
+  @Test def breakFromEvalBodyToEnclosingBoundary = initially {
+    run("""import scala.util.boundary, boundary.break""")
+  } andThen {
+    run("""val r: Int = boundary { eval[Unit]("break(42)"); 0 }""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def breakFromLambdaInsideBoundary = initially {
+    run("""import scala.util.boundary, boundary.break""")
+  } andThen {
+    run("""val r: Int = boundary { List(1, 2, 3).foreach(x => eval[Unit]("if x == 2 then break(x * 21)")); 0 }""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
 
   @Test def boundaryDefinedInsideEvalBody = initially {
     // Self-contained: the boundary and its break both live inside
@@ -5222,13 +5232,86 @@ class DynamicEvalTests extends ReplTest:
     assertContains("val r: Int = 42", storedOutput())
   }
 
-  @Test def breakToCallSiteBoundaryRejectedKnownLimitation = initially {
+  @Test def bodyBoundaryAndCallSiteBoundaryCompose = initially {
+    // The body's own inner boundary catches its own break; the body
+    // then breaks to the *call site's* label.
     run("""import scala.util.boundary, boundary.break""")
   } andThen {
-    run("""val r: Int = boundary { eval[Unit]("break(42)"); 0 }""")
+    run("""val r: Int = boundary { eval[Int]("val inner = boundary { if true then break(2); 0 }; break(inner * 21); 0") }""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def innerBoundaryLabelShadowsOuterInBody = initially {
+    // Two labels named `local` arrive from two nested expansions; the
+    // innermost wins both in the bindings array and in the body's
+    // elaboration, exactly like lexical shadowing.
+    run("""import scala.util.boundary, boundary.break""")
+  } andThen {
+    run("""val r: Int = boundary { boundary { eval[Int]("break(1)") } + 41 }""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def breakPassesThroughTheNonLocalReturnWrap = initially {
+    // The eval call sits directly inside a def, so the rewriter wraps
+    // it in the return-key catch; `Break` must pass through untouched.
+    run("""import scala.util.boundary, boundary.break""")
+  } andThen {
+    run("""def f(): Int = boundary { eval[Unit]("break(42)"); 0 }""")
+  } andThen {
+    run("""val r = f()""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def inlineInternalValNotNameableFromBody = initially {
+    // Hygiene: the body is spliced and *typed* before the wrapper's
+    // own inlining runs, so an inline def's internal `val l` is not
+    // in scope for the body text, exactly as it is not for source
+    // written at the call site. The `__evalInlined_l__` binding is
+    // reachable only through the inliner's substitution of a name
+    // the source could use (a context parameter), never directly.
+    run("""class L""")
+  } andThen {
+    run("""inline def f(op: L ?=> Unit): Unit = { val l = new L(); op(using l) }""")
+  } andThen {
+    run("""f { eval("println(l)") }""")
     val out = storedOutput()
     assertContains("eval failed to compile", out)
-    assertContains("inline-expanded code around the call site", out)
+    assertContains("Not found: l", out)
+  }
+
+  @Test def inlineInternalMangledNameNotNameableFromBody = initially {
+    run("""class L""")
+  } andThen {
+    run("""inline def f(op: L ?=> Unit): Unit = { val l = new L(); op(using l) }""")
+  } andThen {
+    run("""f { eval("println(__evalInlined_l__)") }""")
+    val out = storedOutput()
+    assertContains("eval failed to compile", out)
+    assertContains("Not found", out)
+  }
+
+  @Test def explicitContextParamOfInlineLambdaIsCapturable = initially {
+    // The contrast case: a *user-named* context parameter is real
+    // source scope; the body sees it like any other binding (its
+    // runtime value is the inliner-substituted internal `val l`).
+    run("""class L { override def toString = "L-instance" }""")
+  } andThen {
+    run("""inline def f(op: L ?=> String): String = { val l = new L(); op(using l) }""")
+  } andThen {
+    run("""val r: String = f { (lab: L) ?=> eval("lab.toString") }""")
+    assertContains("""val r: String = "L-instance"""", storedOutput())
+  }
+
+  @Test def userLocalSharingInlineInternalNameIsNotShadowed = initially {
+    // `boundary.apply`'s internal binding is also named `local`; the
+    // mangled `__evalInlined_local__` capture must not collide with
+    // the user's `local`, which the body resolves lexically.
+    run("""import scala.util.boundary, boundary.break""")
+  } andThen {
+    run("""val local = 40""")
+  } andThen {
+    run("""val r: Int = boundary { eval[Unit]("break(local + 2)"); 0 }""")
+    assertContains("val r: Int = 42", storedOutput())
   }
 
 end DynamicEvalTests

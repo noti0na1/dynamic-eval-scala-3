@@ -81,16 +81,12 @@ private[eval] class ResolveEvalAccess(config: EvalCompilerConfig, store: EvalSto
               // path covers both `var` captures (whose binding is a
               // `VarRef[T]`) and `val` captures whose `Mutable` flag
               // was cleared by an earlier phase.
-              //
-              // `originalName` peels the `$N` suffix LambdaLift
-              // appends to lifted local symbols; the runtime bindings
-              // array uses the source name.
-              gen.getValue(variable.originalName.toString)
+              gen.getValue(localBindingName(variable))
 
             case ReflectEvalStrategy.LocalValueAssign(variable) =>
               // Writes need the raw `VarRef` so we can call `.set(v)`;
               // `getValue` would auto-deref to `T`.
-              val ref = gen.getRaw(variable.originalName.toString)
+              val ref = gen.getRaw(localBindingName(variable))
               gen.varRefSet(ref, args.head)
 
             case ReflectEvalStrategy.This(_) =>
@@ -229,6 +225,16 @@ private[eval] class ResolveEvalAccess(config: EvalCompilerConfig, store: EvalSto
         store.linkedClasses.contains(owner) ||
           (owner.isClass && store.linkedModules.contains(owner))
       }
+
+    /** Runtime bindings-array name for a captured local. Values
+     *  introduced by inline expansion were captured under the
+     *  reserved `__evalInlined_<name>__` form (recorded per symbol by
+     *  [[ExtractEvalBody]]); everything else uses the source name,
+     *  with `originalName` peeling the `$N` suffix LambdaLift appends
+     *  to lifted local symbols.
+     */
+    private def localBindingName(variable: TermSymbol)(using Context): String =
+      store.inlinedBindingNames.getOrElse(variable, variable.originalName.toString)
   end ExpressionTransformer
 
   private def evalExpressionBaseClass(using Context): ClassSymbol =

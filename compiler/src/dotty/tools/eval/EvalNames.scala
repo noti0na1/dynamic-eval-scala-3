@@ -65,3 +65,15 @@ private[eval] object EvalNames:
    *  class named `clsName`.
    */
   def thisBinding(clsName: Name | String): String = s"$ThisBinding$clsName"
+
+  /** Binding name for a value introduced by *inline expansion* around
+   *  the eval call site: an `Inlined` node's binding (a parameter
+   *  proxy or the inline def's own local, e.g.
+   *  `scala.util.boundary.apply`'s `val local` label). Inline calls
+   *  expand at the typer, so the outer and the wrapper compile see
+   *  the same expansion and agree on `name`; the binding is reserved
+   *  (hygiene makes the value un-nameable from source) and the
+   *  mangling keeps it from colliding with a user local that happens
+   *  to share the inline def's internal name.
+   */
+  def inlinedBinding(name: Name | String): String = s"__evalInlined_${name}__"
