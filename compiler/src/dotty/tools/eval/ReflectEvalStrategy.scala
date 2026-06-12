@@ -34,6 +34,12 @@ private[eval] enum ReflectEvalStrategy:
    *  lifted class rather than the wrapper's re-elaborated copy.
    */
   case ConstructLocal(bindingName: String)
+  /** `new Array[…[C]…](n)` (`dims` dimensions) where `C` is a linked
+   *  local class: lower to the reflective `newLinkedArray` helper,
+   *  so the array's runtime component class is the *original* lifted
+   *  class rather than the wrapper's re-elaborated copy.
+   */
+  case NewLinkedArray(sourceName: String, dims: Int)
   /** Read a synthetic binding by its exact name: a linked module
    *  instance (`__evalModule_<M>__`), an enclosing instance
    *  (`__this__<C>`), or the non-local-return key

@@ -336,7 +336,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       val savedKind = topLevelKind
       val span = stat.span
       if span.exists then
-        topLevelStart = span.start
+        topLevelStart = extensionClauseStart(stat).getOrElse(span.start)
         topLevelEnd = span.end
         topLevelSource = stat.source
         topLevelKind = classifyTopLevel(stat)
@@ -346,6 +346,27 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
         topLevelEnd = savedEnd
         topLevelSource = savedSrc
         topLevelKind = savedKind
+
+    /** Slice start for an extension-method member. The desugared
+     *  DefDef's span begins at `def`, losing the `extension (…)`
+     *  clause that declares the leading parameters; a slice taken
+     *  from there fails the wrapper compile with "Not found" on the
+     *  extension parameter. The leading params' spans point into the
+     *  clause itself, so widen to the `extension` keyword found just
+     *  before the first of them.
+     */
+    private def extensionClauseStart(stat: Tree)(using Context): Option[Int] = stat match
+      case dd: DefDef if dd.symbol.is(Flags.ExtensionMethod) && dd.span.exists =>
+        val paramStarts = dd.paramss.flatten.collect {
+          case p if p.span.exists && p.span.start < dd.span.start => p.span.start
+        }
+        if paramStarts.isEmpty then None
+        else
+          val src = stat.source.content
+          val upTo = paramStarts.min.min(src.length)
+          val idx = String.valueOf(src, 0, upTo).lastIndexOf("extension")
+          if idx >= 0 then Some(idx) else None
+      case _ => None
 
     /** Source text of `stat`, sliced verbatim from its source file.
      *  Empty when the span is missing or out of bounds.
@@ -377,6 +398,42 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       val owner = cls.maybeOwner
       owner.is(Flags.Package)
         || (owner.is(Flags.ModuleClass) && isStaticModuleChain(owner))
+
+    /** True iff the static path to `cls` is *spellable from anywhere*:
+     *  no layer up to the package is `private` or `protected`. A
+     *  hidden layer vetoes the wrapper compile's module lift (the
+     *  wildcard import it emits would not typecheck), so eval calls
+     *  inside such an object need live-instance captures instead.
+     */
+    private def isModuleChainReachable(cls: Symbol)(using Context): Boolean =
+      !cls.isPrivate && !cls.is(Flags.Protected) && {
+        val owner = cls.maybeOwner
+        owner.is(Flags.Package) || isModuleChainReachable(owner)
+      }
+
+    /** Live-instance captures for eval calls inside a module the
+     *  wrapper compile re-elaborates (instance-dependent, or static
+     *  but `private`): the `__this__` / `__this__<B>` synthetics
+     *  carry the module instance (the runtime `thisObject` and the
+     *  bare-member qualifier), and `__evalModule_<B>__` serves
+     *  name-qualified references. The module-class name suffix is
+     *  stripped so the binding names match the wrapper's source-name
+     *  derivation.
+     */
+    private def moduleInstanceCaptures(classSym: ClassSymbol)(using Context): List[CapturedSym] =
+      import dotc.core.NameOps.stripModuleClassSuffix
+      val plainName = classSym.name.stripModuleClassSuffix
+      val thises = List(
+        CapturedSym(NoSymbol, EvalNames.ThisBinding, isVar = false, selfThisCls = Some(classSym)),
+        CapturedSym(NoSymbol, EvalNames.thisBinding(plainName), isVar = false, selfThisCls = Some(classSym))
+      )
+      val modVal = classSym.sourceModule
+      val moduleRef =
+        if modVal.exists then
+          CapturedSym(modVal, EvalNames.moduleBinding(plainName.toString),
+            isVar = false, isModuleRef = true) :: Nil
+        else Nil
+      thises ++ moduleRef
 
     private def withScope[T](caps: List[CapturedSym])(action: => T): T =
       val pushed = caps.nonEmpty
@@ -686,11 +743,36 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
           // at the call site to survive DCE: an unreferenced
           // `private val` of an object is otherwise elided from the
           // emitted module class, and the runtime lookup misses it.
-          // No `__this__` synthetics: the lift reaches the live
-          // module by its static path, not through a captured
-          // instance.
+          // When the chain is reachable, no `__this__` synthetics:
+          // the lift reaches the live module by its static path, not
+          // through a captured instance. A chain with a `private`
+          // layer vetoes the lift (the wrapper keeps a re-elaborated
+          // copy), so the typed path needs the live-instance
+          // synthetics instead — same as an instance-dependent
+          // module below.
           val members = collectClassMembers(impl, ctx.owner.asClass)
-          withClassFrame(withScope(members)(super.transform(impl)))
+          val instanceCaps =
+            if isModuleChainReachable(ctx.owner) then Nil
+            else moduleInstanceCaptures(ctx.owner.asClass)
+          withClassFrame(withScope(instanceCaps ++ members)(super.transform(impl)))
+
+        case impl: Template
+            if ctx.owner.isClass
+            && ctx.owner.is(Flags.Module)
+            && !ctx.owner.maybeOwner.is(Flags.Package) =>
+          // An *instance-dependent* module: an `object` nested in a
+          // class (one live module per enclosing instance) or local
+          // to a method. The wrapper compile keeps a re-elaborated
+          // copy (no static path to lift against), so eval calls
+          // inside its methods link like class members: `__this__` /
+          // `__this__<B>` carry the live module instance for `this`
+          // and bare-member access, `__evalModule_<B>__` serves
+          // name-qualified references (`B.x`), and the member
+          // keepers protect privates from DCE.
+          val classSym = ctx.owner.asClass
+          val members = collectClassMembers(impl, classSym)
+          withClassFrame(
+            withScope(moduleInstanceCaptures(classSym) ++ members)(super.transform(impl)))
 
         case impl: Template
             if ctx.owner.isClass
