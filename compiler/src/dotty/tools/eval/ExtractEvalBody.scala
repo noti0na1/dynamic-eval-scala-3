@@ -125,7 +125,23 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
   private def collectLinkedEntities(trees: List[Tree])(using Context): Unit =
     val classes = Map.newBuilder[Symbol, String]
     val modules = Map.newBuilder[Symbol, String]
+    val inlined = Map.newBuilder[Symbol, String]
     val traverser = new TreeTraverser:
+      /** Inside an inline expansion's own code; see the symmetric
+       *  tracking in [[EvalCaptureInlined]]. A nested
+       *  `Inlined(EmptyTree, ...)` region is beta-reduced call-site
+       *  code, whose locals are ordinary captures under their source
+       *  names and must not be mapped to inlined-binding names.
+       */
+      private var inExpansion: Boolean = false
+
+      private def recordInlined(stats: List[Tree])(using Context): Unit =
+        stats.foreach {
+          case vd: ValDef if !vd.name.isEmpty =>
+            inlined += vd.symbol -> EvalNames.inlinedBinding(vd.name)
+          case _ =>
+        }
+
       def traverse(tree: Tree)(using Context): Unit =
         tree match
           case td: TypeDef if td.isClassDef =>
@@ -136,6 +152,7 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
               val src = sym.name.toString
               if config.bindingNames.contains(EvalNames.classBinding(src)) then
                 classes += sym -> src
+            traverseChildren(tree)
           case vd: ValDef if vd.symbol.is(Module) =>
             val sym = vd.symbol
             if isDirectlyTermOwned(sym) && !isLocalToBodySym(sym) then
@@ -143,11 +160,32 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
               if config.bindingNames.contains(EvalNames.moduleBinding(src)) then
                 modules += sym -> src
                 modules += sym.moduleClass -> src
+            traverseChildren(tree)
+          case tree: Inlined =>
+            // Values introduced by inline expansion around the call
+            // site: [[EvalCaptureInlined]] captured them under the
+            // reserved `__evalInlined_<name>__` form. Record the
+            // wrapper-side symbols (node bindings are parameter
+            // proxies; expansion-block stats below carry the inline
+            // def's body locals) so the captured-binding gate and
+            // [[ResolveEvalAccess]]'s `LocalValue` lowering use the
+            // same names. Body-internal expansions are recorded too;
+            // harmless, since body-local symbols never reach the
+            // captured-local lowering.
+            val saved = inExpansion
+            inExpansion = !tree.call.isEmpty
+            if inExpansion then recordInlined(tree.bindings)
+            try traverseChildren(tree)
+            finally inExpansion = saved
+          case tree: Block if inExpansion =>
+            recordInlined(tree.stats)
+            traverseChildren(tree)
           case _ =>
-        traverseChildren(tree)
+            traverseChildren(tree)
     trees.foreach(traverser.traverse)
     store.linkedClasses = classes.result()
     store.linkedModules = modules.result()
+    store.inlinedBindingNames = inlined.result()
 
   /** Known limitation: arrays of a *linked* local class cannot cross
    *  the eval boundary. The body rewrite and the post-erasure sweep
@@ -656,7 +694,8 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
      *  check is skipped there.
      */
     private def checkCapturedBinding(sym: TermSymbol, tree: Tree)(using Context): Boolean =
-      config.testMode || config.bindingNames.contains(sym.name.toString) || {
+      val effectiveName = store.inlinedBindingNames.getOrElse(sym, sym.name.toString)
+      config.testMode || config.bindingNames.contains(effectiveName) || {
         val provenance =
           if sym.source != ctx.compilationUnit.source then
             s" `${sym.name}` comes from inline-expanded code around the call site" +

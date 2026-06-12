@@ -59,6 +59,7 @@ class Compiler {
 
   /** Phases dealing with the transformation from pickled trees to backend trees */
   protected def transformPhases: List[List[Phase]] =
+    List(new eval.EvalCaptureInlined) :: // Append inliner-introduced bindings to dynamic `eval` calls (only with -Xdynamic-eval)
     List(new InstrumentCoverage) ::  // Perform instrumentation for code coverage (if -coverage-out is set)
     List(new CrossVersionChecks,     // Check issues related to deprecated and experimental
          new FirstTransform,         // Some transformations to put trees into a canonical form

@@ -48,6 +48,16 @@ private[eval] class EvalStore:
    */
   var bodyLocalClasses: Set[Symbol] = Set.empty
 
+  /** Wrapper-side symbols introduced by inline expansion (`Inlined`
+   *  node bindings), mapped to their reserved
+   *  `__evalInlined_<name>__` binding names. Populated by
+   *  [[ExtractEvalBody]] as it encounters Inlined nodes; consumed by
+   *  [[ResolveEvalAccess]] when lowering `LocalValue` /
+   *  `LocalValueAssign` placeholders, whose runtime names must match
+   *  what [[EvalRewriteTyped]] captured at the call site.
+   */
+  var inlinedBindingNames: Map[Symbol, String] = Map.empty
+
   /** Source name of the linked class `tpe` refers to, if any. */
   def linkedClassName(tpe: Type)(using Context): Option[String] =
     if linkedClasses.isEmpty then None

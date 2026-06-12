@@ -54,7 +54,14 @@ class EvalCompiler(config: EvalCompilerConfig) extends Compiler:
 
   override protected def transformPhases: List[List[Phase]] =
     val store = EvalStore()
-    val transformPhases = super.transformPhases
+    // Swap the base pipeline's flag-gated [[EvalCaptureInlined]] for
+    // the config-carrying instance, so nested eval calls inside the
+    // body get inliner-introduced bindings appended too.
+    val transformPhases = super.transformPhases.map(_.map {
+      case p if p.phaseName == EvalCaptureInlined.name =>
+        new EvalCaptureInlined(Some(config))
+      case p => p
+    })
     // Anchor [[ExtractEvalBody]] right after the capture-checking
     // group so `cc` sees the body in its original lexical context.
     // The group is always *present* in the plan (whether it runs is
