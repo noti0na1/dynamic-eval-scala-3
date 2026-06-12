@@ -13,8 +13,10 @@ import dotty.tools.dotc.core.Types.*
  *
  *    - `symbol`: the val symbol; used as the owner-chain anchor when
  *      classifying body-local vs outer references.
- *    - `classOwners`: enclosing classes from innermost out; Resolve
- *      walks this chain to lower `This(C)` / `Outer(_, C)` placeholders.
+ *    - `classOwners`: enclosing classes from innermost out; Extract's
+ *      `thisOrOuterValue` consults this chain to decide between a
+ *      `This` placeholder (innermost class) and a `__this__<C>`
+ *      binding read (outer classes).
  */
 private[eval] class EvalStore:
   var symbol: TermSymbol | Null = null
@@ -67,10 +69,11 @@ private[eval] class EvalStore:
         linkedClasses.contains(sym) || linkedModules.contains(sym)
 
   /** Substitute every linked-entity occurrence in `info` with
-   *  `Object`. Shared by [[ExtractEvalBody]] (body-local symbols)
-   *  and [[ResolveEvalAccess]] (symbols created between the two
-   *  phases, e.g. PatternMatcher binders and the typer's `+=`
-   *  prefix-lift temps): the runtime values flowing through these
+   *  `Object`. Shared by [[ExtractEvalBody]] (body-local symbols
+   *  that exist when it runs, including PatternMatcher binders) and
+   *  [[ResolveEvalAccess]] (symbols minted by phases that run after
+   *  extract, e.g. LetOverApply receiver temps, Memoize fields, and
+   *  erasure temps): the runtime values flowing through these
    *  positions belong to the *original* lifted classes, so a
    *  descriptor or checkcast naming the wrapper's re-elaborated
    *  copy would be wrong.

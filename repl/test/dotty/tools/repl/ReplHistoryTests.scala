@@ -54,10 +54,33 @@ class ReplHistoryTests
     assertTrue(s"expected a < b < c order, got a=$ia b=$ib c=$ic", ia < ib && ib < ic)
   }
 
-  @Test def stripsAnsiColorCodes = initially {
-    run("val s = \"hi\"")
+  @Test def multiLineInputUsesContinuationPrefix = initially {
+    run("def f(x: Int) =\n  x * 2")
     val s = historyContent
-    assertFalse(s"expected no ANSI escapes, got:\n$s", s.contains("\u001b["))
+    assertTrue(s"expected the first input line prefixed with `scala> `, got:\n$s",
+      s.contains("scala> def f(x: Int) ="))
+    assertTrue(s"expected the continuation line prefixed with `     | `, got:\n$s",
+      s.contains("     |   x * 2"))
+  }
+
+  @Test def commandInputIsRecorded = initially {
+    run("import scala.collection.mutable")
+    run(":imports")
+    val s = historyContent
+    assertTrue(s"expected `scala> :imports` to be recorded, got:\n$s",
+      s.contains("scala> :imports"))
+  }
+
+  @Test def oversizedOutputIsTruncatedWithMarker = initially {
+    // Print more than `ReplHistory.captureLimit` bytes in one line; the
+    // live stream gets everything, the history entry is capped and ends
+    // with a truncation marker.
+    run(s"""print("x" * ${ReplHistory.captureLimit + 1024})""")
+    val s = historyContent
+    assertTrue(s"expected a truncation marker, got tail:\n${s.takeRight(200)}",
+      s.contains("[... output truncated:"))
+    assertTrue(s"expected the entry to be capped near the limit, size was ${s.length}",
+      s.length < ReplHistory.captureLimit + 4096)
   }
 
   @Test def capturesEvalLineOutput = initially {
@@ -84,3 +107,74 @@ object ReplHistoryTests:
 
   val optionsForTempFile: Array[String] =
     ReplTest.defaultOptions :+ s"-Xrepl-history-file:${historyFile.getAbsolutePath}"
+
+/** ANSI stripping needs a session that actually colors its output;
+ *  `ReplTest.defaultOptions` forces `-color:never`, which would make
+ *  the assertion vacuous.
+ */
+class ReplHistoryColorTests
+    extends ReplTest(ReplHistoryColorTests.options, ReplHistoryColorTests.rawOut):
+
+  @After def cleanFile(): Unit =
+    val f = ReplHistoryColorTests.historyFile
+    if f.exists() then f.delete()
+
+  @Test def stripsAnsiColorCodes = initially {
+    run("val s = \"hi\"")
+    // `storedOutput()` strips color, so assert ANSI presence on the
+    // raw buffer (before the @After cleanup resets it).
+    val live = ReplHistoryColorTests.rawOut.toString(StandardCharsets.UTF_8)
+    assertTrue(s"expected ANSI escapes on the live stream, got:\n$live",
+      live.contains("\u001b["))
+    val f = ReplHistoryColorTests.historyFile
+    val recorded = new String(Files.readAllBytes(f.toPath), StandardCharsets.UTF_8)
+    assertTrue(s"expected the input to be recorded, got:\n$recorded",
+      recorded.contains("val s"))
+    assertFalse(s"expected no ANSI escapes in the file, got:\n$recorded",
+      recorded.contains("\u001b["))
+  }
+
+end ReplHistoryColorTests
+
+object ReplHistoryColorTests:
+  val rawOut: ByteArrayOutputStream = new ByteArrayOutputStream
+
+  val historyFile: File =
+    val f = File.createTempFile("repl-history-color-", ".txt")
+    f.deleteOnExit()
+    f.delete()
+    f
+
+  val options: Array[String] =
+    ReplTest.defaultOptions.filterNot(_.startsWith("-color")) ++
+      Array("-color:always", s"-Xrepl-history-file:${historyFile.getAbsolutePath}")
+
+/** A history path that cannot be created (its parent is a regular
+ *  file) must warn and leave the REPL fully functional.
+ */
+class ReplHistoryUnwritableTests
+    extends ReplTest(ReplHistoryUnwritableTests.options, new ByteArrayOutputStream):
+
+  @Test def ioFailureDoesNotBreakTheRepl = initially {
+    run("val ok = 6 * 7")
+    val out = storedOutput()
+    assertTrue(s"expected the line to evaluate normally, got:\n$out",
+      out.contains("val ok: Int = 42"))
+    assertFalse("expected no history file at the unwritable path",
+      new File(ReplHistoryUnwritableTests.unwritablePath).exists())
+  }
+
+end ReplHistoryUnwritableTests
+
+object ReplHistoryUnwritableTests:
+  // A regular file used as a directory component makes every append fail.
+  val blockingFile: File =
+    val f = File.createTempFile("repl-history-blocker-", ".txt")
+    f.deleteOnExit()
+    f
+
+  val unwritablePath: String =
+    s"${blockingFile.getAbsolutePath}${File.separator}sub${File.separator}history.txt"
+
+  val options: Array[String] =
+    ReplTest.defaultOptions :+ s"-Xrepl-history-file:$unwritablePath"

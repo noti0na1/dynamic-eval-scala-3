@@ -7,6 +7,7 @@ import dotty.tools.dotc.core.Contexts.*
 import dotty.tools.dotc.core.Decorators.*
 import dotty.tools.dotc.core.Denotations.SingleDenotation
 import dotty.tools.dotc.core.Flags.*
+import dotty.tools.dotc.core.NameKinds.ExceptionBinderName
 import dotty.tools.dotc.core.Names.*
 import dotty.tools.dotc.core.SymDenotations.SymDenotation
 import dotty.tools.dotc.core.Symbols.*
@@ -16,6 +17,7 @@ import dotty.tools.dotc.core.Phases.*
 import dotty.tools.dotc.report
 import dotty.tools.dotc.transform.MacroTransform
 import dotty.tools.dotc.util.SrcPos
+import dotty.tools.dotc.util.Spans.Span
 
 /** Post-typer phase that pulls the typed eval body out of its splice
  *  point and into the synthesised `__Expression.evaluate` method.
@@ -103,10 +105,13 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
       o == valSym || o == config.evaluateMethod || o == config.expressionClass
     )
 
-  /** True when `sym` is owned (possibly transitively through other
-   *  classes) by a term, i.e. a class/module declared inside a method.
+  /** True when `sym`'s *direct* owner is a term, i.e. a class/module
+   *  declared immediately inside a method or block. Unlike the
+   *  transformer's `isTermOwnedSymbol`, this does not walk the owner
+   *  chain: a class nested inside another method-local class fails
+   *  this check but passes the transitive one.
    */
-  private def isTermOwnedSym(sym: Symbol)(using Context): Boolean =
+  private def isDirectlyTermOwned(sym: Symbol)(using Context): Boolean =
     sym.exists && sym.maybeOwner.exists && sym.maybeOwner.isTerm
 
   /** Record the wrapper's re-elaborated local classes/modules whose
@@ -126,14 +131,14 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
           case td: TypeDef if td.isClassDef =>
             val sym = td.symbol
             if sym.isClass && !sym.is(ModuleClass)
-              && isTermOwnedSym(sym) && !isLocalToBodySym(sym)
+              && isDirectlyTermOwned(sym) && !isLocalToBodySym(sym)
             then
               val src = sym.name.toString
               if config.bindingNames.contains(EvalNames.classBinding(src)) then
                 classes += sym -> src
           case vd: ValDef if vd.symbol.is(Module) =>
             val sym = vd.symbol
-            if isTermOwnedSym(sym) && !isLocalToBodySym(sym) then
+            if isDirectlyTermOwned(sym) && !isLocalToBodySym(sym) then
               val src = vd.name.toString
               if config.bindingNames.contains(EvalNames.moduleBinding(src)) then
                 modules += sym -> src
@@ -143,6 +148,55 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
     trees.foreach(traverser.traverse)
     store.linkedClasses = classes.result()
     store.linkedModules = modules.result()
+
+  /** Known limitation: arrays of a *linked* local class cannot cross
+   *  the eval boundary. The body rewrite and the post-erasure sweep
+   *  redirect casts, type tests, and member access to the original
+   *  runtime class, but an array type escapes them all: `anewarray`,
+   *  array casts, and array store checks would still name the
+   *  wrapper's re-elaborated element class. Rather than fail at
+   *  runtime (a `NoClassDefFoundError` once the wrapper is dropped,
+   *  or a `checkcast` against the wrong class), reject the body
+   *  here, where source positions are still good. Reported once per
+   *  linked class; arrays of non-linked element types pass through,
+   *  and only the captured body is scanned.
+   */
+  private def checkLinkedArrays(body: Tree)(using Context): Unit =
+    if !store.hasLinked then return
+    def linkedArrayElem(tpe: Type): Symbol =
+      var found: Symbol = NoSymbol
+      tpe.foreachPart { p =>
+        if !found.exists then
+          val elem = p match
+            case AppliedType(tycon, arg :: Nil) if tycon.typeSymbol == defn.ArrayClass => arg
+            case JavaArrayType(arg) => arg
+            case _ => NoType
+          if elem.exists then
+            val sym = elem.widenDealias.typeSymbol
+            if store.linkedClasses.contains(sym) then found = sym
+      }
+      found
+    var reported = Set.empty[Symbol]
+    val traverser = new TreeTraverser:
+      def traverse(t: Tree)(using Context): Unit =
+        if t.hasType then
+          // Widen first: a reference to a captured `Array[C]` local
+          // is typed as a `TermRef`, whose parts do not include the
+          // underlying array type.
+          val sym = linkedArrayElem(t.tpe.widenDealias)
+          if sym.exists && !reported.contains(sym) then
+            reported += sym
+            report.error(
+              s"eval: `Array[${sym.name}]` cannot cross the eval boundary: " +
+                s"`${sym.name}` is a local class linked to the call site, and " +
+                "the array's JVM element type would name the wrapper's " +
+                "re-elaborated copy instead of the original class (known " +
+                "limitation). Use a collection such as `List` instead of " +
+                "`Array` across the eval boundary.",
+              t.srcPos
+            )
+        traverseChildren(t)
+    traverser.traverse(body)
 
   /** True iff `sym` is the wrapper module class or its companion val.
    *  The wrapper is synthesised in `EvalAdapter` and always carries
@@ -232,7 +286,15 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
         case tree: DefDef if tree.symbol == config.evaluateMethod =>
           val captured = bodyTree
           if captured == null then tree
-          else cpy.DefDef(tree)(rhs = ExtractTransformer.transform(captured))
+          else
+            checkLinkedArrays(captured)
+            // Run the body rewrite with `evaluate` as the context
+            // owner: the rhs becomes `evaluate`'s body, and symbols
+            // the rewrite creates (the catch binders of the linked
+            // try rewrite) must be owned by their enclosing method.
+            // The TreeMap re-establishes nested owners on descent.
+            val rhs = ExtractTransformer.transform(captured)(using ctx.withOwner(tree.symbol))
+            cpy.DefDef(tree)(rhs = rhs)
 
         case _ => super.transform(tree)
   end ExtractEvalBodyTransformer
@@ -316,6 +378,33 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
             tree
         else super.transform(tree)
 
+      // `try ... catch` with a clause whose catch type is a *linked*
+      // local class. `TryCatchPatterns` runs before this phase and
+      // keeps simple throwable patterns as direct JVM catch clauses;
+      // a method-local class passes its `isSimpleThrowable` test
+      // (NoPrefix, not a trait, derives from Throwable). Left alone,
+      // the backend would emit an exception-table entry naming the
+      // wrapper's re-elaborated class: a `NoClassDefFoundError` once
+      // the wrapper is dropped, or a handler that never catches
+      // instances of the original class. Rewrite into the shape
+      // `TryCatchPatterns.mkFallbackPatterMatchCase` produces: catch
+      // `Throwable` into a fresh binder, test against the linked
+      // class, run the original handler on the cast value, otherwise
+      // rethrow. The first linked clause and *all* clauses after it
+      // fold into one catch-all case, because a rethrow from inside
+      // a handler is not covered by the try's exception table, so a
+      // later clause would otherwise become unreachable. The emitted
+      // `isInstanceOf` / `asInstanceOf` trees are lowered to
+      // `isLinkedInstance` / `castLinked` by [[ResolveEvalAccess]]'s
+      // post-erasure sweep.
+      case tree: Try if tree.cases.exists(isLinkedCatchCase) =>
+        val expr = transform(tree.expr)
+        val finalizer = transform(tree.finalizer)
+        val firstLinked = tree.cases.indexWhere(isLinkedCatchCase)
+        val (direct, folded) = tree.cases.splitAt(firstLinked)
+        val cases = direct.map(transformSub(_)) :+ foldLinkedCatchCases(folded, tree.span)
+        cpy.Try(tree)(expr, cases, finalizer)
+
       // Constructor call on a *linked* local class (`new C(...)`,
       // including secondary constructors). Replace with the
       // call-site factory closure stored under `__evalNew_C__$i`, so
@@ -329,10 +418,28 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
         val cls = tree.symbol.owner.asClass
         val src = store.linkedClasses(cls)
         val idx = ctorIndexOf(cls, tree.symbol)
-        val args = transformedMethodArgs(tree)
-        buildReflectEvalCast(tree, nullLiteral,
-          ReflectEvalStrategy.ConstructLocal(EvalNames.ctorBinding(src, idx)),
-          args, defn.ObjectType)
+        val binding = EvalNames.ctorBinding(src, idx)
+        // The rewriter captures one factory per *non-private*
+        // constructor (a private one would trip the JVM access
+        // check after lifting), so a body that legally names a
+        // private constructor of the re-elaborated class has no
+        // factory to link to. Diagnose here rather than fail with a
+        // NoSuchElementException at runtime; same gating as
+        // `collectLinkedEntities`.
+        if !config.bindingNames.contains(binding) then
+          report.error(
+            s"eval: cannot construct local class `${cls.name}` through this " +
+              "constructor from the eval body: the call site captured no " +
+              "factory for it (private constructors of local classes are " +
+              "not captured; known limitation).",
+            tree.srcPos
+          )
+          tree
+        else
+          val args = transformedMethodArgs(tree)
+          buildReflectEvalCast(tree, nullLiteral,
+            ReflectEvalStrategy.ConstructLocal(binding),
+            args, defn.ObjectType)
 
       // Captured-var write: outer method-local `var x` gets `x = v`
       // routed through the bind site's `VarRef.set(v)`. Body-local
@@ -344,7 +451,7 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
         setLocalValue(tree, lhs.symbol.asTerm, transform(rhs))
 
       case tree @ Assign(lhs, rhs) if isInaccessibleField(lhs) =>
-        setField(tree, transformedQualifier(lhs), lhs.symbol.asTerm, transform(rhs))
+        setField(tree, inaccessibleQualifier(lhs), lhs.symbol.asTerm, transform(rhs))
 
       // Write to a (public) field of a term-owned class/module, e.g.
       // `Counter.n = v` on a linked local object. Must be intercepted
@@ -389,9 +496,9 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
         else if isLocalVariable(sym) then
           getLocalValue(tree, sym.asTerm)
         else if isInaccessibleField(tree) then
-          getField(tree, transformedQualifier(tree), sym.asTerm)
+          getField(tree, inaccessibleQualifier(tree), sym.asTerm)
         else if isInaccessibleMethod(tree) then
-          callMethod(tree, transformedQualifier(tree), sym.asTerm, Nil)
+          callMethod(tree, inaccessibleQualifier(tree), sym.asTerm, Nil)
         else if isOuterMethodLocalDef(sym) then
           captureLocalMethod(tree, sym.asTerm, Nil)
         else if isTermOwnedClassFieldAccess(tree) then
@@ -413,21 +520,21 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
           super.transform(tree)
 
       case tree: Select if isInaccessibleField(tree) =>
-        getField(tree, transform(tree.qualifier), tree.symbol.asTerm)
+        getField(tree, inaccessibleQualifier(tree), tree.symbol.asTerm)
 
       // Member access on a captured local-class instance. The
       // wrapper compile re-elaborates the class declaration as a
       // fresh JVM class, so direct `getfield` / `invokevirtual`
       // on the wrapper's symbol would target a different class
       // than the runtime instance. Route through the reflective
-      // helpers, which use `obj.getClass` (see runtime fallback in
-      // SpliceEvalBody when className is empty).
+      // helpers, which use `obj.getClass` (see the empty-className
+      // fallback in `EvalExpressionBase.getField` / `callMethod`).
       case tree: Select if isTermOwnedClassFieldAccess(tree) =>
         getField(tree, transform(tree.qualifier), tree.symbol.asTerm)
 
       case tree: Apply if isInaccessibleMethod(tree) =>
         val args = transformedMethodArgs(tree)
-        callMethod(tree, transformedQualifier(tree), tree.symbol.asTerm, args)
+        callMethod(tree, inaccessibleQualifier(tree), tree.symbol.asTerm, args)
 
       case tree: Apply if isTermOwnedClassMethodCall(tree) =>
         val args = transformedMethodArgs(tree)
@@ -435,17 +542,17 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
 
       case tree: TypeApply if isInaccessibleMethod(tree) =>
         val args = transformedMethodArgs(tree)
-        callMethod(tree, transformedQualifier(tree), tree.symbol.asTerm, args)
+        callMethod(tree, inaccessibleQualifier(tree), tree.symbol.asTerm, args)
 
       case tree: TypeApply if isTermOwnedClassMethodCall(tree) =>
         val args = transformedMethodArgs(tree)
         callMethod(tree, transformedQualifier(tree), tree.symbol.asTerm, args)
 
       case tree: Select if isInaccessibleMethod(tree) =>
-        // Bare Select to a private method (no Apply yet — i.e. taken
+        // Bare Select to a private method (no Apply yet, i.e. taken
         // as a function value). Treat as a 0-arg call; eta-expansion
         // of private methods is rare enough to revisit if needed.
-        callMethod(tree, transform(tree.qualifier), tree.symbol.asTerm, Nil)
+        callMethod(tree, inaccessibleQualifier(tree), tree.symbol.asTerm, Nil)
 
       case tree: Select if isTermOwnedClassMethodCall(tree) =>
         // Bare Select to a 0-arg method on a term-owned class
@@ -484,7 +591,88 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
         val i = secondaries.indexOf(ctor)
         if primary.exists then i + 1 else i
 
+    /** A catch clause that `TryCatchPatterns` kept as a direct JVM
+     *  catch entry and whose tested type is a linked local class.
+     *  Post-`TryCatchPatterns`, direct clauses are exactly
+     *  `case _: T`, `case x: T`, and the default shapes.
+     */
+    private def isLinkedCatchCase(cdef: CaseDef)(using Context): Boolean =
+      cdef.pat match
+        case Typed(_, tpt) => store.linkedClassName(tpt.tpe).isDefined
+        case Bind(_, Typed(_, tpt)) => store.linkedClassName(tpt.tpe).isDefined
+        case _ => false
+
+    /** Fold `cases` (the first linked catch clause and everything
+     *  after it) into a single `case ex: Throwable` clause holding a
+     *  chain of type tests, mirroring the tree shape of
+     *  `TryCatchPatterns.mkFallbackPatterMatchCase`. Each typed
+     *  clause becomes an `If` on `ex.isInstanceOf[T]` whose branch
+     *  re-binds the original binder to `ex.asInstanceOf[T]`; a
+     *  default clause enters unconditionally (this also covers the
+     *  fallback case `TryCatchPatterns` itself built, whose compiled
+     *  match rethrows on its own); when no clause matches, `ex` is
+     *  rethrown. Direct catch clauses never carry guards
+     *  (`TryCatchPatterns.checkPostCondition`), so guards need no
+     *  handling here.
+     */
+    private def foldLinkedCatchCases(cases: List[CaseDef], span: Span)(using Context): CaseDef =
+      val excSym = newSymbol(ctx.owner, ExceptionBinderName.fresh(),
+        Synthetic | Case, defn.ThrowableType, coord = span)
+      def excRef = ref(excSym)
+      def clause(cdef: CaseDef, rest: Tree): Tree =
+        def enter(binder: Symbol, tpe: Type): Tree =
+          val body = transform(cdef.body)
+          val bound =
+            if binder.exists then
+              Block(ValDef(binder.asTerm, excRef.cast(tpe)) :: Nil, body)
+            else body
+          If(excRef.isInstance(tpe), bound, rest).withSpan(cdef.span)
+        cdef.pat match
+          case Typed(_, tpt) => enter(NoSymbol, tpt.tpe)
+          case bind @ Bind(_, Typed(_, tpt)) => enter(bind.symbol, tpt.tpe)
+          case bind: Bind =>
+            Block(ValDef(bind.symbol.asTerm, excRef) :: Nil, transform(cdef.body))
+              .withSpan(cdef.span)
+          case _ =>
+            transform(cdef.body)
+      val chain = cases.foldRight[Tree](Throw(excRef).withSpan(span))(clause)
+      CaseDef(
+        Bind(excSym, Underscore(excSym.info).withSpan(span)),
+        EmptyTree,
+        chain)
+
+    /** A captured-local read/write is only sound when the call site
+     *  actually captured a binding under the symbol's name. The main
+     *  way this fails: the local was introduced by *inline expansion*
+     *  around the call site. Bindings are collected before `Inlining`
+     *  runs (under, say, a context parameter's name), but this phase
+     *  sees the wrapper post-inlining, where the body's reference has
+     *  been substituted with the inline def's internal binding (e.g.
+     *  `scala.util.boundary.apply`'s `val local` label). The names
+     *  can never agree, so the value cannot cross the eval boundary;
+     *  report it instead of emitting a read that fails at runtime
+     *  with `NoSuchElementException`. Direct bridge tests (testMode)
+     *  pass bindings at invoke time without declaring them, so the
+     *  check is skipped there.
+     */
+    private def checkCapturedBinding(sym: TermSymbol, tree: Tree)(using Context): Boolean =
+      config.testMode || config.bindingNames.contains(sym.name.toString) || {
+        val provenance =
+          if sym.source != ctx.compilationUnit.source then
+            s" `${sym.name}` comes from inline-expanded code around the call site" +
+              s" (defined in ${sym.source.name}). Values that reach the body only" +
+              " through inline expansion (for example `scala.util.boundary`'s label)" +
+              " have no stable name at capture time and cannot cross the eval boundary."
+          else
+            s" the call site captured no binding named `${sym.name}`."
+        report.error(
+          s"eval: cannot link `${sym.name}` back to the call site:$provenance",
+          tree.srcPos)
+        false
+      }
+
     private def getLocalValue(tree: Tree, sym: TermSymbol)(using Context): Tree =
+      if !checkCapturedBinding(sym, tree) then return tree
       // For a binding whose declared type is a term-owned class, the
       // wrapper's symbol is a re-elaborated JVM class distinct from the
       // runtime instance's class. A `checkcast` to the wrapper symbol
@@ -499,9 +687,10 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
         if isTermOwnedClass(sym.info) then defn.ObjectType
         else tree.tpe.widen
       buildReflectEvalCast(tree, nullLiteral,
-        ReflectEvalStrategy.LocalValue(sym, isByName(sym.info)), Nil, castTo)
+        ReflectEvalStrategy.LocalValue(sym), Nil, castTo)
 
     private def setLocalValue(tree: Tree, sym: TermSymbol, rhs: Tree)(using Context): Tree =
+      if !checkCapturedBinding(sym, tree) then return tree
       reflectEvalPlaceholder(tree, nullLiteral,
         ReflectEvalStrategy.LocalValueAssign(sym), rhs :: Nil)
 
@@ -645,7 +834,7 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
       val resultTpe =
         if isTermOwnedClass(field.info) then defn.ObjectType else field.info.widen
       buildReflectEvalCast(tree, qual,
-        ReflectEvalStrategy.Field(field, isByName = false, useReceiverClass(field)),
+        ReflectEvalStrategy.Field(field, useReceiverClass(field)),
         Nil, resultTpe)
 
     private def setField(tree: Tree, qual: Tree, field: TermSymbol, rhs: Tree)(using Context): Tree =
@@ -676,7 +865,7 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
 
     private def captureLocalMethod(tree: Tree, method: TermSymbol, args: List[Tree])(using Context): Tree =
       buildReflectEvalCast(tree, nullLiteral,
-        ReflectEvalStrategy.MethodCapture(method, method, isByName = false),
+        ReflectEvalStrategy.MethodCapture(method),
         args, tree.tpe.widen)
 
     /** Walk a fully-applied call, accumulating value args in source
@@ -687,6 +876,17 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
       case Apply(fun, args) => transformedMethodArgs(fun) ++ args.map(transform)
       case TypeApply(fun, _) => transformedMethodArgs(fun)
       case _ => Nil
+
+    /** Qualifier for an inaccessible-member access. Java statics get
+     *  a null receiver: `Field.get(null)` / `Method.invoke(null, …)`
+     *  is the reflective protocol for statics, and synthesising a
+     *  prefix would materialise a phantom module qualifier for the
+     *  Java class, which has no runtime value. Mirrors the JavaStatic
+     *  branches of `debug.ExtractExpression`.
+     */
+    private def inaccessibleQualifier(tree: Tree)(using Context): Tree =
+      if tree.symbol.is(JavaStatic) then nullLiteral
+      else transformedQualifier(tree)
 
     /** Compute the qualifier tree for a member access. Selects use
      *  their `qual`; Idents synthesise the implicit-`this` prefix
@@ -738,14 +938,29 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
         return getThisObject(tree, cls)
       if target == 0 then getThisObject(tree, owners.head.asClass)
       else
-        // Same cast rule as `getThisObject`: surrounding member
-        // selects need the class type, except for term-owned classes
-        // whose wrapper symbol is a different JVM class from the
-        // runtime instance.
-        val castTo = if isTermOwnedSymbol(cls) then defn.ObjectType else cls.typeRef
-        buildReflectEvalCast(tree, nullLiteral,
-          ReflectEvalStrategy.BindingValue(s"__this__${cls.name}"),
-          Nil, castTo)
+        val binding = EvalNames.thisBinding(cls.name)
+        if !config.bindingNames.contains(binding) then
+          // The wrapper's owner chain mirrors the original source,
+          // but the call site may not have captured every enclosing
+          // instance (e.g. through an `@evalLike` wrapper or a
+          // chained nested eval). Diagnose here rather than fail
+          // with a NoSuchElementException at runtime; same gating
+          // as `collectLinkedEntities`.
+          report.error(
+            s"eval: cannot reach the enclosing `this` of class `${cls.name}` " +
+              s"from the eval body: the call site captured no `$binding` binding.",
+            tree.srcPos
+          )
+          getThisObject(tree, cls)
+        else
+          // Same cast rule as `getThisObject`: surrounding member
+          // selects need the class type, except for term-owned classes
+          // whose wrapper symbol is a different JVM class from the
+          // runtime instance.
+          val castTo = if isTermOwnedSymbol(cls) then defn.ObjectType else cls.typeRef
+          buildReflectEvalCast(tree, nullLiteral,
+            ReflectEvalStrategy.BindingValue(binding),
+            Nil, castTo)
 
     private def reflectEvalPlaceholder(
         tree: Tree,
@@ -757,11 +972,6 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
 
     private def isLocalVariable(sym: Symbol)(using Context): Boolean =
       sym.exists && !sym.is(Method) && sym.isLocalToBlock
-
-    private def isByName(tpe: Type)(using Context): Boolean = tpe match
-      case _: ExprType => true
-      case ref: TermRef => isByName(ref.symbol.info)
-      case _ => false
 
     private def isLocalToBody(sym: Symbol)(using Context): Boolean =
       val valSym = store.symbol

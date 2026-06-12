@@ -28,8 +28,15 @@ private[eval] class LogExecutedTree(config: EvalCompilerConfig) extends Phase:
       catch case NonFatal(e) => s"// LogExecutedTree: tree.show failed: ${e.getMessage}"
     val target = new java.io.File(config.evalLogDir, s"eval_${config.evalLogTimestamp}_wrapper.scala")
     try
+      val parent = target.getParentFile
+      if parent != null then parent.mkdirs()
       Files.write(target.toPath, rendered.getBytes(StandardCharsets.UTF_8))
-    catch case NonFatal(_) => ()
+    catch case NonFatal(e) =>
+      // The user explicitly opted into logging; mirror the runtime
+      // log writer and say why the wrapper file is missing.
+      System.err.println(
+        s"[eval] WARNING: failed to write $target: " +
+        s"${e.getClass.getSimpleName}: ${e.getMessage}")
 
 private[eval] object LogExecutedTree:
   val name: String = "logExecutedTree"

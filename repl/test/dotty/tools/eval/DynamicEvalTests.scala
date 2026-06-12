@@ -2686,6 +2686,47 @@ class DynamicEvalTests extends ReplTest:
   }
 
   // ===========================================================================
+  // 32b. Name resolution of the built-in `eval` itself.
+  //
+  //     Bare `eval` / `evalSafe` come in at root-import precedence (like
+  //     Predef members), so a user definition of either name, on any
+  //     earlier line, shadows the built-in exactly like a definition on
+  //     the same line would; and resolution can't be broken by rebinding
+  //     a path prefix like `dotty`.
+  // ===========================================================================
+
+  @Test def userDefinedEvalShadowsBuiltinAcrossLines = initially {
+    run("def eval(s: String): String = s.toUpperCase")
+  } andThen {
+    run("""val r = eval("hi")""")
+    assertContains("""val r: String = "HI"""", storedOutput())
+  }
+
+  @Test def userDefinedEvalSafeShadowsBuiltinAcrossLines = initially {
+    run("def evalSafe(s: String): Int = s.length")
+  } andThen {
+    run("""val r = evalSafe("abc")""")
+    assertContains("val r: Int = 3", storedOutput())
+  }
+
+  @Test def valNamedDottyDoesNotBreakEval = initially {
+    run("val dotty = 1")
+  } andThen {
+    run("""val r: Int = eval("dotty + 41")""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def userImportFromEvalModulePersistsAcrossLines = initially {
+    run("import dotty.tools.eval.Eval.bind")
+  } andThen {
+    run("""val b = bind("x", 1)""")
+    val out = storedOutput()
+    assertFalse(s"expected `bind` to resolve through the user's import, got:\n$out",
+      out.contains("Not found"))
+    assertContains("val b: ", out)
+  }
+
+  // ===========================================================================
   // 33. Local recursive defs reached from inside an eval body.
   //
   //     A `def` declared inside another `def`/method gets lambda-lifted out
@@ -4818,6 +4859,376 @@ class DynamicEvalTests extends ReplTest:
          |val r: Int = f(21)""".stripMargin
     )
     assertContains("val r: Int = 42", storedOutput())
+  }
+
+  // ===========================================================================
+  // 41. Behavioural edges pinned by review: pattern binders, scoping of
+  //     body-local names, laziness of captures, and runtime identity.
+  // ===========================================================================
+
+  @Test def patternBinderCapturedInMatchCase = initially {
+    run("""val r: Int = Some(41) match { case Some(v) => eval[Int]("v + 1"); case None => 0 }""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def patternBinderCapturedInCatchHandler = initially {
+    run("""val r: String = try throw new RuntimeException("boom") catch { case e: RuntimeException => eval[String]("e.getMessage") }""")
+    assertContains("""val r: String = "boom"""", storedOutput())
+  }
+
+  @Test def patternBinderCapturedInMatchGuard = initially {
+    run("""val r: String = 5 match { case n if eval[Boolean]("n > 2") => "big"; case _ => "small" }""")
+    assertContains("""val r: String = "big"""", storedOutput())
+  }
+
+  @Test def patternBinderCapturedInForGenerator = initially {
+    run("""val r: List[Int] = for (a, b) <- List((1, 2), (3, 4)) yield eval[Int]("a + b")""")
+    assertContains("val r: List[Int] = List(3, 7)", storedOutput())
+  }
+
+  @Test def blockLocalLazyValNotForcedByEval = initially {
+    run("""def f(): Boolean = { var forced = false; lazy val z = { forced = true; 7 }; eval[Int]("1"); forced }""")
+  } andThen {
+    run("""val r = f()""")
+    assertContains("val r: Boolean = false", storedOutput())
+  }
+
+  @Test def blockLocalLazyValReadableInBody = initially {
+    run("""def f(): Int = { lazy val z = 6; eval[Int]("z * 7") }""")
+  } andThen {
+    run("""val r = f()""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def evalBeforeLocalObjectDefinitionDoesNotForceIt = initially {
+    // The module binding is forward-seeded but lazily valued; an eval
+    // call placed before the object's definition must not force (or
+    // crash on) the not-yet-initialized module holder.
+    run("""def f(): Int = { val r = eval[Int]("1 + 1"); object M { var n = 5 }; r + M.n }""")
+  } andThen {
+    run("""val r = f()""")
+    assertContains("val r: Int = 7", storedOutput())
+  }
+
+  @Test def evalInAnonymousClassInitializerEmitsNoReturnWarning = initially {
+    run("""def f(): Int = { val h = new AnyRef { val x: Int = eval[Int]("21 * 2") }; 0 }""")
+    val out = storedOutput()
+    assertFalse(s"expected no non-local-return warning, got:\n$out",
+      out.contains("Non local returns"))
+  }
+
+  @Test def valHoldingVarRefIsNotUnwrapped = initially {
+    // `getValue` unwraps by the binding's `isVar` flag, not by the
+    // value's runtime type: a val that happens to hold a VarRef comes
+    // through as the VarRef itself.
+    run("""import dotty.tools.eval.Eval""")
+  } andThen {
+    run("""var target = 5""")
+  } andThen {
+    run("""val ref = Eval.varRef[Int](() => target, v => target = v)""")
+  } andThen {
+    run("""val r: Int = eval("ref.get() + 1")""")
+    assertContains("val r: Int = 6", storedOutput())
+  }
+
+  @Test def givenBeforeMidBlockEvalStatement = initially {
+    // The marker sits mid-block (not as the trailing expression); the
+    // given is both hoisted into the body and kept for the sibling
+    // `summon` after the eval call.
+    run("""def f(): Int = { given Int = 99; eval[Unit]("assert(summon[Int] == 99)"); summon[Int] }""")
+  } andThen {
+    run("""val r = f()""")
+    assertContains("val r: Int = 99", storedOutput())
+  }
+
+  @Test def bodyLocalVarShadowingPrivateMemberStaysLocal = initially {
+    // A body-local `var v` must shadow the class's private `v`: reads
+    // and writes stay on the local, and the live field is untouched.
+    run("""class A { private var v = 1; def m(): Int = eval[Int]("{ var v = 10; v = 5; v * 2 } + v") }""")
+  } andThen {
+    run("""val a = new A""")
+  } andThen {
+    val st = run("""val r = a.m()""")
+    assertContains("val r: Int = 11", storedOutput())
+    st
+  } andThen {
+    run("""val r2 = a.m()""")
+    assertContains("val r2: Int = 11", storedOutput())
+  }
+
+  @Test def thisInsideBodyAnonymousClassStaysLocal = initially {
+    // `this` inside an anonymous class the body defines refers to the
+    // anonymous instance, not to the lifted enclosing `A`.
+    run("""class A { def m(): Boolean = eval[Boolean]("val o = new java.util.concurrent.Callable[AnyRef] { def call(): AnyRef = this }; o.call() eq o") }""")
+  } andThen {
+    run("""val r = (new A).m()""")
+    assertContains("val r: Boolean = true", storedOutput())
+  }
+
+  @Test def protectedMemberAccessibleInBody = initially {
+    run("""class A { protected val p = 21; def m(): Int = eval[Int]("p * 2") }""")
+  } andThen {
+    run("""val r = (new A).m()""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def outerClassPrivateMemberBareReference = initially {
+    run("""class A { private val secret = 20; class B { def m(): Int = eval[Int]("secret + 22") } }""")
+  } andThen {
+    run("""val a = new A""")
+  } andThen {
+    run("""val b = new a.B""")
+  } andThen {
+    run("""val r = b.m()""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def classLevelImportVisibleInBody = initially {
+    run("""class A { import scala.collection.mutable; def m(): Int = eval[Int]("mutable.Map(1 -> 2)(1)") }""")
+  } andThen {
+    run("""val r = (new A).m()""")
+    assertContains("val r: Int = 2", storedOutput())
+  }
+
+  @Test def methodReturnTypeNamesClassTypeMember = initially {
+    // The lifted def's signature sits outside `import __this__.*`, so
+    // a return type naming a class type member is re-qualified.
+    run("""class A { type T = Int; def m(): T = eval[Int]("42") }""")
+  } andThen {
+    run("""val r = (new A).m()""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def typedCatchAgainstLocalExceptionClass = initially {
+    run("""def f(): String = { class MyErr(m: String) extends Exception(m); eval[String]("try throw new MyErr(\"caught-it\") catch { case e: MyErr => e.getMessage }") }""")
+  } andThen {
+    run("""val r = f()""")
+    assertContains("""val r: String = "caught-it"""", storedOutput())
+  }
+
+  @Test def nonLocalReturnRunsEnclosingFinally = initially {
+    run("""var cleaned = false""")
+  } andThen {
+    run("""def f(): Int = try eval[Int]("return 42") finally cleaned = true""")
+  } andThen {
+    val st = run("""val r = f()""")
+    assertContains("val r: Int = 42", storedOutput())
+    st
+  } andThen {
+    run("""val c = cleaned""")
+    assertContains("val c: Boolean = true", storedOutput())
+  }
+
+  @Test def bodyCatchAllInterceptsNonLocalReturn = initially {
+    // Documented divergence: the return travels as a control throw, so
+    // a body catch-all intercepts it where source code could not catch
+    // its own `return`. `NonFatal` handlers stay transparent.
+    run("""def f(): Int = { eval[Unit]("try return 42 catch { case _: Throwable => () }"); -1 }""")
+  } andThen {
+    run("""val r = f()""")
+    assertContains("val r: Int = -1", storedOutput())
+  }
+
+  @Test def evalSafeRuntimeExceptionPropagates = initially {
+    // `evalSafe` captures only this call's compile errors; the body's
+    // own runtime exceptions propagate like any other.
+    run("""val r: String = try { evalSafe[Int]("1 / 0"); "no-throw" } catch { case _: ArithmeticException => "threw" }""")
+    assertContains("""val r: String = "threw"""", storedOutput())
+  }
+
+  @Test def bodyLocalValShadowsCapturedBinding = initially {
+    run("""def f(x: Int): Int = eval[Int]("val x = 100; x")""")
+  } andThen {
+    run("""val r = f(1)""")
+    assertContains("val r: Int = 100", storedOutput())
+  }
+
+  @Test def redefinedReplValIsAmbiguousKnownLimitation = initially {
+    run("val x = 1")
+  } andThen {
+    run("val x = 2")
+  } andThen {
+    // Known limitation: the REPL resolves `x` to the latest line via
+    // nested root-import contexts, but the wrapper compile emits the
+    // session imports as sequential same-scope wildcard imports, and
+    // same-scope wildcard imports do not shadow each other. A fix
+    // would hide redefined names in the earlier wrapper's import
+    // (`import rs$line$1.{x as _, given, *}`).
+    run("""val r: Int = eval("x")""")
+    assertContains("Reference to x is ambiguous", storedOutput())
+  }
+
+  @Test def concurrentEvalFromBodySpawnedThreads = initially {
+    // Threads created while the adapter is installed inherit it, so
+    // eval works from them; results land in a concurrent queue.
+    run("""val results = new java.util.concurrent.ConcurrentLinkedQueue[Int]()""")
+  } andThen {
+    run("""val ts = (1 to 4).map(i => new Thread(() => { results.add(eval[Int]("i * 10")); () })); ts.foreach(_.start()); ts.foreach(_.join())""")
+  } andThen {
+    run("""val r = results.toArray.map(_.asInstanceOf[Int]).sorted.toList""")
+    assertContains("List(10, 20, 30, 40)", storedOutput())
+  }
+
+  @Test def operatorNamedLocalCaptured = initially {
+    run("""def f(): Int = { val ** = 6; eval[Int]("** * 7") }""")
+  } andThen {
+    run("""val r = f()""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def unicodeNamedValCaptured = initially {
+    run("""val π = 3.0""")
+  } andThen {
+    run("""val r: Double = eval("π * 2")""")
+    assertContains("val r: Double = 6.0", storedOutput())
+  }
+
+  @Test def varargsParamCaptured = initially {
+    run("""def f(xs: Int*): Int = eval[Int]("xs.sum")""")
+  } andThen {
+    run("""val r = f(1, 2, 3)""")
+    assertContains("val r: Int = 6", storedOutput())
+  }
+
+  @Test def capturedArraySharedByReference = initially {
+    run("""val a = Array(1, 2, 3)""")
+  } andThen {
+    val st = run("""val r: Int = eval("a(0) = 10; a(0) + a.length")""")
+    assertContains("val r: Int = 13", storedOutput())
+    st
+  } andThen {
+    run("""val r2 = a(0)""")
+    assertContains("val r2: Int = 10", storedOutput())
+  }
+
+  @Test def unionTypedBindingMatchesInBody = initially {
+    run("""def f(u: Int | String): String = eval[String]("u match { case i: Int => \"int\"; case s: String => \"str\" }")""")
+  } andThen {
+    run("""val r = f(1)""")
+    assertContains("""val r: String = "int"""", storedOutput())
+  }
+
+  // ===========================================================================
+  // 42. Standard-library values across the eval boundary.
+  //
+  //     The eval output classloader delegates `scala.*` and JDK
+  //     classes to the shared parent loader (README "Classloader
+  //     bridging"), so stdlib values keep one Class identity on both
+  //     sides of the boundary: a captured instance is the *same*
+  //     object inside the body (mutations are shared), values built
+  //     inside checkcast cleanly at the call site, and stdlib
+  //     exception types thrown inside catch by class outside.
+  // ===========================================================================
+
+  @Test def mutableStdlibCollectionSharedByReference = initially {
+    run("""val buf = scala.collection.mutable.ArrayBuffer(1, 2)""")
+  } andThen {
+    val st = run("""val inside: Int = eval("buf += 3; buf.sum")""")
+    assertContains("val inside: Int = 6", storedOutput())
+    st
+  } andThen {
+    run("""val outside = buf.length""")
+    assertContains("val outside: Int = 3", storedOutput())
+  }
+
+  @Test def iteratorStateSharedAcrossBoundary = initially {
+    run("""val it = Iterator(1, 2, 3)""")
+  } andThen {
+    val st = run("""val first: Int = eval("it.next()")""")
+    assertContains("val first: Int = 1", storedOutput())
+    st
+  } andThen {
+    run("""val second = it.next()""")
+    assertContains("val second: Int = 2", storedOutput())
+  }
+
+  @Test def bigIntCrossesTheBoundaryBothWays = initially {
+    run("""val b = BigInt("12345678901234567890")""")
+  } andThen {
+    run("""val r: BigInt = eval("b * 2")""")
+    assertContains("val r: BigInt = 24691357802469135780", storedOutput())
+  }
+
+  @Test def stdlibExceptionCaughtByClassAtCallSite = initially {
+    // `NoSuchElementException` inside the body and at the call site is
+    // the same Class, so the catch matches across the boundary.
+    run("""val r: Int = try eval[Int]("List.empty[Int].head") catch { case _: NoSuchElementException => 42 }""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def javaCollectionCapturedAndMutatedInBody = initially {
+    run("""val m = new java.util.HashMap[String, Integer]()""")
+  } andThen {
+    val st = run("""val r: Int = eval("m.put(\"k\", 41); m.get(\"k\") + 1")""")
+    assertContains("val r: Int = 42", storedOutput())
+    st
+  } andThen {
+    run("""val size = m.size""")
+    assertContains("val size: Int = 1", storedOutput())
+  }
+
+  @Test def capturedStdlibTypedGivenUsedInBody = initially {
+    run("""given revOrd: Ordering[Int] = Ordering.Int.reverse""")
+  } andThen {
+    run("""val r: List[Int] = eval("List(1, 3, 2).sorted")""")
+    assertContains("val r: List[Int] = List(3, 2, 1)", storedOutput())
+  }
+
+  @Test def returnedMutableCollectionUsableAtCallSite = initially {
+    // The call site checkcasts the returned value to `mutable.Map`;
+    // identity holds because both sides load the same scala.* Class.
+    run("""val m: scala.collection.mutable.Map[String, Int] = eval("scala.collection.mutable.Map(\"a\" -> 1)")""")
+  } andThen {
+    run("""m("b") = 2""")
+  } andThen {
+    run("""val r = m("a") + m("b")""")
+    assertContains("val r: Int = 3", storedOutput())
+  }
+
+  // ===========================================================================
+  // 43. `scala.util.boundary` and the eval boundary.
+  //
+  //     A boundary/break pair living entirely inside the body works:
+  //     `boundary.apply` is inlined into the wrapper, the `Break`
+  //     control exception is thrown and caught inside `evaluate()`,
+  //     and the stdlib classes are shared across the loaders.
+  //
+  //     A body `break` targeting a boundary at the *call site* is a
+  //     diagnosed limitation. `boundary.apply` is an `inline def`:
+  //     bindings are collected before `Inlining` runs, so the label
+  //     is captured under its context-parameter name, but the body is
+  //     extracted after `Inlining`, where the reference has been
+  //     substituted with the expansion's internal `val local`. The
+  //     names can never agree, so `ExtractEvalBody` rejects the
+  //     reference with a known-limitation diagnostic instead of
+  //     letting it fail at runtime.
+  // ===========================================================================
+
+  @Test def boundaryDefinedInsideEvalBody = initially {
+    // Self-contained: the boundary and its break both live inside
+    // `evaluate()`; nothing escapes.
+    run("""import scala.util.boundary, boundary.break""")
+  } andThen {
+    run("""val r: Int = eval[Int]("boundary { if true then break(42); 0 }")""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def boundaryInsideBodyWithBreakFromLambda = initially {
+    // The label crosses lambda layers inside the body, but never the
+    // eval boundary itself.
+    run("""import scala.util.boundary, boundary.break""")
+  } andThen {
+    run("""val r: Int = eval[Int]("boundary { List(1, 2, 3).foreach(x => if x == 2 then break(x * 21)); 0 }")""")
+    assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def breakToCallSiteBoundaryRejectedKnownLimitation = initially {
+    run("""import scala.util.boundary, boundary.break""")
+  } andThen {
+    run("""val r: Int = boundary { eval[Unit]("break(42)"); 0 }""")
+    val out = storedOutput()
+    assertContains("eval failed to compile", out)
+    assertContains("inline-expanded code around the call site", out)
   }
 
 end DynamicEvalTests

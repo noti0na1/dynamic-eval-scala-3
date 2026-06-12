@@ -114,7 +114,10 @@ class AbstractFileClassLoader(root: AbstractFile, parent: ClassLoader, interrupt
       // need to be loaded by a single shared classloader. Instrumenting
       // each AbstractFileClassLoader instance would mint its own copy and
       // break the cross-loader exchange with `LinkageError` or
-      // `ClassCastException`.
+      // `ClassCastException`. The trade-off: a CPU-bound loop running
+      // entirely inside library code is no longer interruptible through
+      // the `StopRepl` flag (only user-defined classes carry the check);
+      // the `-Xrepl-interrupt-instrumentation` help text documents this.
       case s"scala.$_" => super.loadClass(name)
       case s"dotty.$_" => super.loadClass(name)
 

@@ -19,7 +19,10 @@ package eval
  *      options forwarded to the inner compile (e.g.
  *      `-Yexplicit-nulls -language:experimental.captureChecking`).
  *      Pass the same language options the program was compiled with
- *      so eval bodies are checked under the same rules.
+ *      so eval bodies are checked under the same rules. There is no
+ *      quoting: an option value containing spaces cannot be
+ *      expressed here. Path-valued configuration has dedicated
+ *      properties (`…classpath`, `…logDir`), which are read whole.
  *    - `dotty.tools.eval.classpath`: classpath for the inner
  *      compile. When unset, one is synthesised from the caller's
  *      classloader chain plus `java.class.path`.
@@ -71,16 +74,17 @@ private[eval] object StandaloneAdapter:
         || className.startsWith("java.")
         || className.startsWith("jdk.")
     val walker = java.lang.StackWalker.getInstance(java.lang.StackWalker.Option.RETAIN_CLASS_REFERENCE)
-    var found: ClassLoader | Null = null
-    walker.forEach { frame =>
-      if found == null then
-        val cls = frame.nn.getDeclaringClass.nn
-        if !isInfraFrame(cls.getName.nn) then
-          val loader = cls.getClassLoader
-          if loader != null then found = loader
+    val found: ClassLoader | Null = walker.walk { frames =>
+      frames.nn
+        .map[ClassLoader | Null] { frame =>
+          val cls = frame.nn.getDeclaringClass.nn
+          if isInfraFrame(cls.getName.nn) then null else cls.getClassLoader
+        }
+        .filter(_ != null)
+        .findFirst()
+        .orElse(null)
     }
-    val result = found
-    if result != null then result
+    if found != null then found
     else
       val ctxLoader = Thread.currentThread.nn.getContextClassLoader
       if ctxLoader != null then ctxLoader

@@ -1,6 +1,8 @@
 package dotty.tools
 package eval
 
+import dotty.tools.dotc.core.Names.Name
+
 /** Marker text the eval pipeline splices into `enclosingSource` and
  *  later replaces with the (now known) eval body. Picked so it stays
  *  a single Scala identifier, valid in expression position, with no
@@ -15,22 +17,13 @@ private[eval] object EvalBodyPlaceholder:
   inline def Marker: String = EvalContext.placeholder
   def emit(body: String): String = s"({ $body })"
 
-/** Method names the eval pipeline recognises as call sites it fills
- *  in. The post-PostTyper [[EvalRewriteTyped]] phase additionally
- *  restricts `eval` / `evalSafe` to symbols owned by the `Eval`
- *  module; `agent` / `agentSafe` are user-defined generators that
- *  share the same synthetic-argument shape, so they're matched by
- *  name only.
+/** Reserved binding names shared between the call-site rewriter and
+ *  the wrapper compile. Call-site classification itself is not name
+ *  based: [[EvalRewriteTyped]]'s `classifyCall` matches `eval` /
+ *  `evalSafe` by symbol (owner must be the `Eval` module) and
+ *  `@evalLike` / `@evalSafeLike` wrappers by annotation.
  */
 private[eval] object EvalNames:
-  val EvalLike: Set[String] = Set("eval", "evalSafe", "agent", "agentSafe")
-  val EvalOwned: Set[String] = Set("eval", "evalSafe")
-  /** The non-throwing variants — `evalSafe` / `agentSafe`. The call's
-   *  result is `EvalResult[T]` rather than `T`. [[EvalRewriteTyped]]
-   *  uses this to decide whether to wrap the verify-marker in
-   *  `Eval.handleCompileError(...)`.
-   */
-  val EvalSafeLike: Set[String] = Set("evalSafe", "agentSafe")
 
   // --------------------------------------------------------------
   // Synthetic binding names. Produced by [[EvalRewriteTyped]] at the
@@ -59,3 +52,16 @@ private[eval] object EvalNames:
 
   /** Key object for non-local `return` out of the eval body. */
   val ReturnKeyBinding: String = "__evalReturnKey__"
+
+  /** Reserved prefix for captured enclosing instances. The bare
+   *  `__this__` binding holds the call site's innermost `this`; the
+   *  qualified `__this__<C>` form (built by [[thisBinding]]) holds
+   *  the enclosing instance of class `C` further out, captured once
+   *  per enclosing class.
+   */
+  val ThisBinding: String = "__this__"
+
+  /** `__this__<C>` binding name for the enclosing instance of the
+   *  class named `clsName`.
+   */
+  def thisBinding(clsName: Name | String): String = s"$ThisBinding$clsName"
