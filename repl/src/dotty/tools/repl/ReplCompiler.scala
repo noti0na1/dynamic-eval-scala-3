@@ -18,6 +18,7 @@ import dotc.core.StdNames.*
 import dotc.core.Symbols.*
 import dotc.reporting.Diagnostic
 import dotc.transform.{CheckUnused, CheckShadowing, PostTyper, UnrollDefinitions}
+import dotc.typer.ImportInfo
 import dotc.typer.ImportInfo.{withRootImports, RootRef}
 import dotc.typer.TyperPhase
 import dotc.util.Spans.*
@@ -80,7 +81,11 @@ class ReplCompiler extends Compiler:
         val rootCtx = super.rootContext.fresh
           .withRootImports
           .fresh.setOwner(defn.EmptyPackageClass): Context
-        (state.validObjectIndexes).foldLeft(rootCtx)((ctx, id) =>
+        // `import dotty.tools.eval.Eval.{eval, evalSafe}` sits below the
+        // per-line imports, so a user definition of either name (on any
+        // line) shadows it the same way it shadows a Predef member.
+        val evalCtx: Context = rootCtx.fresh.setImportInfo(ReplCompiler.evalRootImport)
+        (state.validObjectIndexes).foldLeft(evalCtx)((ctx, id) =>
           importPreviousRun(id)(using ctx))
       }
     }
@@ -293,16 +298,22 @@ object ReplCompiler:
   val ReplState: Property.StickyKey[State] = Property.StickyKey()
   val objectNames = mutable.Map.empty[Int, TermName]
 
-  /** Build an untyped `Select` chain for a dotted FQN (e.g.
-   *  `"dotty.tools.eval.Eval"` becomes
-   *  `Select(Select(Select(Ident(dotty), tools), repl), Eval)`).
+  /** An `import dotty.tools.eval.Eval.{eval, evalSafe}` at root-import
+   *  precedence (like `scala.*` and `Predef.*`), so the bare names
+   *  resolve in every REPL line while remaining shadowable by user
+   *  definitions. Built like [[ImportInfo.rootImport]] but with named
+   *  selectors: a wildcard would leak the whole `Eval` surface
+   *  (`bind`, `varRef`, `withAdapter`, ...) into the root namespace.
    */
-  private[repl] def selectFqn(fqn: String, span: Span)(using Context): untpd.Tree =
-    import untpd.*
-    val parts = fqn.split('.').toList
-    parts.tail.foldLeft[Tree](Ident(parts.head.toTermName).withSpan(span)) { (acc, part) =>
-      Select(acc, part.toTermName).withSpan(span)
-    }
+  private def evalRootImport(using Context): ImportInfo =
+    val selectors =
+      untpd.ImportSelector(untpd.Ident("eval".toTermName))
+      :: untpd.ImportSelector(untpd.Ident("evalSafe".toTermName))
+      :: Nil
+    def sym(using Context) =
+      val expr = tpd.Ident(requiredModuleRef("dotty.tools.eval.Eval"))
+      tpd.Import(expr, selectors).symbol
+    ImportInfo(sym, selectors, untpd.EmptyTree, isRootImport = true)
 end ReplCompiler
 
 class ReplCompilationUnit(source: SourceFile) extends CompilationUnit(source, CompilationUnitInfo(source.file)):
@@ -413,17 +424,7 @@ class ReplPhase extends Phase:
     val objectTermName = objectName.toTermName
     ReplCompiler.objectNames.update(defs.state.objectIndex, objectTermName)
 
-    // Import the runtime `eval`/`evalSafe` sentinels so the bare names
-    // resolve in user code. CollectTopLevelImports filters these back
-    // out so they don't pollute `:imports`.
-    val evalImport = Import(
-      ReplCompiler.selectFqn("dotty.tools.eval.Eval", span),
-      ImportSelector(Ident("eval".toTermName))
-        :: ImportSelector(Ident("evalSafe".toTermName))
-        :: Nil
-    ).withSpan(span)
-
-    val tmpl = Template(emptyConstructor, Nil, Nil, EmptyValDef, evalImport :: defs.stats)
+    val tmpl = Template(emptyConstructor, Nil, Nil, EmptyValDef, defs.stats)
     val module = ModuleDef(objectTermName, tmpl).withSpan(span)
 
     PackageDef(Ident(nme.EMPTY_PACKAGE), List(module))

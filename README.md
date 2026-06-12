@@ -20,6 +20,32 @@ computable at runtime. Identifiers in scope at the call site
 definitions, class members) are visible inside the body by their
 source name.
 
+## Quick start
+
+From a checkout of this repo, the fastest loop is the quick build
+plus the in-tree launcher scripts:
+
+```
+sbt buildQuick     # compile the compiler + REPL, write bin/.cp
+bin/replQ          # start the REPL; eval is built in, no flag needed
+
+scala> eval[Int]("6 * 7")
+val res0: Int = 42
+```
+
+`bin/scalacQ` compiles standalone programs against the same build,
+and the program runs with the build's classpath (the compiler must
+be on the runtime classpath for the inner compiles):
+
+```
+bin/scalacQ -Xdynamic-eval -d out Square.scala
+java -cp "$(cat bin/.cp):out" Main
+```
+
+A full distribution (`sbt dist/Universal/packageBin`, output under
+`dist/target/`) works the same way through its `bin/scala` and
+`bin/scalac`. To run the test suite, see "Running the tests" below.
+
 ## Outside the REPL: `-Xdynamic-eval`
 
 The same feature is available to ordinary programs. The eval
@@ -71,13 +97,17 @@ an isolated context where only globally reachable names resolve, and
 a body mentioning a call-site local fails at runtime with a compile
 diagnostic.
 
-Known standalone limitations: a body cannot see `private` members of
+Known standalone limitation: a body cannot see `private` members of
 an *enclosing top-level object* (they come in through the embedded
 wildcard import, which, unlike the REPL's reflective class-member
-path, does not expose privates), and a nested (non-top-level)
-`object`'s state is re-elaborated rather than shared. Class members,
-including private ones, go through the same reflective machinery as
-in the REPL and behave identically.
+path, does not expose privates). Class members, including private
+ones, go through the same reflective machinery as in the REPL and
+behave identically. Nested (non-top-level) `object`s, including
+`case class`es declared inside them, are linked to the live runtime
+module by a singleton lift in the wrapper compile: state is shared,
+instances keep one JVM class across the boundary, and (unlike a
+top-level object) their `private` members reroute through
+reflection.
 
 An eval body *can* `return` from the method enclosing the eval call.
 At runtime the body executes inside a separate `evaluate()` method,
@@ -88,7 +118,32 @@ binding, and the body's `return` compiles to an `EvalNonLocalReturn`
 control throw that the call-site catch turns back into a real
 `return`. A `return` at a position where source code couldn't return
 either (top level, inside a lambda) is still rejected with the
-standard diagnostic.
+standard diagnostic. One visible seam remains: because the return
+travels as a control exception, a body's own catch-all handler
+(`catch case _: Throwable`) intercepts it, where source code at
+that position would return uncatchably; `NonFatal` handlers are
+transparent to it as usual.
+
+Other diagnosed limitations: an `Array` of a method-local class
+cannot cross the eval boundary (rejected with a diagnostic; use a
+`List`), and an eval call written inside an `inline def` warns that
+expansion sites will see the unrewritten call (the inline body is
+recorded before the rewriter runs). Values that reach the body only
+through *inline expansion around the call site* cannot cross either:
+bindings are captured before inlining, but the wrapper extracts the
+body after it, where such references have been substituted with the
+expansion's internal names. The visible case is `scala.util.boundary`:
+a `boundary`/`break` pair written entirely inside the body works,
+while a body `break` targeting a boundary at the call site (whose
+`Label` arrives through `boundary.apply`'s inlined `val local`) is
+rejected with a known-limitation diagnostic. In the REPL, an eval body that
+names a session val *redefined* on a later line fails with an
+ambiguity error: the wrapper compile sees the session lines as
+same-scope wildcard imports, which do not shadow each other the way
+the REPL's own nested line contexts do. The narrower edges around
+linked local classes (a body-local class extending one, by-name
+constructor params, a user-defined `unapply` on a local module) are
+listed at the end of `EVAL-BINDINGS-DESIGN.md`.
 
 ## The idea
 
@@ -394,7 +449,10 @@ says
 > annotate the function with `@evalLike` (or `@evalSafeLike`).
 
 The rewriter cannot mis fire on unrelated code that happens to use
-the name `eval`.
+the name `eval`. In the REPL the built-in names come in at
+root-import precedence (like `Predef` members), so a user
+definition of `eval` or `evalSafe`, on the same line or any earlier
+line, shadows the built-in and resolves like any ordinary method.
 
 **All or nothing on synthetic arguments.** Three of `eval`'s
 arguments are *synthetic*: `bindings`, `expectedType`, and
@@ -775,12 +833,23 @@ specific phases on top of the standard chain.
 #### `SpliceEvalBody` (after parser)
 
 Parses the body string, replaces the marker, appends the
-synthesised `__Expression` class to the package, and lifts class
-methods that contain the marker out of their enclosing class
-(needed so the wrapper does not mint a duplicate `Class` for the
-class the REPL session has already compiled). After the lift,
-`this` references in the body are rewritten to `__this__`, and
-private field/method accesses are rerouted through synthesised
+synthesised `__Expression` class to the package, and lifts
+marker-bearing methods out of their enclosing declarations:
+
+* a *class* method is hoisted with a `__this__` parameter and the
+  class declaration dropped, so the wrapper does not mint a
+  duplicate `Class` for the class the live program has already
+  compiled;
+* a *nested (non-top-level) `object`*'s method is hoisted next to
+  an `import <Obj>.{given, *}` and the object declaration dropped,
+  so the body resolves members against the live runtime module
+  (state is shared, and a `case class` declared inside the object
+  keeps one runtime identity) instead of a re-elaborated copy with
+  fresh state.
+
+After the lift, `this` references in the body are rewritten to
+`__this__` (or to the object's own name for a lifted singleton),
+and private field/method accesses are rerouted through synthesised
 `__refl_get__`, `__refl_set__`, and `__refl_call__` helpers.
 
 #### `EvalRewriteTyped` (after PostTyper, on the wrapper)
@@ -801,13 +870,16 @@ reference into a `reflectEval(...)` placeholder carrying a
 | `LocalValue`         | outer method local val/var read   | `getValue("name")`                                           |
 | `LocalValueAssign`   | outer var write                   | `getRaw("name").asInstanceOf[VarRef].set(rhs)`               |
 | `This`               | `this` of an enclosing class      | `getThisObject()`                                            |
-| `Outer`              | one `$outer` walk                 | `getOuter(qual, outerCls)`                                   |
 | `Field`              | private/protected field read      | `getField(qual, className, fieldName)` or getter call        |
 | `FieldAssign`        | private/protected field write     | `setField(qual, className, fieldName, v)` or setter call     |
 | `MethodCall`         | private/protected method call     | `callMethod(qual, className, name, paramTpes, retTpe, args)` |
 | `MethodCapture`      | outer block local def call        | `getValue(name).asInstanceOf[FunctionN].apply(args*)`        |
 | `ConstructLocal`     | `new C(...)` on a linked local class | `getValue("__evalNew_C__$i").asInstanceOf[FunctionN].apply(args*)` |
 | `BindingValue`       | linked module read / return key   | `getRaw("__evalModule_M__")` / `getRaw("__evalReturnKey__")` |
+
+Enclosing instances further out come in through the
+`__this__<Cls>` synthetic bindings (read with `BindingValue`),
+so there is no runtime `$outer`-chain walking.
 
 Anchored after `cc` so capture checking sees the body in its
 original lexical context, with the original `^` annotations on def
@@ -818,6 +890,11 @@ whose signature mentions a linked local class have that class
 substituted with `Object` at the denotation level (the runtime
 values belong to the *original* class, so a descriptor naming the
 wrapper's re elaborated copy would force a wrong `checkcast`).
+Typed `catch` clauses naming a linked class are folded into a
+catch-all with explicit `isInstanceOf` tests here too: the JVM's
+exception table would otherwise name the re-elaborated class.
+Arrays of linked classes cannot cross the boundary; the phase
+rejects them with a known-limitation diagnostic (use a `List`).
 
 `ResolveEvalAccess` additionally runs a post erasure sweep over
 `__Expression`: type tests and casts that PatternMatcher generated
@@ -859,14 +936,17 @@ at runtime, the adapter:
 1. Writes per invocation log files if `Xrepl-eval-log-dir` is
    set.
 2. Looks the call up in a per session LRU cache keyed on
-   `(code, enclosingSource, bindingNames, imports, settings,
-   sessionLoader)`. A cache hit reuses the loaded `__Expression`
-   class and reflected handles.
+   `(code, enclosingSource, expectedType, bindingNames, imports,
+   settings, classpath, sessionLoader, standalone)`. A cache hit
+   reuses the loaded `__Expression` class and reflected handles
+   (and writes no log files: the per-invocation logs are written
+   per compile).
 3. On a cache miss, builds an `EvalCompilerConfig`, drives an
    `EvalCompilerBridge.compile` (the inner compile through
-   `EvalCompiler`), loads `__Expression` via
-   `AbstractFileClassLoader`, and snapshots its constructor and
-   `evaluate` method.
+   `EvalCompiler`), loads `__Expression` via a dedicated
+   `WrapperLoader` (child-first for the wrapper class, with the
+   session's `AbstractFileClassLoader` as parent for everything
+   else), and snapshots its constructor and `evaluate` method.
 4. Instantiates `__Expression` with the captured `__this__` (or
    `null`) and the bindings array, invokes `evaluate()`, and
    returns the result.
@@ -883,12 +963,13 @@ combinator (`xs.map(x => eval[Int]("..."))`). `EvalAdapter` keeps
 a per session LRU of compiled `__Expression` classes so identical
 call sites recompile zero times after the first.
 
-The cache key is a `WrapperKey(code, enclosingSource, bindingsKey,
-importsKey, settingsKey, sessionLoader)`. Two calls share an
-entry iff every input to the wrapper compile is identical: same
-body, same surrounding source slice, same bindings shape (names
-plus kinds, not values, since values change per call by design),
-same REPL session imports, same compiler flags, same session
+The cache key is a `WrapperKey(code, enclosingSource, expectedType,
+bindingsKey, importsKey, settingsKey, classpathKey, sessionLoader,
+standalone)`. Two calls share an entry iff every input to the
+wrapper compile is identical: same body, same surrounding source
+slice, same expected type, same bindings shape (names plus kinds,
+not values, since values change per call by design), same REPL
+session imports, same compiler flags, same classpath, same session
 classloader. The classloader is part of the key by *reference
 identity* so two REPL sessions that happen to share imports and
 flags do not bleed state across each other.
@@ -906,8 +987,9 @@ to be safe.
 so parallel calls are safe. The bound is `cacheCapacity = 128`
 entries, each of which pins a classloader and one `__Expression`
 class, so this also bounds metaspace growth from caching.
-`EvalAdapter.clearCache()` flushes everything (used by `:reset`
-and tests).
+`EvalAdapter.clearCache()` flushes everything; it is JVM-wide, not
+per session, which is what `:reset` wants (the old session's
+entries pin its classloader) and what tests want.
 
 ### Classloader bridging
 
@@ -915,13 +997,13 @@ The eval output classloader (`AbstractFileClassLoader`) routes
 class lookups through the parent for several name patterns to
 keep `Class` objects shared across the REPL / eval boundary:
 
-* `dotty.tools.repl.*`. The eval infrastructure types
-  (`Eval.Binding`, `EvalContext`, `EvalResult`, `VarRef`,
-  `EvalCompileException`, ...). User wrappers reference them and
-  need the *same* `Class` the driver itself uses, otherwise
-  mutable state like `Eval.active` (a `ThreadLocal`) splits into
-  independent copies. Routed through the classloader that loaded
-  `AbstractFileClassLoader` itself.
+* `dotty.tools.repl.*` and `dotty.tools.eval.*`. The REPL and eval
+  infrastructure types (`Eval.Binding`, `EvalContext`,
+  `EvalResult`, `VarRef`, `EvalCompileException`, ...). User
+  wrappers reference them and need the *same* `Class` the driver
+  itself uses, otherwise mutable state like `Eval.active` (a
+  `ThreadLocal`) splits into independent copies. Routed through
+  the classloader that loaded `AbstractFileClassLoader` itself.
 * `scala.*`, `dotty.*`. Values produced by `eval` cross the
   boundary (a lambda `Int => Int` returned from eval is a
   `scala.Function1` the REPL also recognises). Loaded by the
@@ -1063,8 +1145,8 @@ Open an sbt shell (`sbt`) and run the commands below at the
 (`sbt "scala3-repl/testOnly ..."`).
 
 All eval tests live under the `dotty.tools.eval` package (in
-`repl/test/dotty/tools/eval/`), so a single package glob runs
-every one of them — the end-to-end REPL suites and the lower-level
+`repl/test/dotty/tools/eval/`), so a single package glob runs every
+one of them, the end-to-end REPL suites and the lower-level
 pipeline unit tests alike:
 
 ```
@@ -1088,7 +1170,7 @@ the session output:
 
 | Suite                            | What it covers                                                                 | REPL flags exercised                          |
 |----------------------------------|--------------------------------------------------------------------------------|-----------------------------------------------|
-| `DynamicEvalTests`               | Core behaviour: return types, capturing previous lines / locals / `var`s / `given`s, class members, nested eval, compile-error reporting. | (defaults)                                    |
+| `DynamicEvalTests`               | Core behaviour: return types, capturing previous lines / locals / `var`s / `given`s, class members, nested eval, compile-error reporting, stdlib values crossing the boundary (shared mutable collections, iterators, exception classes). | (defaults)                                    |
 | `DynamicEvalExplicitNullsTests`  | Flag forwarding into the body compile: `null` no longer conforms to `String`.  | `-Yexplicit-nulls`                            |
 | `DynamicEvalCaptureCheckingTests`| Capture checking on the spliced body (the `cc` examples above).                | `-language:experimental.captureChecking`      |
 | `DynamicEvalSafeModeTests`       | Safe-mode checks applied to the body, including the verify-compile pass.        | `-language:experimental.safe`                 |
@@ -1101,10 +1183,11 @@ standalone path end-to-end: each test compiles a complete program
 with the main `dotc` pipeline under `-Xdynamic-eval`, loads the
 classes, and invokes an entry point whose `eval(...)` calls go
 through the standalone adapter. It covers basics, captures of every
-kind, live module state, top-level definitions, named packages,
-class members, nested eval, compile-error reporting (including the
-`return` limitation), flag gating, and settings forwarding via
-`dotty.tools.eval.settings`.
+kind, live module state (top-level, method-local, and nested
+objects, including their case classes and private members),
+top-level definitions, named packages, class members, nested eval,
+compile-error reporting, non-local `return`, flag gating, and
+settings forwarding via `dotty.tools.eval.settings`.
 
 The lower-level unit tests (in
 `repl/test/dotty/tools/eval/`) exercise the pipeline without

@@ -44,18 +44,13 @@ class EvalCompilerBridge:
   ): Boolean =
     val args = Array(
       "-d", outputDir.toString,
-      "-classpath", classPath,
-      "-Yskip:pureStats"
+      "-classpath", classPath
     ) ++ options :+ sourceFile.toString
     val driver = new Driver:
       override protected def newCompiler(using Context): EvalCompiler = EvalCompiler(config)
     val reporter = EvalReporter(error => config.errorReporter.accept(error))
-    try
-      driver.process(args, reporter)
-      !reporter.hasErrors
-    catch case cause: Exception =>
-      cause.printStackTrace()
-      throw cause
+    driver.process(args, reporter)
+    !reporter.hasErrors
 
   /** In-process compile entry point. The REPL session's `replOutDir`
    *  (an in-memory `VirtualDirectory`) is added to the inner
@@ -100,11 +95,16 @@ class EvalCompilerBridge:
   ): Either[Seq[String], Unit] =
     val driver = new EvalDriver
     val (classpath, settingsWithoutCp) =
-      if replClasspath.nonEmpty then (replClasspath, stripClasspathFlag(compilerSettings))
+      if replClasspath.nonEmpty then (replClasspath, splitClasspathFlag(compilerSettings)._2)
       else composeClasspath(compilerSettings, classLoader)
-    val initCtx = driver.initCtx
-    initCtx.settings.classpath.update(classpath)(using initCtx)
-    driver.setup(settingsWithoutCp, initCtx) match
+    // The classpath goes through `setup`'s argument parsing (not a
+    // direct `settings.classpath.update`, whose copy-on-write result
+    // is silently dropped once any setting has been read). Setup
+    // diagnostics (e.g. a malformed forwarded option) are buffered so
+    // a failure can report the actual cause.
+    val setupReporter = new StoreReporter(null)
+    val setupCtx = driver.initCtx.fresh.setReporter(setupReporter)
+    driver.setup(settingsWithoutCp ++ Array("-classpath", classpath), setupCtx) match
       case Some((_, ctx0)) =>
         val storeReporter = new StoreReporter(null)
         // The inner compile is a continuation of the live REPL session:
@@ -148,8 +148,8 @@ class EvalCompilerBridge:
         Left(Seq("Failed to set up eval driver"))
   end compile
 
-  /** Driver subclass that exposes `initCtx` so [[compile]] can
-   *  pre-set the composed classpath before `setup`.
+  /** Driver subclass exposing `initCtx` so [[compile]] can install a
+   *  buffering reporter before `setup`.
    */
   private class EvalDriver extends Driver:
     override def sourcesRequired: Boolean = false
@@ -161,26 +161,37 @@ class EvalCompilerBridge:
    *    3. the host JVM's `java.class.path`.
    *
    *  Returns the combined path plus settings with `-classpath` /
-   *  `-cp` removed so `Driver.setup` doesn't try to re-set it.
+   *  `-cp` removed so they don't override the composed path when the
+   *  settings are re-parsed by `Driver.setup`.
    */
   private def composeClasspath(
       compilerSettings: Array[String],
       classLoader: ClassLoader
   ): (String, Array[String]) =
-    val cliCp = extractClasspathArg(compilerSettings)
+    val (cliCp, stripped) = splitClasspathFlag(compilerSettings)
     val cp = ClasspathFromClassloader(classLoader)
     val sysCp = Option(System.getProperty("java.class.path")).getOrElse("")
     val sep = java.io.File.pathSeparator
     val combined = (cliCp.toSeq ++ Seq(cp, sysCp)).filter(_.nonEmpty).mkString(sep)
-    (combined, stripClasspathFlag(compilerSettings))
+    (combined, stripped)
 
-  private def extractClasspathArg(args: Array[String]): Option[String] =
-    val i = args.indexWhere(a => a == "-classpath" || a == "-cp")
-    if i < 0 || i + 1 >= args.length then None
-    else Some(args(i + 1))
-
-  private def stripClasspathFlag(args: Array[String]): Array[String] =
-    val i = args.indexWhere(a => a == "-classpath" || a == "-cp")
-    if i < 0 then args
-    else if i + 1 >= args.length then args.take(i)
-    else args.take(i) ++ args.drop(i + 2)
+  /** Split off every classpath flag in `args`, in both the two-token
+   *  (`-classpath <path>`) and colon (`-classpath:<path>`) forms the
+   *  CLI accepts. Returns the first path found (if any) and the
+   *  remaining arguments.
+   */
+  private def splitClasspathFlag(args: Array[String]): (Option[String], Array[String]) =
+    val kept = Array.newBuilder[String]
+    var found: Option[String] = None
+    var i = 0
+    while i < args.length do
+      val a = args(i)
+      if a == "-classpath" || a == "-cp" then
+        if i + 1 < args.length then
+          if found.isEmpty then found = Some(args(i + 1))
+          i += 1
+      else if a.startsWith("-classpath:") || a.startsWith("-cp:") then
+        if found.isEmpty then found = Some(a.substring(a.indexOf(':') + 1))
+      else kept += a
+      i += 1
+    (found, kept.result())

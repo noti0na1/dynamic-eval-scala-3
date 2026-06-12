@@ -39,7 +39,18 @@ class EvalCompilerBridgeTest:
       errors: String
   )
 
-  private def runSplice(body: String, enclosing: String): SpliceResult =
+  /** `declaredBindings` mirrors the production contract: the adapter
+   *  always fills `initialScope` with the names of the bindings the
+   *  call site captured, and the extract phase gates synthetic-name
+   *  reads (`__this__<C>`, `__evalNew_<C>__$i`, ...) on those names
+   *  being present. Tests that pass such bindings to `invoke` must
+   *  declare them here too.
+   */
+  private def runSplice(
+      body: String,
+      enclosing: String,
+      declaredBindings: Array[(String, Boolean)] = Array.empty
+  ): SpliceResult =
     val outputDir = Files.createTempDirectory("eval-test-")
     val sourceFile = Files.createTempFile("eval-enclosing-", ".scala")
     Files.writeString(sourceFile, enclosing)
@@ -49,7 +60,8 @@ class EvalCompilerBridgeTest:
       outputClassName = outputClassName,
       body = body,
       testMode = true,
-      errorReporter = s => errors.append(s).append('\n')
+      errorReporter = s => errors.append(s).append('\n'),
+      initialScope = declaredBindings
     )
     val ok = EvalCompilerBridge().run(outputDir, testClassPath, Array.empty, sourceFile, config)
     SpliceResult(outputDir, sourceFile, outputClassName, ok, errors.toString)
@@ -446,7 +458,8 @@ class EvalCompilerBridgeTest:
          |  class Inner { def f(): Int = ({ ${EvalContext.placeholder} }) }
          |}
          |""".stripMargin
-    val r = runSplice(body = "outerVal + 1", enclosing = enclosing)
+    val r = runSplice(body = "outerVal + 1", enclosing = enclosing,
+      declaredBindings = Array(("__this__PhaseFiveBOuter", false)))
     assertTrue(s"compile failed:\n${r.errors}", r.ok)
     val loaded = loadExpression(r.outputDir, r.outputClassName)
     val (outer, inner) = newOuterAndInner(loaded.loader, "PhaseFiveBOuter", "PhaseFiveBOuter$Inner")
@@ -461,7 +474,8 @@ class EvalCompilerBridgeTest:
          |  class Inner { def f(): Int = ({ ${EvalContext.placeholder} }) }
          |}
          |""".stripMargin
-    val r = runSplice(body = "factor * 7", enclosing = enclosing)
+    val r = runSplice(body = "factor * 7", enclosing = enclosing,
+      declaredBindings = Array(("__this__PhaseFiveBOuterMethod", false)))
     assertTrue(s"compile failed:\n${r.errors}", r.ok)
     val loaded = loadExpression(r.outputDir, r.outputClassName)
     val (outer, inner) = newOuterAndInner(loaded.loader, "PhaseFiveBOuterMethod", "PhaseFiveBOuterMethod$Inner")
@@ -482,7 +496,8 @@ class EvalCompilerBridgeTest:
          |  }
          |}
          |""".stripMargin
-    val r = runSplice(body = "outerVal + innerVal", enclosing = enclosing)
+    val r = runSplice(body = "outerVal + innerVal", enclosing = enclosing,
+      declaredBindings = Array(("__this__PhaseFiveBMix", false)))
     assertTrue(s"compile failed:\n${r.errors}", r.ok)
     val loaded = loadExpression(r.outputDir, r.outputClassName)
     val (outer, inner) = newOuterAndInner(loaded.loader, "PhaseFiveBMix", "PhaseFiveBMix$Inner")

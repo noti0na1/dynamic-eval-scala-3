@@ -3,9 +3,7 @@ package eval
 
 import java.util.UUID
 
-import dotty.tools.dotc.core.Contexts.{Context, ContextBase}
 import dotty.tools.dotc.core.StdNames.str
-import dotty.tools.dotc.util.ClasspathFromClassloader
 import dotty.tools.io.{AbstractFile, VirtualDirectory}
 
 /** REPL-side implementation of [[Eval.Adapter]]. Wraps a call's
@@ -55,17 +53,6 @@ class EvalAdapter:
       evalLogDir: String = "",
       standalone: Boolean = false
   ): Either[Eval.CompileFailure, Any] =
-    // Per-invocation log files (when `-Xrepl-eval-log-dir` is set):
-    // capture the enclosing source, the body the user submitted,
-    // the synthesised wrapper module, and — on failure — the
-    // diagnostics. Useful for inspecting what the eval driver
-    // actually compiled. Failure-tolerant: any IO error in the
-    // logger is reported once via stderr and the eval call
-    // continues.
-    val logTimestamp =
-      if evalLogDir.isEmpty then ""
-      else writeEvalLogStart(evalLogDir, enclosingSource, code)
-
     // The runtime nested-eval rewrite used to happen here: parse
     // `code`, rewrite inner eval calls, pretty-print the result back
     // to a string, and pass the string as `config.body`. The
@@ -110,6 +97,10 @@ class EvalAdapter:
         bindingsKey = EvalAdapter.bindingsFingerprint(bindings),
         importsKey = replWrapperImports.mkString("\n"),
         settingsKey = compilerSettings.mkString(" "),
+        // Constant per REPL session (the loader already scopes the
+        // key), but in standalone mode it comes from a system
+        // property read per call, so a change must miss the cache.
+        classpathKey = replClasspath,
         sessionLoader = classLoader,
         standalone = standalone
       )
@@ -119,6 +110,18 @@ class EvalAdapter:
         case null => () // miss; fall through
         case Left(failure) => return Left(failure)
         case Right(compiled) => return invokeCached(compiled, bindings)
+
+    // Per-compile log files (when `-Xrepl-eval-log-dir` is set):
+    // capture the enclosing source, the body the user submitted,
+    // the synthesised wrapper module, and (on failure) the
+    // diagnostics. Useful for inspecting what the eval driver
+    // actually compiled. Written after the cache lookup: a cache
+    // hit recompiles nothing, so it logs nothing new either.
+    // Failure-tolerant: any IO error in the logger is reported via
+    // stderr and the eval call continues.
+    val logTimestamp =
+      if evalLogDir.isEmpty then ""
+      else writeEvalLogStart(evalLogDir, enclosingSource, code)
 
     // When invoked from a live REPL session, prefix the synthesised
     // class names with `rs$line$` so `NameOps.isReplWrapperName` flags
@@ -155,7 +158,7 @@ class EvalAdapter:
     // any nested `eval(...)` call inside the body or alongside the
     // marker in the enclosing source, and harmless when the wrapper
     // never references `eval`.
-    val evalImport = "import dotty.tools.eval.Eval.{eval, evalSafe}\n"
+    val evalImport = "import _root_.dotty.tools.eval.Eval.{eval, evalSafe}\n"
     val importBlock =
       if replWrapperImports.isEmpty then evalImport
       else evalImport + replWrapperImports.mkString("", "\n", "\n")
@@ -332,7 +335,7 @@ class EvalAdapter:
     val it = bindings.iterator
     while it.hasNext do
       val b = it.next()
-      if b.name == "__this__" then return b.value.asInstanceOf[AnyRef]
+      if b.name == EvalNames.ThisBinding then return b.value.asInstanceOf[AnyRef]
     null
 
 end EvalAdapter
@@ -382,10 +385,14 @@ object EvalAdapter:
 
     override def loadClass(name: String): Class[?] =
       // Cached `CompiledExpression`s share this loader across calls
-      // (and threads). Lock per name like the JVM's own
-      // `loadClass(name, resolve)` does, so two threads resolving the
-      // same wrapper-referenced class can't race into a duplicate
+      // (and threads). Lock so two threads resolving the same
+      // wrapper-referenced class can't race into a duplicate
       // `defineClass` (`LinkageError: duplicate class definition`).
+      // Since this loader isn't registered parallel-capable (Scala
+      // can't run `registerAsParallelCapable()` in a static
+      // initializer), `getClassLoadingLock` degenerates to one lock
+      // for the whole loader; that coarseness is fine here: the
+      // loader serves a single wrapper class plus parent delegation.
       getClassLoadingLock(name).synchronized {
         val loaded = findLoadedClass(name)
         if loaded != null then loaded
@@ -424,6 +431,7 @@ object EvalAdapter:
       bindingsKey: String,
       importsKey: String,
       settingsKey: String,
+      classpathKey: String,
       sessionLoader: ClassLoader,
       standalone: Boolean
   )

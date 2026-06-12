@@ -439,7 +439,9 @@ private sealed trait XSettings:
     AdvancedSetting,
     "Xrepl-interrupt-instrumentation",
     "true|false|local",
-    "pass `false` to disable bytecode instrumentation for interrupt handling in REPL, or `local` to limit interrupt support to only REPL-defined classes",
+    "pass `false` to disable bytecode instrumentation for interrupt handling in REPL, or `local` to limit interrupt support to only REPL-defined classes. " +
+      "Classes under `scala.*` and `dotty.*` are never instrumented (they must stay shared across the REPL/eval classloader boundary), " +
+      "so a loop running entirely inside library code is not interruptible through instrumentation.",
     "true"
   )
   val XdynamicEval: Setting[Boolean] = BooleanSetting(
@@ -460,7 +462,8 @@ private sealed trait XSettings:
       "`eval_<timestamp>_code.scala` (the body the user submitted), " +
       "`eval_<timestamp>_wrapper.scala` (the synthesised wrapper module the eval driver compiled), and " +
       "`eval_<timestamp>_error.scala` (only on a compile failure, carrying the diagnostics). " +
-      "When unset, no logs are written.",
+      "When unset, no logs are written. Read by REPL sessions only; standalone `-Xdynamic-eval` " +
+      "programs configure logging through the `dotty.tools.eval.logDir` system property at run time.",
     ""
   )
   val XreplHistoryFile: Setting[String] = StringSetting(

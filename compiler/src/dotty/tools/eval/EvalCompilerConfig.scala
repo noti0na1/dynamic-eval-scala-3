@@ -31,17 +31,17 @@ private[eval] case class EvalCompilerConfig(
     errorReporter: Consumer[String] = (_: String) => (),
     testMode: Boolean = false,
     expectedType: String = "",
-    /** Names of bindings already captured by the outer eval call.
-     *  Seeded into the runtime nested-eval rewriter inside
-     *  [[SpliceEvalBody]] so an inner eval call's bindings list
-     *  includes both these and any new in-scope names introduced
-     *  inside the body itself.
+    /** Names of bindings already captured by the outer eval call
+     *  (name, isSynthetic). Consumed as [[bindingNames]] by
+     *  [[ExtractEvalBody]] to identify linked classes/modules and
+     *  the non-local-return key, and by [[EvalRewriteTyped]] so a
+     *  nested eval call's bindings include the outer captures.
      */
     initialScope: Array[(String, Boolean)] = Array.empty,
     /** The outer eval's `enclosingSource` slice (with its own
-     *  marker). When non-empty, [[SpliceEvalBody]] activates the
-     *  rewriter's nested mode so each inner eval call gets a
-     *  composed `enclosingSource` chained off this one.
+     *  marker). When non-empty, [[EvalRewriteTyped]] composes each
+     *  nested eval call's `enclosingSource` against it, so every
+     *  level of nesting carries the full lexical context down.
      */
     outerEnclosingSource: String = "",
     evalLogDir: String = "",
@@ -55,8 +55,6 @@ private[eval] case class EvalCompilerConfig(
      */
     standalone: Boolean = false
 ):
-  val expressionClassName: TypeName = typeName(outputClassName)
-
   /** Names of all bindings the call site captured (visible and
    *  synthetic alike). The inner compile consults this to decide
    *  whether a term-owned class/module in the wrapper is *linked*

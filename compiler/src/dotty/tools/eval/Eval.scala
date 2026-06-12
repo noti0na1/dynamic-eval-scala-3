@@ -83,6 +83,18 @@ object Eval:
     override def toString =
       s"Binding($name, $value, tpe=$tpe, isVar=$isVar, isGiven=$isGiven, isSynthetic=$isSynthetic)"
 
+  /** Lazily forced binding value: the wrapped supplier runs at most
+   *  once, on first read through the bindings array (the unwrap
+   *  happens centrally in [[EvalExpressionBase]]'s `getValue` /
+   *  `getRaw`). Used for synthetic local-module bindings and
+   *  captured `lazy val`s, so building the array does not force (or
+   *  precede) the wrapped initializer. The parameter type is the JDK
+   *  `Supplier` for the same classloader-bridging reason as
+   *  [[varRef]].
+   */
+  final class LazyBindingValue(supplier: java.util.function.Supplier[Any]):
+    lazy val value: Any = supplier.get()
+
   /** Live getter/setter facade over a captured `var`. The rewriter
    *  emits a `varRef(() => x, v => x = v)` at every `bindVar` site:
    *  the lambdas close over the outer var, so Scala's standard local-
@@ -243,8 +255,20 @@ object Eval:
     ): Either[CompileFailure, Any]
 
   // Inheritable so a body that spawns a Future / Thread can still
-  // reach the live adapter from the new thread (the snapshot at spawn
-  // time is fine — there's exactly one adapter per running REPL).
+  // reach the live adapter from the new thread. The snapshot is taken
+  // at *thread creation*, which sets the propagation contract:
+  //
+  //   - threads created while an adapter is installed (the common
+  //     case: an ExecutionContext warmed up by the body itself)
+  //     inherit it and keep it for their lifetime;
+  //   - threads created *before* the install (a pool warmed at
+  //     process start) see no adapter, and an eval call on them falls
+  //     back to the standalone adapter: it compiles without the
+  //     session's scope, so call-site names fail to resolve;
+  //   - a process-wide fallback registry would be wrong here: it
+  //     would bleed one session's adapter into another's threads (or
+  //     into standalone-mode calls) in any JVM hosting more than one
+  //     driver, which the test suite does routinely.
   private val active = new InheritableThreadLocal[Adapter]
 
   def withAdapter[T](adapter: Adapter)(thunk: => T): T =

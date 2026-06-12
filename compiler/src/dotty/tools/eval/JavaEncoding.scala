@@ -47,7 +47,9 @@ private[eval] object JavaEncoding:
         if tpe.symbol.isPrimitiveValueClass then primitiveBinaryName(tpe.symbol)
         else classBinaryName(tpe.symbol)
       case AnnotatedType(t, _) => binaryName(t)
-      case _ => "Ljava/lang/Object;"
+      // Dot-separated: the result is compared against `Class.getName`
+      // of array element types, which uses dots.
+      case _ => "Ljava.lang.Object;"
 
   private def primitiveName(sym: Symbol)(using Context): String =
     if sym == defn.UnitClass then "void"

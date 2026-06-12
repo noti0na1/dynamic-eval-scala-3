@@ -35,37 +35,43 @@ import dotc.core.Phases.Phase
 class EvalCompiler(config: EvalCompilerConfig) extends Compiler:
 
   override protected def frontendPhases: List[List[Phase]] =
-    val parser :: others0 = super.frontendPhases: @unchecked
-    // The base Compiler pipeline carries its own (flag-gated)
-    // EvalRewriteTyped instance; drop it so the config-carrying
-    // instance below is the only one (duplicate phase names in a
-    // single plan are rejected, and the inner compile may run with
-    // `-Xdynamic-eval` forwarded from the outer session).
-    val others = others0
-      .map(_.filterNot(_.phaseName == EvalRewriteTyped.name))
-      .filter(_.nonEmpty)
-    // [[EvalRewriteTyped]] runs at the *end* of frontend (after
-    // PostTyper, before any transformPhases like Inlining, macro
-    // expansion, cc). At that point typed symbols are resolved (so
-    // the eval / evalSafe call's owner can be verified against
-    // `Eval.moduleClass`) but inline / macro expansion hasn't yet
-    // synthesised compiler-introduced variables we'd otherwise
-    // accidentally capture as bindings.
-    parser :: List(SpliceEvalBody(config)) :: (others :+ List(new EvalRewriteTyped(Some(config))))
+    val parser :: others = super.frontendPhases: @unchecked
+    // Replace the base pipeline's (flag-gated) EvalRewriteTyped with
+    // the config-carrying instance *in place* (right after PostTyper,
+    // before UnrollDefinitions and the pickler/Inlining groups). Both
+    // compiles then run the rewriter at the same pipeline point: the
+    // design relies on the inner and outer elaborations of the same
+    // source agreeing (e.g. linked-class constructor indices), and at
+    // that point typed symbols are resolved (so the eval / evalSafe
+    // call's owner can be verified against `Eval.moduleClass`) while
+    // inline / macro expansion hasn't yet synthesised
+    // compiler-introduced variables we'd accidentally capture as
+    // bindings.
+    parser :: List(SpliceEvalBody(config)) :: others.map(_.map {
+      case p if p.phaseName == EvalRewriteTyped.name => new EvalRewriteTyped(Some(config))
+      case p => p
+    })
 
   override protected def transformPhases: List[List[Phase]] =
     val store = EvalStore()
     val transformPhases = super.transformPhases
-    // Anchor [[ExtractEvalBody]] relative to the capture-checking
-    // phase so `cc` sees the body in its original lexical context.
-    // `cc` only runs when capture checking is enabled in the
-    // session; fall back to placing the eval phase right after the
-    // typer's transform group when it isn't there.
+    // Anchor [[ExtractEvalBody]] right after the capture-checking
+    // group so `cc` sees the body in its original lexical context.
+    // The group is always *present* in the plan (whether it runs is
+    // decided per run, in `Phases.fusePhases`, by `isEnabled`), so
+    // the anchor always resolves.
     val ccIndex = transformPhases.indexWhere(_.exists(_.phaseName == CheckCaptures.name))
-    val anchor =
-      if ccIndex >= 0 then ccIndex
-      else 0
-    val (before, after) = transformPhases.splitAt(anchor + 1)
+    assert(ccIndex >= 0, s"phase ${CheckCaptures.name} not found in transform plan")
+    val (before, after) = transformPhases.splitAt(ccIndex + 1)
+    // ResolveEvalAccess sits at the very end of the transform chain,
+    // *after* the Constructors group, despite the warning in
+    // `Compiler.transformPhases` that no InfoTransformer should
+    // follow it (Constructors changes class decls in
+    // transformTemplate). That is sound here because its
+    // `infoMayChange` is restricted to non-class symbols owned by
+    // `__Expression` or by body-local classes when linked classes
+    // exist, so the decls Constructors rewrites are never re-derived
+    // through it.
     val resolveGroup = List(ResolveEvalAccess(config, store))
     val logGroup =
       if config.evalLogDir.isEmpty || config.evalLogTimestamp.isEmpty then Nil

@@ -55,23 +55,41 @@ abstract class EvalExpressionBase(
    */
   protected final def getThisObject(): Object | Null = thisObject
 
-  /** Look up a binding by name, auto-unwrapping `Eval.VarRef` so the
-   *  body sees a `T` rather than a live var facade. Var-assignment
-   *  codegen uses `getRaw` to preserve the facade.
-   */
-  protected final def getValue(name: String): Any =
-    val raw = getRaw(name)
-    if raw.isInstanceOf[Eval.VarRef[?]] then
-      raw.asInstanceOf[Eval.VarRef[Any]].get()
-    else raw
-
-  /** Return the binding's stored value as-is (no `VarRef` unwrap). */
-  protected final def getRaw(name: String): Any =
+  private final def __findBinding__(name: String): Eval.Binding =
     var i = 0
     while i < bindings.length do
-      if bindings(i).name == name then return bindings(i).value
+      if bindings(i).name == name then return bindings(i)
       i = i + 1
     throw new java.util.NoSuchElementException(name)
+
+  /** Force an `Eval.LazyBindingValue` wrapper to its value; anything
+   *  else passes through untouched. The rewriter wraps values whose
+   *  read must not happen while the bindings array is built (local
+   *  modules, captured `lazy val`s); the supplier runs at most once,
+   *  on the first read through here.
+   */
+  private final def __unwrapLazy__(v: Any): Any = v match
+    case lzy: Eval.LazyBindingValue => lzy.value
+    case _ => v
+
+  /** Look up a binding by name, unwrapping the `Eval.VarRef` facade of
+   *  a var binding so the body sees a `T` rather than the live facade.
+   *  The unwrap is keyed on `Binding.isVar`, not on the value's runtime
+   *  type: a *val* whose value happens to be a user-held `VarRef` must
+   *  come through untouched. Var-assignment codegen uses `getRaw` to
+   *  preserve the facade.
+   */
+  protected final def getValue(name: String): Any =
+    val b = __findBinding__(name)
+    if b.isVar then b.value.asInstanceOf[Eval.VarRef[Any]].get()
+    else __unwrapLazy__(b.value)
+
+  /** Return the binding's stored value with no `VarRef` unwrap
+   *  (lazy wrappers are still forced; they are an encoding detail of
+   *  the bindings array, never a value the body should see).
+   */
+  protected final def getRaw(name: String): Any =
+    __unwrapLazy__(__findBinding__(name).value)
 
   /** Walk the `$outer` chain on `obj`. Used to lower the `Outer`
    *  strategy so a body inside a nested class can reach an
@@ -93,20 +111,24 @@ abstract class EvalExpressionBase(
     throw new NoSuchFieldException("$outer (" + outerTypeName + ") on " + obj.getClass.getName)
 
   /** Match a field whose name is either the literal `name` or any
-   *  Scala 3-mangled `<owner-chain>$<name>` form. Returns null on
-   *  miss so the caller can decide whether to fall back to a
-   *  getter / superclass walk.
+   *  Scala 3-mangled `<owner-chain>$<name>` form. An exact match wins
+   *  over a mangled one, so a subclass field `x` is not shadowed by an
+   *  unrelated `Trait$$x` that happens to come first in declaration
+   *  order. Returns null on miss so the caller can decide whether to
+   *  fall back to a getter / superclass walk.
    */
   private final def __findField__(c: Class[?], name: String): java.lang.reflect.Field | Null =
     val fs = c.getDeclaredFields
-    var i = 0
     val suffix = "$" + name
+    var mangled: java.lang.reflect.Field | Null = null
+    var i = 0
     while i < fs.length do
       val f = fs(i)
       val n = f.getName
-      if n == name || n.endsWith(suffix) then return f
+      if n == name then return f
+      if mangled == null && n.endsWith(suffix) then mangled = f
       i = i + 1
-    null
+    mangled
 
   /** Reflective field read on an instance of `className`. Walks
    *  superclasses; falls back to a 0-arg getter method when no

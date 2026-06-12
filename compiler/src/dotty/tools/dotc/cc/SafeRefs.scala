@@ -176,7 +176,7 @@ object SafeRefs {
 
   /** Allow name in safe mode even though it contains `$` characters */
   def allowDollarIn(name: Name)(using Context): Boolean =
-    name.isReplWrapperName && ctx.mode.is(Mode.Interactive)
+    ctx.mode.is(Mode.Interactive) && name.isReplWrapperName
 
   private def fail(sym: Symbol, reason: String, pos: SrcPos)(using Context) =
     report.error(em"Cannot refer to ${sym.sanitizedDescription}${sym.showExtendedLocation} from safe code since $reason", pos)

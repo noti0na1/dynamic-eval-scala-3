@@ -894,15 +894,18 @@ class CheckCaptures extends Recheck, SymTransformer:
       else if meth == defn.Caps_unsafeDiscardUses then
         val arg :: Nil = tree.args: @unchecked
         withDiscardedUses(recheck(arg, pt))
+      else if meth == defn.Caps_freeze then
+        freeze(super.recheckApply(tree, pt), tree.srcPos)
       else if tree.hasAttachment(DiscardUses) then
         // A compiler-internal rewriter asked for `unsafeDiscardUses`
         // semantics on this whole call without going through the
         // (safe-mode-rejected) `caps.unsafe.unsafeDiscardUses` symbol.
         // Recheck the application normally, but with use recording
-        // suppressed for everything inside it.
+        // suppressed for everything inside it. Checked after the
+        // `defn.Caps_*` symbol dispatch: sticky attachments survive
+        // tree copies, and an attached `caps.freeze` call must not
+        // silently skip freeze semantics.
         withDiscardedUses(super.recheckApply(tree, pt))
-      else if meth == defn.Caps_freeze then
-        freeze(super.recheckApply(tree, pt), tree.srcPos)
       else
         val res = super.recheckApply(tree, pt)
         includeCallCaptures(meth, res, tree)
