@@ -63,6 +63,29 @@ private[eval] class EvalStore:
     if linkedClasses.isEmpty then None
     else linkedClasses.get(tpe.typeSymbol)
 
+  /** Source name and dimension count of the linked element class
+   *  when `tpe` is a (possibly multi-dimensional) array of a linked
+   *  local class, in either the pre-erasure
+   *  (`AppliedType(Array, …)`) or post-erasure (`JavaArrayType`)
+   *  shape. `Array[Array[C]]` yields `(C, 2)`.
+   */
+  def linkedArrayElemInfo(tpe: Type)(using Context): Option[(String, Int)] =
+    if linkedClasses.isEmpty then None
+    else
+      def elem(p: Type): Type = p match
+        case AppliedType(tycon, arg :: Nil) if tycon.typeSymbol == defn.ArrayClass => arg
+        case JavaArrayType(arg) => arg
+        case _ => NoType
+      var dims = 0
+      var cur = tpe
+      var e = elem(cur)
+      while e.exists do
+        dims += 1
+        cur = e.widenDealias
+        e = elem(cur)
+      if dims == 0 then None
+      else linkedClasses.get(cur.typeSymbol).map((_, dims))
+
   def hasLinked: Boolean =
     linkedClasses.nonEmpty || linkedModules.nonEmpty
 

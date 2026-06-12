@@ -3849,6 +3849,287 @@ class DynamicEvalTests extends ReplTest:
     assertContains("val res0: Int = 11", storedOutput())
   }
 
+  @Test def localClassByNameCtorParamStaysLazy = initially {
+    // A by-name constructor parameter keeps by-name semantics across
+    // the boundary. The wrapper's ElimByName wraps the body's argument
+    // in a Function0 *before* extract runs, and the call-site factory
+    // (`__evalNew_C__$0`) declares the slot by-name, so the closure
+    // travels through `FunctionN.apply` unevaluated: nothing is forced
+    // at the factory boundary, and each force re-evaluates the body's
+    // expression (the `log` write goes through the captured VarRef).
+    run("""|def f(): String =
+           |  var log = ""
+           |  class C(x: => Int):
+           |    def force(): Int = x
+           |  val c = eval[C]("new C({ log += \"e\"; 5 })")
+           |  val before = log
+           |  val a = c.force()
+           |  val b = c.force()
+           |  s"[$before|$log|$a|$b]"
+           |f()""".stripMargin)
+    assertContains("""val res0: String = "[|ee|5|5]"""", storedOutput())
+  }
+
+  @Test def localClassByNameSecondaryCtorParam = initially {
+    // Same laziness through a *secondary* constructor's factory
+    // (`__evalNew_C__$1`): the argument is evaluated by the
+    // constructor body's two forces, not at the boundary.
+    run("""|def f(): String =
+           |  var log = ""
+           |  class C(val v: Int):
+           |    def this(x: => Int, s: String) = this({ x; x })
+           |  val c = eval[C]("new C({ log += \"e\"; 5 }, \"hi\")")
+           |  s"$log ${c.v}"
+           |f()""".stripMargin)
+    assertContains("""val res0: String = "ee 5"""", storedOutput())
+  }
+
+  @Test def localModuleUserDefinedUnapply = initially {
+    // Pattern matching through a *user-defined* `unapply` on a local
+    // module: PatternMatcher (running before extract) lowers the
+    // match to an `Ex.unapply(...)` call plus Option accessors, and
+    // the module reference links to the live instance through
+    // `__evalModule_Ex__` with receiver-class reflection.
+    run("""|def f(): Int =
+           |  object Ex:
+           |    def unapply(s: String): Option[Int] = if s.isEmpty then None else Some(s.length)
+           |  eval[Int]("\"abc\" match { case Ex(n) => n; case _ => -1 }")
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 3", storedOutput())
+  }
+
+  @Test def localModuleBooleanUnapply = initially {
+    // Boolean-result `unapply` variant of the same path.
+    run("""|def f(): Int =
+           |  object Even:
+           |    def unapply(n: Int): Boolean = n % 2 == 0
+           |  eval[Int]("4 match { case Even() => 1; case _ => 0 }")
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 1", storedOutput())
+  }
+
+  @Test def localModuleUnapplySeq = initially {
+    // `unapplySeq` variant: the lowered match additionally calls the
+    // Seq accessors on the (global) result type, which need no link.
+    run("""|def f(): Int =
+           |  object Words:
+           |    def unapplySeq(s: String): Option[Seq[String]] = Some(s.split(" ").toSeq)
+           |  eval[Int]("\"a b c\" match { case Words(x, _*) => x.length; case _ => -1 }")
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 1", storedOutput())
+  }
+
+  // -- Arrays of a linked local class. ---------------------------------------
+  //
+  //    Arrays cross the boundary in both directions at any dimension
+  //    count. Captured arrays read through a depth-matched
+  //    `Object`-array boundary cast (sound through JVM array
+  //    covariance at every level; loads and member accesses on
+  //    elements stay reflective, and store checks run against the
+  //    *runtime* component class). Arrays the body creates get the
+  //    *original* component class: `Array(...)` literals route their
+  //    `classOf` ClassTag constants through the post-erasure sweep,
+  //    `new Array[…[C]…](n)` lowers to the reflective
+  //    `newLinkedArray` helper, and `Array.ofDim`'s `newArray`
+  //    intrinsic lowers to `newLinkedArrayDims`.
+
+  @Test def localClassArrayCapturedReadAndWrite = initially {
+    // Read elements of a captured `Array[C]` and write one back; the
+    // store check runs against the runtime component class (the
+    // original `C`), so the write from the body sticks.
+    run("""|def f(): Int =
+           |  class C(val x: Int)
+           |  val arr = Array(new C(1), new C(2))
+           |  eval[Unit]("arr(1) = new C(arr(0).x + 40)")
+           |  arr(1).x
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 41", storedOutput())
+  }
+
+  @Test def localClassArrayLiteralCreatedInBody = initially {
+    // `Array(new C(1), new C(2))` inside the body: the ClassTag's
+    // `classOf[C']` constant is forwarded to the original class, so
+    // the array that crosses back out is a real `C[]` and the call
+    // site's checkcast passes.
+    run("""|def f(): Int =
+           |  class C(val x: Int)
+           |  val arr = eval[Array[C]]("Array(new C(20), new C(22))")
+           |  arr(0).x + arr(1).x
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def localClassArrayNewAndFill = initially {
+    // `new Array[C](n)` lowers to `newLinkedArray`; the body then
+    // stores original-class instances and the array crosses out.
+    run("""|def f(): Int =
+           |  class C(val x: Int)
+           |  val arr = eval[Array[C]]("val a = new Array[C](2); a(0) = new C(5); a(1) = new C(6); a")
+           |  arr(0).x + arr(1).x
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 11", storedOutput())
+  }
+
+  @Test def localClassArrayTypeTestInBody = initially {
+    // `case a: Array[C]` on a captured `Any`: PatternMatcher's
+    // `isInstanceOf[Array[C']]` / cast lower through the post-erasure
+    // sweep to the covariant runtime test against the original class.
+    run("""|def f(): Int =
+           |  class C(val x: Int)
+           |  val any: Any = Array(new C(30), new C(12))
+           |  eval[Int]("any match { case a: Array[C] => a(0).x + a(1).x; case _ => -1 }")
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def localCaseClassArrayRoundTrip = initially {
+    // Case-class variant: `Array(Pt(1, 2), Pt(3, 4))` in the body
+    // composes the companion-apply link with the array literal path.
+    run("""|def f(): Int =
+           |  case class Pt(x: Int, y: Int)
+           |  val arr = eval[Array[Pt]]("Array(Pt(1, 2), Pt(3, 4))")
+           |  arr.map(p => p.x + p.y).sum
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 10", storedOutput())
+  }
+
+  @Test def localClassArrayThroughLocalDef = initially {
+    // A block-local def *returning* `Array[C]` called from the body:
+    // the MethodCapture result widens to `Array[Object]` instead of
+    // checkcasting to the re-elaborated element class.
+    run("""|def f(): Int =
+           |  class C(val x: Int)
+           |  def mk(n: Int): Array[C] = Array(new C(n), new C(n + 1))
+           |  eval[Int]("val a = mk(20); a(0).x + a(1).x")
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 41", storedOutput())
+  }
+
+  @Test def localClassNestedArrayCapturedReadAndWrite = initially {
+    // Multi-dimensional arrays: covariance holds at every depth
+    // (`C[][] <: Object[][]`), so a captured grid reads and writes
+    // through the depth-matched `Object`-array boundary cast, and
+    // both element and row stores check against the *runtime*
+    // component classes (the original ones).
+    run("""|def f(): Int =
+           |  class C(val x: Int)
+           |  val grid = Array(Array(new C(1), new C(2)), Array(new C(3)))
+           |  eval[Unit]("grid(1)(0) = new C(grid(0)(1).x + 38); grid(0) = Array(new C(2))")
+           |  grid(1)(0).x + grid(0)(0).x
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def localClassNestedArrayCreatedInBody = initially {
+    // A 2-dim literal built inside the body: the inner literals
+    // re-house through `arrayOfLinked("C", 1, …)`, the outer one
+    // through `arrayOfLinked("C", 2, …)` (its ClassTag's
+    // `classOf[Array[C']]` constant forwards to the original array
+    // class), so a real `C[][]` crosses out.
+    run("""|def f(): Int =
+           |  class C(val x: Int)
+           |  val grid = eval[Array[Array[C]]]("Array(Array(new C(1), new C(2)), Array(new C(39)))")
+           |  grid(0)(0).x + grid(0)(1).x + grid(1)(0).x
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def localClassNestedArrayNewAndOfDim = initially {
+    // `new Array[Array[C]](n)` lowers to `newLinkedArray("C", 2, n)`
+    // (null rows, like source); `Array.ofDim[C](n, m)` is generic
+    // library code running with the forwarded original-class
+    // ClassTag, so it builds a correct `C[][]` on its own.
+    run("""|def f(): Int =
+           |  class C(val x: Int)
+           |  val a = eval[Array[Array[C]]]("val g = new Array[Array[C]](2); g(0) = Array(new C(20)); g(1) = Array(new C(22)); g")
+           |  val b = eval[Array[Array[C]]]("val g = Array.ofDim[C](1, 1); g(0)(0) = new C(100); g")
+           |  a(0)(0).x + a(1)(0).x + b(0)(0).x
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 142", storedOutput())
+  }
+
+  @Test def localClassArrayUnderGenericLayer = initially {
+    // `Array[Box[Array[C]]]`: the outer array's JVM component class
+    // is `Box` (the type argument is erased), so no descriptor names
+    // the linked class and the array layer needs no widening at all.
+    // `C` resurfaces only through the generic read `box.value`,
+    // whose erasure-inserted `asInstanceOf[Array[C']]` lowers in the
+    // sweep. Reads, an element write from the body, and a round trip
+    // out all link to the original class.
+    run("""|case class Box[T](value: T)
+           |def f(): Int =
+           |  class C(val x: Int)
+           |  val xs: Array[Box[Array[C]]] = Array(Box(Array(new C(1), new C(2))))
+           |  eval[Unit]("xs(0) = Box(Array(new C(xs(0).value(1).x + 38)))")
+           |  xs(0).value(0).x
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 40", storedOutput())
+  }
+
+  @Test def localClassArrayUnderGenericLayerCreatedInBody = initially {
+    run("""|case class Box[T](value: T)
+           |def f(): Int =
+           |  class C(val x: Int)
+           |  val xs = eval[Array[Box[Array[C]]]]("Array(Box(Array(new C(20), new C(22))))")
+           |  xs(0).value(0).x + xs(0).value(1).x
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def localClassArrayMapUnderGenerics = initially {
+    // `xs.map(_.value)` in the body yields `Array[Array[C]]`: the
+    // ClassTag the mapper needs materializes as a
+    // `classOf[Array[C']]` array-class constant, forwarded to the
+    // original class's array class by the sweep.
+    run("""|case class Box[T](value: T)
+           |def f(): Int =
+           |  class C(val x: Int)
+           |  val xs: Array[Box[Array[C]]] = Array(Box(Array(new C(40))), Box(Array(new C(2))))
+           |  eval[Int]("val grid = xs.map(_.value); grid(0)(0).x + grid(1)(0).x")
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def localGenericClassArrayOfLocalArrays = initially {
+    // Both layers local: `Array[Box[Array[C]]]` where `Box` is
+    // *itself* a local class. The outer array is then an
+    // array-of-linked at depth 1 (component `Box'`), and the inner
+    // generic read reflects against the live Box instance.
+    run("""|def f(): Int =
+           |  class C(val x: Int)
+           |  class Box[T](val value: T)
+           |  val xs: Array[Box[Array[C]]] = Array(new Box(Array(new C(40), new C(2))))
+           |  eval[Int]("xs(0).value(0).x + xs(0).value(1).x")
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def localClassArrayDeepInterleaving = initially {
+    // `Array[Box[Array[C]]]` with both classes local and the body
+    // rebuilding the whole structure: every array layer below a
+    // generic position re-houses against the original classes, and
+    // each generic read reflects against the live instances.
+    run("""|def f(): Int =
+           |  class C(val x: Int)
+           |  class Box[T](val value: T)
+           |  val xs = eval[Array[Box[Array[C]]]](
+           |    "Array(new Box(Array(new C(20))), new Box(Array(new C(22))))")
+           |  xs(0).value(0).x + xs(1).value(0).x
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  @Test def localClassNestedArrayTypeTestInBody = initially {
+    // `case g: Array[Array[C]]` lowers to the depth-aware
+    // `isLinkedArrayInstance(x, "C", 2)` runtime test.
+    run("""|def f(): Int =
+           |  class C(val x: Int)
+           |  val any: Any = Array(Array(new C(40), new C(2)))
+           |  eval[Int]("any match { case g: Array[Array[C]] => g(0)(0).x + g(0)(1).x; case _ => -1 }")
+           |f()""".stripMargin)
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
   // -- Evals *inside* a session-level object. --------------------------------
   //
   //    The eval call sits inside a method of a REPL-defined `object`,
@@ -3927,6 +4208,161 @@ class DynamicEvalTests extends ReplTest:
            |  def calc(): Int = eval[Int]("this.base + A.base + 2")
            |val r = A.calc()""".stripMargin)
     assertContains("val r: Int = 42", storedOutput())
+  }
+
+  // -- Evals inside instance-dependent and private objects. ------------------
+  //
+  //    An `object` nested in a *class* has one live module per
+  //    enclosing instance, and a `private object`'s static path is
+  //    not spellable from the wrapper, so neither can go through the
+  //    module lift; the wrapper keeps a re-elaborated copy. The
+  //    rewriter captures the live module instance (`__this__`,
+  //    `__this__<B>`, `__evalModule_<B>__`), and the extract phase
+  //    treats wrapper-owned re-elaborations like term-owned classes:
+  //    boundary casts widen to Object and member access reflects
+  //    against the runtime instance, so state is shared with the
+  //    live module.
+
+  @Test def evalInsideObjectNestedInClass = initially {
+    // Bare reference to the *enclosing class's* member from inside
+    // the nested object's method: `k` lowers through `__this__A`.
+    run("""|class A(val k: Int):
+           |  object B:
+           |    def m: Int = eval[Int]("k + 1")
+           |new A(5).B.m""".stripMargin)
+    assertContains("val res0: Int = 6", storedOutput())
+  }
+
+  @Test def evalInsideObjectNestedInClassLiveState = initially {
+    // Writes land on the *live* per-instance module: state persists
+    // across calls (previously a ClassCastException against the
+    // wrapper's re-elaborated class).
+    run("""|class A(val k: Int):
+           |  object B:
+           |    var s: Int = 0
+           |    def m: Int = eval[Int]("s += k; s")
+           |val a = new A(5)
+           |a.B.m
+           |a.B.m""".stripMargin)
+    val out = storedOutput()
+    assertContains("val res0: Int = 5", out)
+    assertContains("val res1: Int = 10", out)
+  }
+
+  @Test def evalInsideObjectNestedInClassPerInstance = initially {
+    // Two enclosing instances have two distinct live modules; each
+    // eval links to its own.
+    run("""|class A(val k: Int):
+           |  object B:
+           |    var s: Int = 0
+           |    def m: Int = eval[Int]("s += k; s")
+           |val a1 = new A(5)
+           |val a2 = new A(7)
+           |a1.B.m
+           |a2.B.m
+           |a1.B.m""".stripMargin)
+    val out = storedOutput()
+    assertContains("val res0: Int = 5", out)
+    assertContains("val res1: Int = 7", out)
+    assertContains("val res2: Int = 10", out)
+  }
+
+  @Test def evalInsideObjectNestedInClassQualified = initially {
+    // Name-qualified forms: `B.s` links through `__evalModule_B__`,
+    // `A.this.k` through `__this__A`.
+    run("""|class A(val k: Int):
+           |  object B:
+           |    var s: Int = 1
+           |    def m: Int = eval[Int]("B.s + A.this.k")
+           |new A(5).B.m""".stripMargin)
+    assertContains("val res0: Int = 6", storedOutput())
+  }
+
+  @Test def evalInsidePrivateObject = initially {
+    // A `private object` vetoes the module lift (its wildcard import
+    // would not typecheck), so it links like an instance-dependent
+    // module: live state, increments persist across calls.
+    run("""|object Outer:
+           |  private object Inner:
+           |    var c: Int = 0
+           |    def m: Int = eval[Int]("c += 1; c")
+           |  def go: Int = Inner.m + Inner.m
+           |Outer.go""".stripMargin)
+    assertContains("val res0: Int = 3", storedOutput())
+  }
+
+  @Test def evalInsidePrivateObjectQualified = initially {
+    run("""|object Outer:
+           |  private object Inner:
+           |    var c: Int = 10
+           |    def m: Int = eval[Int]("Inner.c + 1")
+           |  def go: Int = Inner.m
+           |Outer.go""".stripMargin)
+    assertContains("val res0: Int = 11", storedOutput())
+  }
+
+  @Test def evalInsidePrivateObjectPrivateMember = initially {
+    // A private member of the private object reroutes through the
+    // inaccessible-member reflective path on the live instance.
+    run("""|object Outer:
+           |  private object Inner:
+           |    private var c: Int = 20
+           |    def m: Int = eval[Int]("c = c + 1; c")
+           |  def go: Int = Inner.m + Inner.m
+           |Outer.go""".stripMargin)
+    assertContains("val res0: Int = 43", storedOutput())
+  }
+
+  @Test def evalInObjectValInitializer = initially {
+    // Marker outside a def: an object-level val initializer takes
+    // the re-elaboration path (the eval runs during construction of
+    // the live module, so there is no second state to diverge).
+    run("""|object O:
+           |  val x: Int = eval[Int]("21 * 2")
+           |O.x""".stripMargin)
+    assertContains("val res0: Int = 42", storedOutput())
+  }
+
+  // -- Evals *inside* extension methods. -------------------------------------
+  //
+  //    The desugared DefDef's span starts at `def`, so a naive
+  //    enclosing-source slice loses the `extension (…)` clause and
+  //    the wrapper compile fails with "Not found" on the extension
+  //    parameter. The rewriter widens the slice to the `extension`
+  //    keyword (located through the leading params' spans), and
+  //    SpliceEvalBody's ExtMethods case renames the marker-bearing
+  //    member so recursion resolves to the live session copy.
+
+  @Test def evalInsideExtensionMethod = initially {
+    run("""|extension (n: Int) def bump: Int = eval[Int]("n + 1")
+           |5.bump""".stripMargin)
+    assertContains("val res0: Int = 6", storedOutput())
+  }
+
+  @Test def evalInsideExtensionGroupMember = initially {
+    // The widened slice carries the whole group, so the body's
+    // simple-name call to the sibling extension method resolves.
+    run("""|extension (n: Int)
+           |  def double: Int = n * 2
+           |  def quad: Int = eval[Int]("double * 2")
+           |5.quad""".stripMargin)
+    assertContains("val res0: Int = 20", storedOutput())
+  }
+
+  @Test def evalInsideExtensionMethodRecursion = initially {
+    // The renamed wrapper copy keeps the marker; the body's recursive
+    // call resolves through the session import to the live extension.
+    run("""|extension (n: Int) def fact: Int = if n <= 1 then 1 else eval[Int]("(n - 1).fact * n")
+           |5.fact""".stripMargin)
+    assertContains("val res0: Int = 120", storedOutput())
+  }
+
+  @Test def evalInsideGenericExtensionMethod = initially {
+    // A type-parameterised extension: the widened slice re-declares
+    // `T`, so the body and the expected-type slot resolve it.
+    run("""|extension [T](xs: List[T]) def second: T = eval[T]("xs.tail.head")
+           |List(1, 2, 3).second""".stripMargin)
+    assertContains("val res0: Int = 2", storedOutput())
   }
 
   // -- Evals *inside* a local class's methods. -------------------------------
@@ -4568,15 +5004,16 @@ class DynamicEvalTests extends ReplTest:
   // test to assert the success result and move it into the relevant section
   // above.
   //
-  // Open limitations: none currently pinned. The narrower edges that
-  // remain (documented in EVAL-BINDINGS-DESIGN.md) are: a body-local
-  // class extending a *linked* local class; by-name constructor params
-  // of linked classes evaluating eagerly at the factory boundary; a
-  // user-defined `unapply` on a local module; eval inside an object
-  // nested in a *class* (instance-dependent module); and markers
-  // outside a def (an object-level val initializer, an extension
-  // method) or in a `private` object, which take the old
-  // re-elaboration path.
+  // Open limitations, pinned below: a body-local class extending a
+  // *linked* local class (named or anonymous; rejected with a
+  // diagnostic, see `bodyLocalClassExtendingLinkedClassRejected`).
+  // Documented but not pinnable: the inliner's def-shaped by-name
+  // argument proxies are not captured, but no reachable source shape
+  // is known to hit them (lambdas cannot declare by-name params;
+  // context function arguments beta-reduce their parameter to a
+  // val-shaped binding); and an eval call written inside an
+  // `inline def` warns that expansion sites see the unrewritten call
+  // (`evalInsideInlineDefWarns`).
   //
   // Lifted (now covered by success tests above):
   //   - *Local* case-class apply/unapply from the body: section 38
@@ -4597,6 +5034,18 @@ class DynamicEvalTests extends ReplTest:
   //   - Eval inside a method of a *local* class: bare member Idents lower
   //     through the synthesised `this` qualifier with receiver-class
   //     reflection (`evalInsideLocalClassMethod` and friends above).
+  //   - By-name constructor params of linked classes: full by-name
+  //     semantics across the boundary (`localClassByNameCtorParamStaysLazy`).
+  //   - User-defined `unapply` / `unapplySeq` on a local module
+  //     (`localModuleUserDefinedUnapply` and friends, section 38).
+  //   - Arrays of a linked local class (any dimension count), both
+  //     directions (`localClassArrayCapturedReadAndWrite`,
+  //     `localClassNestedArrayCreatedInBody`, and friends, section 38).
+  //   - Eval inside an object nested in a *class* (instance-dependent
+  //     module) and inside a `private object`: live-instance captures
+  //     (`evalInsideObjectNestedInClass`, `evalInsidePrivateObject`).
+  //   - Eval inside extension methods: the slice is widened to the
+  //     `extension` clause (`evalInsideExtensionMethod` and friends).
   // ===========================================================================
 
   @Test def returnOutsideMethodInBodyRejected = initially {
@@ -4615,6 +5064,48 @@ class DynamicEvalTests extends ReplTest:
     // with its return, so nothing crosses the method boundary.
     run("""val r: Int = eval[Int]("def g(x: Int): Int = { if x > 0 then return x * 2; -1 }; g(21)")""")
     assertContains("val r: Int = 42", storedOutput())
+  }
+
+  @Test def bodyLocalClassExtendingLinkedClassRejected = initially {
+    // A body-local class extending a *linked* local class is rejected
+    // with a clean diagnostic: the subclass would extend the wrapper's
+    // re-elaborated copy, and its `super.<init>` cannot be routed
+    // through the call-site factory closure. (Previously this
+    // corrupted the parent-init call and failed with an internal
+    // "wrong number of arguments at constructors" error.)
+    run("""|def f(): Int =
+           |  class Base(val k: Int)
+           |  eval[Int]("class D(n: Int) extends Base(n)\nval d = new D(3)\nd.k")
+           |f()""".stripMargin)
+    val out = storedOutput()
+    assertTrue(s"expected the body-local-subclass diagnostic, got:\n$out",
+      out.contains("eval failed to compile") &&
+        out.contains("a class declared in the eval body cannot extend `Base`"))
+  }
+
+  @Test def evalInsideInlineDefWarns = initially {
+    // An eval call written inside an `inline def` warns: the body
+    // recorded for inlining was snapshotted before the rewriter ran,
+    // so every expansion site would see an unrewritten call (empty
+    // bindings, no enclosing source). The retained, non-inlined body
+    // still carries the filled call. Not liftable without
+    // per-expansion slicing: an expansion's spans point into the
+    // inline def's source while the bindings would have to come from
+    // the expansion site's scope.
+    run("""inline def f(x: Int): Int = eval[Int]("x + 1")""")
+    assertContains("eval inside an inline method is not supported", storedOutput())
+  }
+
+  @Test def bodyAnonymousClassOfLinkedClassRejected = initially {
+    // Same rejection for the anonymous-template form `new Base { }`.
+    run("""|def f(): Int =
+           |  class Base(val k: Int)
+           |  eval[Int]("val b: Base = new Base(3) {}; b.k")
+           |f()""".stripMargin)
+    val out = storedOutput()
+    assertTrue(s"expected the body-local-subclass diagnostic, got:\n$out",
+      out.contains("eval failed to compile") &&
+        out.contains("a class declared in the eval body cannot extend `Base`"))
   }
 
   // ===========================================================================

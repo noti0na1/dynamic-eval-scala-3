@@ -286,6 +286,70 @@ abstract class EvalExpressionBase(
         s"${obj.getClass.getName} cannot be cast to linked local class " +
           s"$sourceName (${cls.getName})")
 
+  /** Runtime `Class` of the `dims`-dimensional array of the linked
+   *  local class `C` (`dims = 1` → `C[]`). Built by stacking
+   *  zero-length array creations; also replaces `classOf[Array[C']]`
+   *  constants (a multi-dimensional array literal's `ClassTag`), so
+   *  protected like [[linkedClass]].
+   */
+  protected final def linkedArrayClass(sourceName: String, dims: Int): Class[?] =
+    var cls = linkedClass(sourceName)
+    var i = 0
+    while i < dims do
+      cls = java.lang.reflect.Array.newInstance(cls, 0).getClass
+      i += 1
+    cls
+
+  /** `new Array[…[C]…](length)` where `C` is a linked local class
+   *  and the created array has `dims` dimensions (`dims = 1` →
+   *  `C[]`, `dims = 2` → `C[][]` with null rows, matching source
+   *  semantics): the runtime component class must name the
+   *  *original* lifted class, which only reflection can do.
+   */
+  protected final def newLinkedArray(sourceName: String, dims: Int, length: Int): Object =
+    java.lang.reflect.Array.newInstance(linkedArrayClass(sourceName, dims - 1), length)
+
+  /** The `ArrayConstructors` intrinsic shape (`Array.ofDim`, generic
+   *  array news minted after extract): allocate a (possibly
+   *  rectangular multi-dimensional) array whose ultimate element
+   *  class is the original lifted class, `elemDims` array layers
+   *  deep below the allocated `dims.length` dimensions.
+   */
+  protected final def newLinkedArrayDims(sourceName: String, elemDims: Int, dims: Array[Int]): Object =
+    java.lang.reflect.Array.newInstance(linkedArrayClass(sourceName, elemDims), dims*)
+
+  /** `Array(e1, …, en)` of a linked local class (or of arrays of
+   *  one, for the outer layers of a multi-dimensional literal):
+   *  re-house the elements (delivered as an `Object[]`) in an array
+   *  whose runtime component class is the original lifted class
+   *  (`dims - 1` array dimensions deep). `arraycopy` runs the
+   *  per-element store checks, so a wrong element class surfaces as
+   *  the same `ArrayStoreException` a direct `aastore` would raise.
+   */
+  protected final def arrayOfLinked(sourceName: String, dims: Int, elems: Array[Object | Null]): Object =
+    val out = java.lang.reflect.Array.newInstance(linkedArrayClass(sourceName, dims - 1), elems.length)
+    java.lang.System.arraycopy(elems, 0, out, 0, elems.length)
+    out
+
+  /** `x.isInstanceOf[Array[…[C]…]]` (`dims` dimensions) against the
+   *  original runtime class of the linked local class `C`.
+   *  `Class.isInstance` applies JVM array covariance at every depth
+   *  (`D[][] instanceof C[][]` iff `D <: C`).
+   */
+  protected final def isLinkedArrayInstance(obj: Object | Null, sourceName: String, dims: Int): Boolean =
+    obj != null && linkedArrayClass(sourceName, dims).isInstance(obj)
+
+  /** `x.asInstanceOf[Array[…[C]…]]` (`dims` dimensions) against the
+   *  original runtime class of the linked local class `C`; `null`
+   *  passes through like the checkcast it replaces.
+   */
+  protected final def castLinkedArray(obj: Object | Null, sourceName: String, dims: Int): Object | Null =
+    if obj == null then null
+    else if isLinkedArrayInstance(obj, sourceName, dims) then obj
+    else throw new ClassCastException(
+      s"${obj.getClass.getName} cannot be cast to " +
+        s"${linkedArrayClass(sourceName, dims).getName} of linked local class $sourceName")
+
   /** Placeholder consumed by `ResolveEvalAccess`, which rewrites
    *  every `reflectEval(...)` Apply in `evaluate`'s body into the
    *  matching concrete accessor (`getValue`, `getField`,

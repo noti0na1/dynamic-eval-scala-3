@@ -125,6 +125,11 @@ private[eval] class ResolveEvalAccess(config: EvalCompilerConfig, store: EvalSto
               // the instance belongs to the *original* lifted class.
               gen.applyCapturedFunction(bindingName, args)
 
+            case ReflectEvalStrategy.NewLinkedArray(sourceName, dims) =>
+              // `new Array[…[C]…](n)`: reflective creation against
+              // the original class of the `__evalClass_C__` binding.
+              gen.newLinkedArray(sourceName, dims, args.head)
+
             case ReflectEvalStrategy.BindingValue(name) =>
               // Raw read of a synthetic binding (linked module
               // instance, non-local-return key).
@@ -158,6 +163,59 @@ private[eval] class ResolveEvalAccess(config: EvalCompilerConfig, store: EvalSto
               && store.linkedClassName(targ.tpe).isDefined =>
           val gen = new Gen(This(config.expressionClass))
           gen.castLinked(transform(qual), store.linkedClassName(targ.tpe).get)
+
+        // `x.isInstanceOf[Array[…[C']…]]` (any dimension count) →
+        // `isLinkedArrayInstance(x, "C", dims)`
+        case tree @ TypeApply(Select(qual, _), targ :: Nil)
+            if tree.symbol == defn.Any_isInstanceOf
+              && store.linkedArrayElemInfo(targ.tpe).isDefined =>
+          val (src, dims) = store.linkedArrayElemInfo(targ.tpe).get
+          val gen = new Gen(This(config.expressionClass))
+          gen.isLinkedArrayInstance(transform(qual), src, dims)
+
+        // `x.asInstanceOf[Array[…[C']…]]` → `castLinkedArray(x, "C",
+        // dims)`, typed as the `Object`-array of the same depth so
+        // array loads/stores still compile directly (sound through
+        // covariance at every depth; the runtime component class is
+        // the original one).
+        case tree @ TypeApply(Select(qual, _), targ :: Nil)
+            if tree.symbol == defn.Any_asInstanceOf
+              && store.linkedArrayElemInfo(targ.tpe).isDefined =>
+          val (src, dims) = store.linkedArrayElemInfo(targ.tpe).get
+          val gen = new Gen(This(config.expressionClass))
+          gen.castLinkedArray(transform(qual), src, dims).cast(objectArrayOfDepth(dims))
+
+        // `newArray(classOf[…C'…], classOf[…], dims)`: the
+        // `ArrayConstructors` intrinsic for `Array.ofDim` (and any
+        // generic array `new` minted after extract). The backend
+        // pattern-matches constant class literals in this shape, so
+        // letting the `classOf` sweep rewrite them would break it;
+        // lower the whole call to the reflective multi-dimensional
+        // creation instead.
+        case tree @ Apply(_, List(Literal(ec), Literal(_), dimsLit: JavaSeqLiteral))
+            if tree.symbol == defn.newArrayMethod && ec.tag == ClazzTag
+              && linkedUltimateElemInfo(ec.typeValue).isDefined =>
+          val (src, elemDims) = linkedUltimateElemInfo(ec.typeValue).get
+          val gen = new Gen(This(config.expressionClass))
+          gen.newLinkedArrayDims(src, elemDims,
+              JavaSeqLiteral(dimsLit.elems.map(transform), TypeTree(defn.IntType)))
+            .cast(objectArrayOfDepth(elemDims + dimsLit.elems.length))
+
+        // An array literal whose element type names a linked class —
+        // directly (`Array(a, b)` after the ArrayApply optimization
+        // rewrote the varargs call into a `JavaSeqLiteral`) or
+        // through array layers (the outer literal of a
+        // multi-dimensional `Array(Array(…), …)`). Re-house the
+        // (transformed) elements in an array whose runtime component
+        // class is the original one; for the outer layers the
+        // elements are the already re-housed inner arrays, and
+        // `arraycopy`'s store checks verify them against the real
+        // component class.
+        case lit: JavaSeqLiteral if linkedSeqLiteralInfo(lit).isDefined =>
+          val (src, dims) = linkedSeqLiteralInfo(lit).get
+          val gen = new Gen(This(config.expressionClass))
+          val objElems = JavaSeqLiteral(lit.elems.map(transform), TypeTree(defn.ObjectType))
+          gen.arrayOfLinked(src, dims, objElems).cast(objectArrayOfDepth(dims))
 
         // Cast to a linked *module* class (typically inserted by
         // erasure when adapting an `Object`-typed module read to a
@@ -213,6 +271,16 @@ private[eval] class ResolveEvalAccess(config: EvalCompilerConfig, store: EvalSto
           val gen = new Gen(This(config.expressionClass))
           gen.linkedClassOf(store.linkedClassName(c.typeValue).get)
 
+        // `classOf[Array[…[C']…]]` constant: the `ClassTag` of a
+        // multi-dimensional array literal's outer layers materializes
+        // as an array-class constant of the re-elaborated element
+        // class. Forward to the original class's array class.
+        case tree @ Literal(c)
+            if c.tag == ClazzTag && store.linkedArrayElemInfo(c.typeValue).isDefined =>
+          val (src, dims) = store.linkedArrayElemInfo(c.typeValue).get
+          val gen = new Gen(This(config.expressionClass))
+          gen.linkedArrayClassOf(src, dims)
+
         case _ => super.transform(tree)
 
     /** Member of a linked local class or linked local module's class.
@@ -226,6 +294,21 @@ private[eval] class ResolveEvalAccess(config: EvalCompilerConfig, store: EvalSto
           (owner.isClass && store.linkedModules.contains(owner))
       }
 
+    /** Element-class info for a `JavaSeqLiteral` whose ultimate
+     *  element names a linked class: the literal itself adds one
+     *  array dimension on top of the element type's own.
+     */
+    private def linkedSeqLiteralInfo(lit: JavaSeqLiteral)(using Context): Option[(String, Int)] =
+      store.linkedClassName(lit.elemtpt.tpe).map((_, 1))
+        .orElse(store.linkedArrayElemInfo(lit.elemtpt.tpe).map((src, d) => (src, d + 1)))
+
+    /** `(sourceName, array depth)` when `tpe` is the linked class
+     *  itself (depth 0) or an array of it (depth ≥ 1).
+     */
+    private def linkedUltimateElemInfo(tpe: Type)(using Context): Option[(String, Int)] =
+      store.linkedClassName(tpe).map((_, 0))
+        .orElse(store.linkedArrayElemInfo(tpe))
+
     /** Runtime bindings-array name for a captured local. Values
      *  introduced by inline expansion were captured under the
      *  reserved `__evalInlined_<name>__` form (recorded per symbol by
@@ -236,6 +319,13 @@ private[eval] class ResolveEvalAccess(config: EvalCompilerConfig, store: EvalSto
     private def localBindingName(variable: TermSymbol)(using Context): String =
       store.inlinedBindingNames.getOrElse(variable, variable.originalName.toString)
   end ExpressionTransformer
+
+  /** `[…[Ljava/lang/Object;` with `dims` array layers: the
+   *  post-erasure cast target for swept linked-array positions
+   *  (sound at every depth through JVM array covariance).
+   */
+  private def objectArrayOfDepth(dims: Int)(using Context): Type =
+    (1 to dims).foldLeft(defn.ObjectType: Type)((t, _) => JavaArrayType(t))
 
   private def evalExpressionBaseClass(using Context): ClassSymbol =
     requiredClass("dotty.tools.eval.EvalExpressionBase")
@@ -280,6 +370,56 @@ private[eval] class ResolveEvalAccess(config: EvalCompilerConfig, store: EvalSto
     def linkedClassOf(sourceName: String): Tree =
       callOnThis("linkedClass", Literal(Constant(sourceName)) :: Nil)
 
+    /** `isLinkedArrayInstance(obj, "C", dims)`: array type test
+     *  against the original component class, with JVM array
+     *  covariance at every depth.
+     */
+    def isLinkedArrayInstance(qualifier: Tree, sourceName: String, dims: Int): Tree =
+      callOnThis("isLinkedArrayInstance",
+        qualifier :: Literal(Constant(sourceName)) :: Literal(Constant(dims)) :: Nil)
+
+    /** `castLinkedArray(obj, "C", dims)`: checked array cast against
+     *  the original component class, typed Object.
+     */
+    def castLinkedArray(qualifier: Tree, sourceName: String, dims: Int): Tree =
+      callOnThis("castLinkedArray",
+        qualifier :: Literal(Constant(sourceName)) :: Literal(Constant(dims)) :: Nil)
+
+    /** `linkedArrayClass("C", dims)`: the original class's
+     *  `dims`-dimensional array class, replacing a
+     *  `classOf[Array[…[C']…]]` constant.
+     */
+    def linkedArrayClassOf(sourceName: String, dims: Int): Tree =
+      callOnThis("linkedArrayClass",
+        Literal(Constant(sourceName)) :: Literal(Constant(dims)) :: Nil)
+
+    /** `newLinkedArrayDims("C", elemDims, dims)`: the reflective
+     *  lowering of the `ArrayConstructors` `newArray` intrinsic.
+     */
+    def newLinkedArrayDims(sourceName: String, elemDims: Int, dims: Tree): Tree =
+      callOnThis("newLinkedArrayDims",
+        Literal(Constant(sourceName)) :: Literal(Constant(elemDims)) :: dims :: Nil)
+
+    /** `newLinkedArray("C", dims, n)`: reflective `Array.newInstance`
+     *  against the original component class. The placeholder's
+     *  `Object[]` args carry the length boxed; the helper takes a
+     *  primitive `Int`.
+     */
+    def newLinkedArray(sourceName: String, dims: Int, length: Tree): Tree =
+      val len =
+        if length.tpe.widen.isPrimitiveValueType then length
+        else dotc.transform.Erasure.Boxing.unbox(length, defn.IntType)
+      callOnThis("newLinkedArray",
+        Literal(Constant(sourceName)) :: Literal(Constant(dims)) :: len :: Nil)
+
+    /** `arrayOfLinked("C", dims, elems)`: re-house an `Object[]` in
+     *  an array whose runtime component class is the original class
+     *  (`dims - 1` array dimensions deep).
+     */
+    def arrayOfLinked(sourceName: String, dims: Int, elems: Tree): Tree =
+      callOnThis("arrayOfLinked",
+        Literal(Constant(sourceName)) :: Literal(Constant(dims)) :: elems :: Nil)
+
     /** Box a primitive-typed tree. The sweep runs after erasure, so
      *  adaptation that the erasure phase would normally insert has
      *  to be done by hand.
@@ -303,6 +443,11 @@ private[eval] class ResolveEvalAccess(config: EvalCompilerConfig, store: EvalSto
       if exp.isRef(defn.UnitClass) then Block(call :: Nil, unitLiteral)
       else if exp.isPrimitiveValueType then dotc.transform.Erasure.Boxing.unbox(call, exp)
       else if store.isLinkedPart(exp) then call
+      else if store.linkedArrayElemInfo(exp).isDefined then
+        // A checkcast naming the re-elaborated class would fail; the
+        // `Object`-array of the same depth is sound through array
+        // covariance.
+        call.cast(objectArrayOfDepth(store.linkedArrayElemInfo(exp).get._2))
       else call.cast(exp)
 
     def getValue(name: String): Tree =
@@ -435,7 +580,8 @@ private[eval] class ResolveEvalAccess(config: EvalCompilerConfig, store: EvalSto
         case pt: PolyType => resultType(pt.resultType)
         case t => t
       def encode(t: Type): String =
-        if store.isLinkedPart(t.widen) then "*"
+        if store.isLinkedPart(t.widen) || store.linkedArrayElemInfo(t.widen).isDefined
+        then "*"
         else JavaEncoding.encode(t)
       val paramTypeNames = valueParamInfos(method.info).map(encode)
       val paramTypesArray = JavaSeqLiteral(

@@ -766,7 +766,11 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
    *  or through nested object/class layers the lifts know how to
    *  hoist through. A marker anywhere else (an object-level `val`
    *  initializer, a parent clause, an extension method) keeps the
-   *  current re-elaboration path for the whole object.
+   *  re-elaboration path for the whole object. A `private` object's
+   *  veto is compensated on the typed side: the rewriter captures
+   *  the live module instance (`__this__`, `__evalModule_<M>__`)
+   *  and ExtractEvalBody links the re-elaborated copy's members
+   *  against it reflectively.
    */
   private def moduleLiftable(mod: ModuleDef)(using Context): Boolean =
     !mod.mods.flags.is(Private)
