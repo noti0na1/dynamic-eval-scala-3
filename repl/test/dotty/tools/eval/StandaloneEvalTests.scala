@@ -368,6 +368,237 @@ class StandaloneEvalTests:
         |""".stripMargin)
     assertEquals(11, r)
 
+  // ===========================================================================
+  // Nested (non-top-level) objects: the eval call sits *inside* a
+  // method of an object that is itself a member of the top-level
+  // object. The wrapper compile used to re-elaborate the whole nested
+  // object, so body reads/writes landed on a fresh module and a
+  // nested case class minted a second JVM class. SpliceEvalBody's
+  // module lift now drops the declaration and hoists the
+  // marker-bearing def next to an `import <Obj>.{given, *}`, so the
+  // body links against the *live* module on the classpath; private
+  // members reroute through the reflective helpers with the object
+  // itself as receiver.
+  // ===========================================================================
+
+  @Test def nestedObjectLiveState(): Unit =
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |object Main:
+        |  object Outer:
+        |    var n = 0
+        |    def bump(): Unit = eval[Unit]("n += 10")
+        |  def run(): Any =
+        |    Outer.n = 1
+        |    Outer.bump()
+        |    Outer.n
+        |""".stripMargin)
+    assertEquals(11, r)
+
+  @Test def nestedObjectSiblingObjectState(): Unit =
+    // The body touches a *sibling* nested object of the lifted one;
+    // `Counter` resolves through the injected `import Outer.{given, *}`
+    // to the live `Main.Outer.Counter`.
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |object Main:
+        |  object Outer:
+        |    object Counter:
+        |      var n = 0
+        |    def bump(): Unit = eval[Unit]("Counter.n += 10")
+        |  def run(): Any =
+        |    Outer.Counter.n = 1
+        |    Outer.bump()
+        |    Outer.Counter.n
+        |""".stripMargin)
+    assertEquals(11, r)
+
+  @Test def doublyNestedObjectLiveState(): Unit =
+    // The marker sits two object layers deep; the lift recurses,
+    // emitting one import per dropped layer (outermost first) so the
+    // inner object's name resolves through the outer one's import.
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |object Main:
+        |  object Outer:
+        |    object Inner:
+        |      var n = 0
+        |      def bump(): Unit = eval[Unit]("n += 10")
+        |  def run(): Any =
+        |    Outer.Inner.n = 1
+        |    Outer.Inner.bump()
+        |    Outer.Inner.n
+        |""".stripMargin)
+    assertEquals(11, r)
+
+  @Test def caseClassInNestedObject(): Unit =
+    // The body constructs an instance of a case class declared next
+    // to the lifted def. `Pt` resolves to the live classpath class,
+    // so the instance pattern-matches outside against `Main.Outer.Pt`
+    // (previously: the wrapper minted a second `Pt` and the call
+    // failed to compile at the expected-type boundary).
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |object Main:
+        |  object Outer:
+        |    case class Pt(x: Int, y: Int)
+        |    def mk(): Pt = eval[Pt]("Pt(3, 4)")
+        |  def run(): Any =
+        |    Outer.mk() match
+        |      case Main.Outer.Pt(a, b) => a + b
+        |""".stripMargin)
+    assertEquals(7, r)
+
+  @Test def caseClassInNestedObjectPatternInBody(): Unit =
+    // Opposite direction: the instance is built outside, captured as
+    // a method param, and destructured *inside* the body through the
+    // live companion's unapply.
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |object Main:
+        |  object Outer:
+        |    case class Pt(x: Int, y: Int)
+        |    def sum(p: Pt): Int = eval[Int]("p match { case Pt(a, b) => a + b }")
+        |  def run(): Any = Outer.sum(Outer.Pt(20, 22))
+        |""".stripMargin)
+    assertEquals(42, r)
+
+  @Test def privateValOfNestedObject(): Unit =
+    // Unlike a top-level object (whose privates the embedded wildcard
+    // import cannot expose), a *nested* object's privates are
+    // collected from the dropped declaration and rerouted through the
+    // reflective helpers with the live module as receiver.
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |object Main:
+        |  object Outer:
+        |    private val secret = 41
+        |    def reveal(): Int = eval[Int]("secret + 1")
+        |  def run(): Any = Outer.reveal()
+        |""".stripMargin)
+    assertEquals(42, r)
+
+  @Test def privateVarOfNestedObjectWrite(): Unit =
+    // A bare write to a private var of the lifted object lands on the
+    // live instance through `__refl_set__`.
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |object Main:
+        |  object Outer:
+        |    private var count = 1
+        |    def bump(): Unit = eval[Unit]("count = count + 10")
+        |    def current: Int = count
+        |  def run(): Any =
+        |    Outer.bump()
+        |    Outer.current
+        |""".stripMargin)
+    assertEquals(11, r)
+
+  @Test def nestedObjectMethodRecursionThroughEval(): Unit =
+    // The hoisted def is renamed (`__eval_fact__`), so the body's
+    // `fact(n - 1)` resolves through the import to the live
+    // `Outer.fact`: each recursive step re-enters the real method
+    // (and its eval call) rather than the wrapper's drained stub.
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |object Main:
+        |  object Outer:
+        |    def fact(n: Int): Int =
+        |      if n <= 1 then 1 else eval[Int]("n * fact(n - 1)")
+        |  def run(): Any = Outer.fact(5)
+        |""".stripMargin)
+    assertEquals(120, r)
+
+  @Test def thisInsideNestedObjectBody(): Unit =
+    // A singleton's `this` *is* the module: plain `this` in the body
+    // rewrites to the object's own name.
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |object Main:
+        |  object Outer:
+        |    val base = 20
+        |    def calc(): Int = eval[Int]("this.base + Outer.base + 2")
+        |  def run(): Any = Outer.calc()
+        |""".stripMargin)
+    assertEquals(42, r)
+
+  @Test def givenInNestedObject(): Unit =
+    // The injected `import Outer.{given, *}` carries the `given`
+    // selector, so the body's implicit search resolves the object's
+    // given members.
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |object Main:
+        |  object Outer:
+        |    given Int = 7
+        |    def calc(): Int = eval[Int]("summon[Int] * 6")
+        |  def run(): Any = Outer.calc()
+        |""".stripMargin)
+    assertEquals(42, r)
+
+  @Test def classInsideNestedObject(): Unit =
+    // Mixed nesting: the marker is in a method of a *class* declared
+    // inside a nested object. The class lift composes with the module
+    // lift: the lifted def's `__this__` parameter is typed
+    // `Outer.W` (a static path through the dropped object's import),
+    // and the body reaches the object's members through the sibling
+    // import.
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |object Main:
+        |  object Outer:
+        |    val bonus = 5
+        |    class W(val v: Int):
+        |      def m(): Int = eval[Int]("v + bonus")
+        |  def run(): Any = new Outer.W(37).m()
+        |""".stripMargin)
+    assertEquals(42, r)
+
+  @Test def returnFromNestedObjectMethod(): Unit =
+    // The non-local-return wrap composes with the module lift: the
+    // body's `return` targets the hoisted def and lowers to the
+    // keyed control throw the call site catches.
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |object Main:
+        |  object Outer:
+        |    def f(): Int = eval[Int]("return 42")
+        |  def run(): Any = Outer.f()
+        |""".stripMargin)
+    assertEquals(42, r)
+
+  // ===========================================================================
+  // Eval inside a local class's methods, and body-defined case classes
+  // (standalone twins of the REPL tests in DynamicEvalTests).
+  // ===========================================================================
+
+  @Test def evalInsideLocalClassMethod(): Unit =
+    // Bare `k` in the body carries an implicit `L.this` prefix; it
+    // lowers through the captured `__this__` (the live instance)
+    // with receiver-class reflection.
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |object Main:
+        |  def run(): Any =
+        |    class L(val k: Int):
+        |      def reach: Int = eval[Int]("k * 3")
+        |    (new L(11)).reach
+        |""".stripMargin)
+    assertEquals(33, r)
+
+  @Test def bodyDefinesCaseClass(): Unit =
+    // The case class (and its synthesised companion) is declared
+    // inside the body string itself; its `this` references are
+    // ordinary same-class reads, and the whole bundle moves into
+    // `evaluate` with the body.
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |object Main:
+        |  def run(): Any =
+        |    eval[Int]("case class Local(a: Int, b: Int); val l = Local(7, 8); l.a * l.b")
+        |""".stripMargin)
+    assertEquals(56, r)
+
   @Test def returnInsideBodyLocalDefWorks(): Unit =
     // The boundary of the limitation: a `return` from a def declared
     // *inside* the body stays a local return. The def moves into

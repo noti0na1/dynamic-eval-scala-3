@@ -214,6 +214,18 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
         case tree: ValDef if isExpressionVal(tree.symbol) =>
           bodyTree = tree.rhs
           store.store(tree.symbol)
+          // Record classes the body itself declares: after LambdaLift
+          // and Flatten they live outside `__Expression`, so
+          // ResolveEvalAccess needs the symbols to find their
+          // placeholders (a body-local class method can carry
+          // reflectEval placeholders for outer captures).
+          val classCollector = new TreeTraverser:
+            def traverse(t: Tree)(using Context): Unit = t match
+              case td: TypeDef if td.isClassDef =>
+                store.bodyLocalClasses += td.symbol
+                traverseChildren(t)
+              case _ => traverseChildren(t)
+          classCollector.traverse(tree.rhs)
           val defaultRhs = Literal(Constant(null)).cast(tree.tpt.tpe).withSpan(tree.rhs.span)
           cpy.ValDef(tree)(rhs = defaultRhs)
 
@@ -251,6 +263,13 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
       case tree: This =>
         val cls = tree.symbol
         if cls == config.expressionClass then super.transform(tree)
+        else if isLocalToBody(cls) then
+          // `this` of a class declared *inside* the eval body (e.g.
+          // the synthesised members of a body-local case class, which
+          // read fields as `Local.this.a`). The class moves into
+          // `evaluate` together with the body, so its `this` stays an
+          // ordinary same-class reference.
+          super.transform(tree)
         else if cls.is(ModuleClass) && isGloballyAccessible(cls) then
           super.transform(tree)
         else if cls.isClass && store.classOwners.contains(cls) then
@@ -375,6 +394,17 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
           callMethod(tree, transformedQualifier(tree), sym.asTerm, Nil)
         else if isOuterMethodLocalDef(sym) then
           captureLocalMethod(tree, sym.asTerm, Nil)
+        else if isTermOwnedClassFieldAccess(tree) then
+          // Bare reference to a (public) member of a term-owned class:
+          // the implicit-`this`-prefix form of the Select case below.
+          // Reached when the eval call sits inside a method of a
+          // *local* class and the body names a member directly
+          // (`eval("k * 3")` inside `class L(val k: Int)`); the
+          // qualifier is synthesised from the captured `this` chain.
+          getField(tree, transformedQualifier(tree), sym.asTerm)
+        else if isTermOwnedClassMethodCall(tree) then
+          // Same, for a parameterless method named bare in the body.
+          callMethod(tree, transformedQualifier(tree), sym.asTerm, Nil)
         else
           report.error(
             s"eval: cannot reference outer symbol `${sym.name}` (owner: ${sym.owner}).",
@@ -486,9 +516,6 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
       val castTo = if isTermOwnedSymbol(cls) then defn.ObjectType else cls.typeRef
       buildReflectEvalCast(tree, nullLiteral, ReflectEvalStrategy.This(cls), Nil, castTo)
 
-    private def getOuter(tree: Tree, qualifier: Tree, outerCls: ClassSymbol)(using Context): Tree =
-      buildReflectEvalCast(tree, qualifier, ReflectEvalStrategy.Outer(outerCls), Nil, outerCls.typeRef)
-
     private def buildReflectEvalCast(
         tree: Tree,
         qualifier: Tree,
@@ -574,13 +601,17 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
         !isLocalToBody(sym) &&
         !sym.isPrivate && !sym.is(Protected)
 
-    /** True when `cls` is owned by a term-level scope (a method or
-     *  block) — i.e. a class declared inside a `def` or other term.
-     *  REPL session classes are owned by a module class (not a term)
-     *  so they pass through.
+    /** True when `cls` is owned, possibly transitively through other
+     *  classes, by a term-level scope (a method or block): a class
+     *  declared inside a `def`, including a class nested in another
+     *  method-local class. Such classes are re-elaborated by the
+     *  wrapper compile, so member access on their instances must go
+     *  through receiver-class reflection. REPL session classes are
+     *  owned by a module class (never through a term) so they pass
+     *  through.
      */
     private def isTermOwnedSymbol(cls: Symbol)(using Context): Boolean =
-      cls.exists && cls.maybeOwner.exists && cls.maybeOwner.isTerm
+      cls.exists && cls.ownersIterator.exists(_.isTerm)
 
     /** True when `tpe`'s widened typeSymbol is a term-owned class. */
     private def isTermOwnedClass(tpe: Type)(using Context): Boolean =
@@ -680,16 +711,18 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
           nullLiteral
       case _ => nullLiteral
 
-    /** Build a chain of `getThisObject` + zero or more `getOuter`
-     *  steps that yields a `cls` instance at runtime.
+    /** Yield a `cls` instance at runtime: `getThisObject()` for the
+     *  innermost enclosing class, and a `__this__<ClassName>` binding
+     *  read for an outer one.
      *
-     *  Example: with `cls = Outer` and
-     *  `classOwners = [Inner, Middle, Outer, ...]`:
-     *  {{{
-     *  getThisObject()
-     *    .getOuter(_, Middle)   // Inner -> Middle
-     *    .getOuter(_, Outer)    // Middle -> Outer
-     *  }}}
+     *  The binding read is deliberate: a chain of `$outer` walks
+     *  would only work when the original class happened to need an
+     *  outer pointer of its own (a class whose only outer reference
+     *  sits inside the eval body string gets none). The rewriter
+     *  captures one `__this__<Name>` binding per enclosing class at
+     *  the call site, and that capture makes the *original* compile
+     *  thread the outer access, so the binding always holds the
+     *  right instance.
      */
     private def thisOrOuterValue(tree: Tree, cls: ClassSymbol)(using Context): Tree =
       // Globally-accessible module: the singleton is reachable via
@@ -703,10 +736,16 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
       if target < 0 then
         report.error(s"internal error: class `${cls.name}` not in classOwners", tree.srcPos)
         return getThisObject(tree, cls)
-      val ths = getThisObject(tree, owners.head.asClass)
-      owners.iterator.drop(1).take(target).foldLeft(ths) { (inner, outerSym) =>
-        getOuter(tree, inner, outerSym)
-      }
+      if target == 0 then getThisObject(tree, owners.head.asClass)
+      else
+        // Same cast rule as `getThisObject`: surrounding member
+        // selects need the class type, except for term-owned classes
+        // whose wrapper symbol is a different JVM class from the
+        // runtime instance.
+        val castTo = if isTermOwnedSymbol(cls) then defn.ObjectType else cls.typeRef
+        buildReflectEvalCast(tree, nullLiteral,
+          ReflectEvalStrategy.BindingValue(s"__this__${cls.name}"),
+          Nil, castTo)
 
     private def reflectEvalPlaceholder(
         tree: Tree,

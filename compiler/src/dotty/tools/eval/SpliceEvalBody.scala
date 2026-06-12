@@ -2,7 +2,7 @@ package dotty.tools
 package eval
 
 import dotty.tools.dotc.ast.untpd.*
-import dotty.tools.dotc.core.Constants.Constant
+import dotty.tools.dotc.core.Constants.*
 import dotty.tools.dotc.core.Contexts.*
 import dotty.tools.dotc.core.Decorators.*
 import dotty.tools.dotc.core.Flags.*
@@ -74,18 +74,24 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
     privateFieldsByThis = Map.empty
     privateMethodsByThis = Map.empty
     liftedDefParamNames = Set.empty
+    bodyThisReceiver = termName("__this__")
+    liftedScopeReceivers = Map.empty
+    selfAliasReceivers = Map.empty
     // Pre-pass: lift each marker-bearing method out of its enclosing
-    // class. Otherwise the wrapper's compile emits a second class
-    // under the same source name as the REPL session's already-loaded
-    // copy, and instances crossing the two loaders fail `checkcast`
-    // ("X cannot be cast to X (different loaders)").
+    // class or nested `object`. Otherwise the wrapper's compile emits
+    // a second class under the same source name as the already-loaded
+    // copy: instances crossing the two loaders fail `checkcast`
+    // ("X cannot be cast to X (different loaders)"), and for an
+    // `object` the body's reads and writes land on the re-elaborated
+    // module's fresh state instead of the live one.
     //
     // Gated on `import rs$line$N.{*}` (REPL) or `config.standalone`:
-    // the lift drops the class declaration, so it's only safe when
-    // the class is reachable elsewhere, either as the REPL session's
-    // compiled copy or (standalone) as the program's own classes on
-    // the runtime classpath. Bridge-test fixtures have neither and
-    // rely on the wrapper to be the only source of the class.
+    // the lift drops the declaration, so it's only safe when the
+    // class/object is reachable elsewhere, either as the REPL
+    // session's compiled copy or (standalone) as the program's own
+    // classes on the runtime classpath. Bridge-test fixtures have
+    // neither and rely on the wrapper to be the only source of the
+    // class.
     val hasReplSessionImport = sourceImportsReplSession(ctx.compilationUnit.untpdTree)
     val extractor = new ClassMethodExtractor
     val lifted =
@@ -153,6 +159,13 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
               if privateFieldsByThis.get(qual.toTermName).exists(_.contains(name.toTermName)) =>
             mkReflSet(qual.toTermName, name.toTermName, transform(rhs)).withSpan(tree.span)
 
+          // Write: bare `name = rhs` for a private innermost-scope
+          // field (not shadowed by a lifted-def param).
+          case Assign(Ident(name), rhs)
+              if privateFieldsInScope.contains(name.toTermName)
+                && !liftedDefParamNames.contains(name.toTermName) =>
+            mkReflSet(bodyThisReceiver, name.toTermName, transform(rhs)).withSpan(tree.span)
+
           // Method call: `qual.m(args*)`.
           case tree @ Apply(Select(Ident(qual), name), args)
               if privateMethodsByThis.get(qual.toTermName).exists(_.contains(name.toTermName)) =>
@@ -165,7 +178,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
               if privateMethodsInScope.contains(name.toTermName)
                 && !liftedDefParamNames.contains(name.toTermName) =>
             val n = name.toTermName
-            mkReflCall(termName("__this__"), n, args.map(transform), privateMethodsInScope(n)).withSpan(tree.span)
+            mkReflCall(bodyThisReceiver, n, args.map(transform), privateMethodsInScope(n)).withSpan(tree.span)
 
           // Field read: `qual.name` (post-This-rewrite, qual is
           // `__this__` or `__this__<Outer>`).
@@ -187,7 +200,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
           case id @ Ident(name)
               if privateFieldsInScope.contains(name.toTermName)
                 && !liftedDefParamNames.contains(name.toTermName) =>
-            mkReflGet(termName("__this__"), name.toTermName,
+            mkReflGet(bodyThisReceiver, name.toTermName,
               privateFieldsInScope(name.toTermName)).withSpan(id.span)
 
           // Bare `name`: nullary call to a private innermost-scope
@@ -195,7 +208,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
           case id @ Ident(name)
               if privateMethodsInScope.contains(name.toTermName)
                 && !liftedDefParamNames.contains(name.toTermName) =>
-            mkReflCall(termName("__this__"), name.toTermName, Nil,
+            mkReflCall(bodyThisReceiver, name.toTermName, Nil,
               privateMethodsInScope(name.toTermName)).withSpan(id.span)
 
           // Don't rewrite declaration-position Idents.
@@ -211,13 +224,16 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
    *  the reflective `Any` back at the field's declared type so the
    *  surrounding expression keeps its type. The `tpt` is duplicated
    *  to avoid sharing tree nodes with the dropped class declaration.
+   *  With no recoverable type (inferred declaration, non-literal
+   *  initializer) the cast is skipped and the read types as `Any`.
    */
   private def mkReflGet(thisName: TermName, fieldName: TermName, tpt: Tree)(using Context): Tree =
     val call = Apply(
       Ident(termName("__refl_get__")),
       List(Ident(thisName), Literal(Constant(fieldName.toString)))
     )
-    TypeApply(Select(call, termName("asInstanceOf")), List(freshTypeTree(tpt)))
+    if tpt.isEmpty then call
+    else TypeApply(Select(call, termName("asInstanceOf")), List(freshTypeTree(tpt)))
 
   /** Fresh copy of an untyped type tree, recursively duplicating
    *  nested `Ident`/`AppliedTypeTree`/`Select` shapes so no node
@@ -260,7 +276,8 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
         argArray
       )
     )
-    TypeApply(Select(rawCall, termName("asInstanceOf")), List(freshTypeTree(retTpt)))
+    if retTpt.isEmpty then rawCall
+    else TypeApply(Select(rawCall, termName("asInstanceOf")), List(freshTypeTree(retTpt)))
 
   /** Inject typer-only stubs of `__refl_get__/_set__/_call__` into the
    *  wrapper module. The bodies are `???` because no one ever calls
@@ -315,32 +332,71 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
         case _ => super.transform(tree)
     rewriter.transform(body)
 
-  /** Walk the parsed body and replace each plain `This(EmptyType)`
-   *  node with `Ident(__this__)`. Used after [[ClassMethodExtractor]]
-   *  lifts one or more methods out of an enclosing class — the body's
-   *  original `this` no longer has the class as its enclosing
-   *  `This` after the lift, so leaving them in would resolve to
-   *  the wrapper module.
+  /** Walk the parsed body and redirect `this` references at the
+   *  receivers the lift left behind. Used after
+   *  [[ClassMethodExtractor]] lifts one or more methods out of an
+   *  enclosing class or object: the body's original `this` no longer
+   *  has the declaration as its enclosing `This` after the lift, so
+   *  leaving it in would resolve to the wrapper module.
    *
-   *  *Qualified* `OuterClass.this` is left alone; those resolve via
-   *  the typer's outer-chain machinery and are subsequently lowered
-   *  by [[ExtractEvalBody]]'s `This` strategy.
+   *    - plain `this` → the innermost receiver ([[bodyThisReceiver]]);
+   *    - qualified `<Name>.this` of a dropped layer → that layer's
+   *      receiver ([[liftedScopeReceivers]]);
+   *    - a declared self alias → its layer's receiver
+   *      ([[selfAliasReceivers]]).
+   *
+   *  Inside a class/object the body itself declares, the plain-`this`
+   *  rewrite is suspended (that `this` belongs to the body-local
+   *  type) while the qualified and alias rewrites still apply, so a
+   *  body-defined `class B` can reach the dropped `A` via `A.this.x`.
    */
   private def rewriteThisInBody(body: Tree)(using Context): Tree =
-    val thisName = termName("__this__")
     val rewriter = new UntypedTreeMap:
+      /** Inside a class/object declared by the body itself. Plain
+       *  `this` (and a qualified `this` naming that body-local type)
+       *  belongs to the body-local type and stays; a qualified
+       *  `this` naming a *dropped* enclosing layer still rewrites,
+       *  as do self aliases.
+       */
+      private var inBodyLocalClass = false
       override def transform(tree: Tree)(using Context): Tree = tree match
         case t @ This(qual) if qual.name.isEmpty =>
-          Ident(thisName).withSpan(t.span)
-        case t @ This(qual) =>
-          // Qualified `OuterName.this` — point at the corresponding
-          // `__this__<OuterName>` parameter the lifted def carries,
-          // matching the binding names `EvalRewriteTyped` emits.
-          Ident(termName(s"__this__${qual.name}")).withSpan(t.span)
-        // Don't descend into a body-local class/object: its inner
-        // `this` refers to that nested type, not to the enclosing
-        // class we lifted out of.
-        case _: TypeDef | _: ModuleDef => tree
+          // `__this__` after a class lift; the object's own name
+          // after a module lift (a singleton's `this` IS the module).
+          if inBodyLocalClass then t
+          else Ident(bodyThisReceiver).withSpan(t.span)
+        case t @ This(qual) if liftedScopeReceivers.contains(qual.name.toTypeName) =>
+          // Qualified `OuterName.this` of a dropped layer — point at
+          // that layer's receiver: `__this__` for the innermost
+          // lifted class, the `__this__<OuterName>` parameter for an
+          // outer class (matching the binding names
+          // `EvalRewriteTyped` emits), the object itself for a
+          // lifted static module.
+          Ident(liftedScopeReceivers(qual.name.toTypeName)).withSpan(t.span)
+        case t: This =>
+          // Qualified `this` of a body-local type (or of a class the
+          // lift never touched): leave it for the typer.
+          t
+        // A declared self alias of a dropped class/object layer is
+        // another name for that layer's `this`; redirect it at the
+        // matching receiver.
+        case id @ Ident(name) if selfAliasReceivers.contains(name.toTermName) =>
+          Ident(selfAliasReceivers(name.toTermName)).withSpan(id.span)
+        // Descend into a body-local class/object with the
+        // plain-`this` rewrite suspended: its `this` refers to that
+        // nested type, but qualified `this` naming a dropped layer
+        // (`A.this.x` inside a body-defined `class B`) still needs
+        // the receiver redirect.
+        case td: TypeDef if td.isClassDef =>
+          val saved = inBodyLocalClass
+          inBodyLocalClass = true
+          try super.transform(td)
+          finally inBodyLocalClass = saved
+        case mod: ModuleDef =>
+          val saved = inBodyLocalClass
+          inBodyLocalClass = true
+          try super.transform(mod)
+          finally inBodyLocalClass = saved
         case _ => super.transform(tree)
     rewriter.transform(body)
 
@@ -414,6 +470,30 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
   private var privateFieldsByThis: Map[TermName, Map[TermName, Tree]] = Map.empty
   private var privateMethodsByThis: Map[TermName, Map[TermName, Tree]] = Map.empty
 
+  /** Receiver for plain `this` in the body after a lift: `__this__`
+   *  when the marker-bearing def was lifted out of a class, the
+   *  object's own (statically reachable) name when it was lifted
+   *  out of a static module. Reset per `run`.
+   */
+  private var bodyThisReceiver: TermName = termName("__this__")
+
+  /** Scope-name → receiver-term mapping for every class/object layer
+   *  a lift dropped. Drives the qualified `<Name>.this` body rewrite:
+   *  the innermost lifted class maps to `__this__`, outer class
+   *  layers to their `__this__<Name>` parameter, module layers to
+   *  the object's own name. Innermost-wins on name collisions.
+   *  Reset per `run`.
+   */
+  private var liftedScopeReceivers: Map[TypeName, TermName] = Map.empty
+
+  /** Declared self-alias name → receiver-term mapping for the
+   *  class/object layers a lift dropped (`class A: self =>` makes
+   *  `self` another name for `A.this`). The body rewrite redirects
+   *  bare references to the alias at the matching receiver. Reset
+   *  per `run`.
+   */
+  private var selfAliasReceivers: Map[TermName, TermName] = Map.empty
+
   /** Value-param names on the lifted def. The body rewriter consults
    *  this to avoid shadowing a method param with a same-named private
    *  class member. Reset per `run`.
@@ -421,12 +501,12 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
   private var liftedDefParamNames: Set[TermName] = Set.empty
 
   /** Innermost-scope privates — those reachable without an explicit
-   *  `this.` qualifier in the original class body.
+   *  `this.` qualifier in the original class or object body.
    */
   private def privateFieldsInScope: Map[TermName, Tree] =
-    privateFieldsByThis.getOrElse(termName("__this__"), Map.empty)
+    privateFieldsByThis.getOrElse(bodyThisReceiver, Map.empty)
   private def privateMethodsInScope: Map[TermName, Tree] =
-    privateMethodsByThis.getOrElse(termName("__this__"), Map.empty)
+    privateMethodsByThis.getOrElse(bodyThisReceiver, Map.empty)
 
   /** Pre-pass that lifts each marker-bearing method out of its
    *  enclosing class:
@@ -469,9 +549,17 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
       case _ => super.transform(tree)
 
     private def transformTopStat(stat: Tree)(using Context): List[Tree] = stat match
-      case td: TypeDef if td.isClassDef && containsMarker(td) =>
+      case td: TypeDef if td.isClassDef && containsMarker(td) && classLiftable(td) =>
         didLift = true
         liftClassMethods(td)
+      case td: TypeDef if td.isClassDef && containsMarker(td) =>
+        // Marker in a position the class lift can't hoist (a
+        // template-level statement, a parent argument): keep the
+        // re-elaborated class so the splice lands in place. The
+        // typed path still threads `this` through the captured
+        // owner chain; only the duplicate-class minting is not
+        // avoided.
+        List(td)
       case dd: DefDef if containsMarker(dd) =>
         // Top-level marker-bearing def: rename it so the wrapper's
         // copy doesn't shadow `import rs$line$N.{*}`'s already-
@@ -481,9 +569,129 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
         // *real* function, not the wrapper's stub whose RHS gets
         // drained into `__Expression.evaluate` by ExtractEvalBody).
         List(renameTopLevelDef(dd))
+      case mod: ModuleDef
+          if containsMarker(mod) && !isWrapperModule(mod) && moduleLiftable(mod) =>
+        // Marker inside a nested (non-top-level) `object`: drop the
+        // declaration and lift, so the body links against the *live*
+        // module on the classpath instead of a re-elaborated copy
+        // with fresh state and duplicate nested classes.
+        didLift = true
+        liftModuleMethods(mod, outerScopes = Nil)
       case mod: ModuleDef => List(transform(mod))
       case other => List(other)
   end ClassMethodExtractor
+
+  /** The synthesised `__EvalWrapper_<uuid>` module that hosts the
+   *  spliced enclosing source. It always contains the marker but must
+   *  never be dropped by the module lift.
+   */
+  private def isWrapperModule(mod: ModuleDef): Boolean =
+    mod.name.toString.contains(ExtractEvalBody.WrapperMarker)
+
+  /** True iff the module lift can handle every marker occurrence
+   *  inside `mod`: the object is reachable by name at runtime (not
+   *  `private`), and the marker sits inside a `def`, either directly
+   *  or through nested object/class layers the lifts know how to
+   *  hoist through. A marker anywhere else (an object-level `val`
+   *  initializer, a parent clause, an extension method) keeps the
+   *  current re-elaboration path for the whole object.
+   */
+  private def moduleLiftable(mod: ModuleDef)(using Context): Boolean =
+    !mod.mods.flags.is(Private)
+      && !mod.impl.parents.exists(containsMarker)
+      && mod.impl.body.forall {
+        case stat if !containsMarker(stat) => true
+        case _: DefDef => true
+        case nested: ModuleDef => moduleLiftable(nested)
+        case td: TypeDef if td.isClassDef => classLiftable(td)
+        case _ => false
+      }
+
+  /** True iff the class lift can hoist every marker occurrence inside
+   *  `td`: markers must sit in a `def`, a `val`/`var` initializer
+   *  (lifted as a def), or a nested class satisfying the same rule.
+   *  A marker anywhere else (a template-level statement, a parent
+   *  argument) vetoes the lift; the class is then kept so the splice
+   *  lands in place instead of being dropped with the declaration.
+   */
+  private def classLiftable(td: TypeDef)(using Context): Boolean =
+    td.rhs match
+      case tmpl: Template =>
+        !tmpl.parents.exists(containsMarker)
+          && !tmpl.constr.paramss.exists(_.exists(containsMarker))
+          && tmpl.body.forall {
+            case stat if !containsMarker(stat) => true
+            case _: DefDef => true
+            case _: ValDef => true
+            case nested: TypeDef if nested.isClassDef => classLiftable(nested)
+            case _ => false
+          }
+      case _ => false
+
+  /** Lift the marker-bearing method out of a *static* nested
+   *  `object` (every enclosing layer up to the wrapper is also an
+   *  object). The runtime module is reachable on the classpath (or
+   *  through the REPL session imports), so instead of re-elaborating
+   *  the object (which would mint a second module class whose state
+   *  is fresh and whose nested classes duplicate the originals), we:
+   *
+   *    - drop the object declaration entirely;
+   *    - emit a sibling `import <Obj>.{given, *}` in its place, so
+   *      the hoisted def's signature and body resolve members
+   *      against the *live* module;
+   *    - hoist the marker-bearing def, renamed like a top-level def
+   *      so body references to its original name resolve to the
+   *      live module's copy (recursion re-enters the real method);
+   *    - record the object's private members keyed by its name, so
+   *      the body rewriter reroutes them through the reflective
+   *      helpers (the wildcard import does not expose privates).
+   *
+   *  `outerScopes` carries the enclosing module scopes
+   *  innermost-first, mirroring [[liftClassMethodsRec]].
+   */
+  private def liftModuleMethods(mod: ModuleDef, outerScopes: List[OuterScope])(using Context): List[Tree] =
+    val modName = mod.name.toTermName
+    val tmpl = mod.impl
+    val scope = OuterScope(
+      modName.toTypeName, Ident(modName), Nil,
+      templateMemberNames(tmpl), templatePrivateFields(tmpl), templatePrivateMethods(tmpl),
+      isModule = true)
+    val newOuters = scope :: outerScopes
+    // Keyed by the object's own name: that's the qualifier the body
+    // rewriter sees for `M.x`, post-This-rewrite `this` references,
+    // and (as the innermost receiver) bare member references.
+    privateFieldsByThis = privateFieldsByThis.updated(modName, scope.privateFields)
+    privateMethodsByThis = privateMethodsByThis.updated(modName, scope.privateMethods)
+    liftedScopeReceivers = liftedScopeReceivers.updated(mod.name.toTypeName, modName)
+    templateSelfAlias(tmpl).foreach { alias =>
+      selfAliasReceivers = selfAliasReceivers.updated(alias, modName)
+    }
+    val importStat: Tree = Import(
+      Ident(modName),
+      List(ImportSelector(Ident(nme.EMPTY)), ImportSelector(Ident(nme.WILDCARD)))
+    ).withSpan(mod.span)
+    val hoisted = tmpl.body.flatMap {
+      case dd: DefDef if containsMarker(dd) =>
+        bodyThisReceiver = modName
+        liftedDefParamNames = dd.paramss.flatMap { ps =>
+          ps.collect { case vd: ValDef => vd.name }
+        }.toSet ++ liftedDefParamNames
+        List(renameLiftedModuleDef(dd))
+      case nested: ModuleDef if containsMarker(nested) =>
+        liftModuleMethods(nested, newOuters)
+      case td: TypeDef if td.isClassDef && containsMarker(td) =>
+        liftClassMethodsRec(td, newOuters)
+      case _ => Nil
+    }
+    importStat :: hoisted
+
+  /** [[renameTopLevelDef]] for a def hoisted out of a static module,
+   *  additionally stripping `override` (the parent the def overrode
+   *  is gone after the lift).
+   */
+  private def renameLiftedModuleDef(dd: DefDef)(using Context): DefDef =
+    val renamed = renameTopLevelDef(dd)
+    renamed.withMods(renamed.mods.withFlags(renamed.mods.flags &~ Override))
 
   /** Rename a top-level marker-bearing DefDef so the original name
    *  resolves through the wrapper's auto-import to the REPL session
@@ -563,30 +771,47 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
     // `__this__<OuterName>` parameter — `def m(__this__A: A,
     // __this__: __this__A.B)` — because `A.B` (bare static path)
     // doesn't resolve when A is a class, only when A is an object.
-    // The prefix-paramName comes from the immediate outer scope
-    // (the parent class), if any.
-    val outerThisNames = outerScopes.map(s => termName(s"__this__${s.name}"))
-    val typeRef = applyClassTypeParams(td, tparams, outerThisNames)
+    // The prefix comes from the immediate outer scope: for a class
+    // it's its `__this__<Name>` parameter, for a static module it's
+    // the object's own name (`Select(Ident(M), C)` resolves through
+    // the sibling `import` the module lift emits).
+    val outerReceiverNames = outerScopes.map(receiverName)
+    val typeRef = applyClassTypeParams(td, tparams, outerReceiverNames)
     val members = classMemberNames(td)
     val privateFields = classPrivateFields(td)
     val privateMethods = classPrivateMethods(td)
-    val scope = OuterScope(td.name, typeRef, tparams, members, privateFields, privateMethods)
+    val scope = OuterScope(td.name, typeRef, tparams, members, privateFields, privateMethods,
+      selfAlias = templateSelfAlias(tmpl))
     val newOuters = scope :: outerScopes
+    // Record per-qualifier private fields/methods for the body
+    // rewriter. The innermost class is reached via `__this__`; each
+    // outer enclosing class via `__this__<OuterName>`. These are the
+    // qualifiers `rewriteThisInBody` produces for
+    // `OuterName.this`-style references. A declared self alias
+    // (`self =>`) maps to the same receiver, so a body naming the
+    // alias resolves after the class declaration is dropped.
+    def recordScopes(): Unit =
+      val innermostThis = termName("__this__")
+      privateFieldsByThis = privateFieldsByThis.updated(innermostThis, privateFields)
+      privateMethodsByThis = privateMethodsByThis.updated(innermostThis, privateMethods)
+      templateSelfAlias(tmpl).foreach { alias =>
+        selfAliasReceivers = selfAliasReceivers.updated(alias, innermostThis)
+      }
+      // Outer layers first, the innermost last, so an inner scope
+      // wins a name collision (matching lexical shadowing).
+      outerScopes.reverse.foreach { s =>
+        val q = receiverName(s)
+        privateFieldsByThis = privateFieldsByThis.updated(q, s.privateFields)
+        privateMethodsByThis = privateMethodsByThis.updated(q, s.privateMethods)
+        liftedScopeReceivers = liftedScopeReceivers.updated(s.name, q)
+        s.selfAlias.foreach { alias =>
+          selfAliasReceivers = selfAliasReceivers.updated(alias, q)
+        }
+      }
+      liftedScopeReceivers = liftedScopeReceivers.updated(td.name.toTypeName, innermostThis)
     tmpl.body.flatMap {
       case dd: DefDef if containsMarker(dd) =>
-        // Record per-qualifier private fields/methods for the body
-        // rewriter. The innermost class is reached via `__this__`;
-        // each outer enclosing class via `__this__<OuterName>`.
-        // These are the qualifiers `rewriteThisInBody` produces for
-        // `OuterName.this`-style references.
-        val innermostThis = termName("__this__")
-        privateFieldsByThis = privateFieldsByThis.updated(innermostThis, privateFields)
-        privateMethodsByThis = privateMethodsByThis.updated(innermostThis, privateMethods)
-        outerScopes.foreach { s =>
-          val q = termName(s"__this__${s.name}")
-          privateFieldsByThis = privateFieldsByThis.updated(q, s.privateFields)
-          privateMethodsByThis = privateMethodsByThis.updated(q, s.privateMethods)
-        }
+        recordScopes()
         // Record the lifted def's value-param names so the body
         // rewriter can skip bare-Ident rewrites that would otherwise
         // shadow a method param sharing a name with a private
@@ -595,6 +820,16 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
           ps.collect { case vd: ValDef => vd.name }
         }.toSet ++ liftedDefParamNames
         List(liftDef(dd, newOuters))
+      case vd: ValDef if containsMarker(vd) =>
+        // Marker in a member val/var *initializer* (the eval runs
+        // during construction). Lift the initializer as a def: the
+        // hoisted host only exists to carry the marker into the
+        // wrapper, so the val-ness (laziness, mutability) of the
+        // original member is irrelevant here.
+        recordScopes()
+        val asDef = DefDef(vd.name.toTermName, Nil, vd.tpt, vd.rhs)
+          .withMods(Modifiers()).withSpan(vd.span)
+        List(liftDef(asDef, newOuters))
       case nested: TypeDef if nested.isClassDef && containsMarker(nested) =>
         liftClassMethodsRec(nested, newOuters)
       case _ => Nil
@@ -619,8 +854,23 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
       tparams: List[TypeDef],
       memberNames: Set[TermName],
       privateFields: Map[TermName, Tree],
-      privateMethods: Map[TermName, Tree]
+      privateMethods: Map[TermName, Tree],
+      isModule: Boolean = false,
+      selfAlias: Option[TermName] = None
   )
+
+  /** The declared self-alias name of a template (`self =>`), if any. */
+  private def templateSelfAlias(tmpl: Template): Option[TermName] =
+    val self = tmpl.self
+    if self.isEmpty || self.name.isEmpty || self.name == nme.WILDCARD then None
+    else Some(self.name.toTermName)
+
+  /** The term the lifted code uses to reach an enclosing scope's
+   *  members: the `__this__<Name>` parameter for a class scope, the
+   *  object's own (statically reachable) name for a module scope.
+   */
+  private def receiverName(s: OuterScope): TermName =
+    if s.isModule then s.name.toTermName else termName(s"__this__${s.name}")
 
   /** Map of private term-member names → declared type tree. Used by
    *  the body rewriter to route bare or `__this__.x` references to
@@ -628,21 +878,52 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
    *  val/var params and body val/var declarations.
    */
   private def classPrivateFields(td: TypeDef)(using Context): Map[TermName, Tree] =
-    val tmpl = td.rhs.asInstanceOf[Template]
+    templatePrivateFields(td.rhs.asInstanceOf[Template])
+
+  private def templatePrivateFields(tmpl: Template)(using Context): Map[TermName, Tree] =
     val builder = collection.mutable.LinkedHashMap.empty[TermName, Tree]
     tmpl.constr.paramss.foreach { ps =>
       ps.foreach {
         case vd: ValDef if vd.mods.flags.is(Private) && !vd.name.isEmpty =>
-          builder.put(vd.name, vd.tpt)
+          builder.put(vd.name, memberTpt(vd.tpt, vd.rhs))
         case _ =>
       }
     }
     tmpl.body.foreach {
       case vd: ValDef if vd.mods.flags.is(Private) && !vd.name.isEmpty =>
-        builder.put(vd.name, vd.tpt)
+        builder.put(vd.name, memberTpt(vd.tpt, vd.rhs))
       case _ =>
     }
     builder.toMap
+
+  /** Declared type of a member, or a literal-derived one when the
+   *  declaration relies on inference (`private var count = 1`): the
+   *  reflective rewrite needs *some* static type for its cast, and a
+   *  literal initializer pins it. Returns `EmptyTree` when neither
+   *  is available; [[mkReflGet]] / [[mkReflCall]] then skip the cast
+   *  and the reference types as `Any`.
+   */
+  private def memberTpt(declared: Tree, rhs: Tree)(using Context): Tree =
+    if !declared.isEmpty then declared
+    else rhs match
+      case Number(_, kind) =>
+        kind match
+          case NumberKind.Whole(_) => Ident(typeName("Int"))
+          case _ => Ident(typeName("Double"))
+      case Literal(c) =>
+        val name = c.tag match
+          case IntTag => "Int"
+          case LongTag => "Long"
+          case FloatTag => "Float"
+          case DoubleTag => "Double"
+          case BooleanTag => "Boolean"
+          case CharTag => "Char"
+          case ByteTag => "Byte"
+          case ShortTag => "Short"
+          case StringTag => "String"
+          case _ => ""
+        if name.isEmpty then EmptyTree else Ident(typeName(name))
+      case _ => EmptyTree
 
   /** Map of private method names → declared return type tree.
    *  Mirrors [[classPrivateFields]] for `def`s, so the body rewriter
@@ -650,13 +931,15 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
    *  `__refl_call__` helper.
    */
   private def classPrivateMethods(td: TypeDef)(using Context): Map[TermName, Tree] =
-    val tmpl = td.rhs.asInstanceOf[Template]
+    templatePrivateMethods(td.rhs.asInstanceOf[Template])
+
+  private def templatePrivateMethods(tmpl: Template)(using Context): Map[TermName, Tree] =
     val builder = collection.mutable.LinkedHashMap.empty[TermName, Tree]
     tmpl.body.foreach {
       case dd: DefDef
           if dd.mods.flags.is(Private) && !dd.name.isEmpty
             && dd.name != nme.CONSTRUCTOR =>
-        builder.put(dd.name.asTermName, dd.tpt)
+        builder.put(dd.name.asTermName, memberTpt(dd.tpt, dd.rhs))
       case _ =>
     }
     builder.toMap
@@ -668,7 +951,9 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
    *  the bare reference back through the import.
    */
   private def classMemberNames(td: TypeDef)(using Context): Set[TermName] =
-    val tmpl = td.rhs.asInstanceOf[Template]
+    templateMemberNames(td.rhs.asInstanceOf[Template])
+
+  private def templateMemberNames(tmpl: Template)(using Context): Set[TermName] =
     val ctorParams = tmpl.constr.paramss.flatMap { ps =>
       ps.collect { case vd: ValDef => vd.name }
     }
@@ -701,17 +986,18 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
    *      A is a class. The lifted def declares `__this__A` ahead of
    *      `__this__: __this__A.B` so the prefix is in scope.
    *
-   *  `outerThisNames` lists the `__this__<Outer>` parameter names
-   *  innermost-first (i.e. closest enclosing class first); the
-   *  *immediate* outer class's parameter is the qualifier we use.
+   *  `outerReceiverNames` lists the receiver names innermost-first
+   *  (`__this__<Outer>` parameters for class scopes, the object's
+   *  own name for static module scopes); the *immediate* outer
+   *  scope's receiver is the qualifier we use.
    */
   private def applyClassTypeParams(
       td: TypeDef,
       tparams: List[TypeDef],
-      outerThisNames: List[TermName]
+      outerReceiverNames: List[TermName]
   )(using Context): Tree =
     val baseName = td.name
-    val base: Tree = outerThisNames match
+    val base: Tree = outerReceiverNames match
       case Nil => Ident(baseName)
       case head :: _ => Select(Ident(head), baseName)
     if tparams.isEmpty then base
@@ -780,8 +1066,10 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
     // path-dependent type refs on outer params (`__this__: __this__A.B`)
     // see their prefix already in scope. Names match the bindings
     // `EvalRewriteTyped` emits: `__this__<OuterName>` for outer
-    // classes, plain `__this__` for the immediate innermost.
-    val outerParams = outerScopes.tail.reverse.map { scope =>
+    // classes, plain `__this__` for the immediate innermost. Static
+    // module scopes contribute no parameter: the object is reachable
+    // by name through the sibling import the module lift emits.
+    val outerParams = outerScopes.tail.reverse.filterNot(_.isModule).map { scope =>
       val name = termName(s"__this__${scope.name}")
       ValDef(name, scope.typeRef, EmptyTree)
         .withMods(Modifiers(Param)).withSpan(span)
@@ -799,7 +1087,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
         outerScopes.reverse.foldLeft(Map.empty[TermName, TermName]) { (acc, scope) =>
           val qual =
             if scope eq innermost then thisName
-            else termName(s"__this__${scope.name}")
+            else receiverName(scope)
           scope.memberNames.foldLeft(acc) { (m, n) => m.updated(n, qual) }
         }
       val seenParams = collection.mutable.Set.empty[TermName]
@@ -819,7 +1107,16 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
         else List(combined)
       val thisClause: ParamClause = outerParams :+ innermostParam
       tparamClause ++ (thisClause :: rewrittenValueClauses)
-    DefDef(dd.name, newParamss, dd.tpt, newRhs).withMods(dd.mods).withSpan(span)
+    // Rename like [[renameTopLevelDef]]: with the original name kept,
+    // a body reference to it would be ambiguous between the hoisted
+    // def and the live member coming in through `import __this__.*`
+    // (an inner wildcard import cannot override an outer definition).
+    // After the rename, recursion in the body resolves through the
+    // import and re-enters the live method. `override` is stripped:
+    // the parent the def overrode is gone after the lift.
+    val newName = termName(s"__eval_${dd.name}__")
+    val newMods = dd.mods.withFlags(dd.mods.flags &~ Override)
+    DefDef(newName, newParamss, dd.tpt, newRhs).withMods(newMods).withSpan(span)
 
   /** Walk a parameter default expression, rewriting any bare
    *  `Ident(name)` where `name` is a captured class member into
