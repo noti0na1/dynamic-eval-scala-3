@@ -954,15 +954,21 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
     private def isTermOwnedModule(sym: Symbol)(using Context): Boolean =
       sym.exists && sym.is(Module) && isTermOwnedSymbol(sym)
 
-    /** True when `sym` is a `def` declared inside another method's
-     *  body, with that block sitting *outside* the captured eval
-     *  body. The rewriter captures such defs as eta-expanded
-     *  `FunctionN` bindings; references lower to MethodCapture so
-     *  Resolve retrieves the function value and applies it.
+    /** True when `sym` is a `def` declared in an outer *term* scope —
+     *  an enclosing method's body, or a block owned by a `val` (the
+     *  shape stateful-eval splicing produces: code from an earlier
+     *  `State.eval` step re-elaborates inside `val __evalEnd = {...}`,
+     *  so its defs are owned by that val) — with that block sitting
+     *  *outside* the captured eval body. The rewriter captures such
+     *  defs as eta-expanded `FunctionN` bindings (the Block pre-scan
+     *  is owner-agnostic); references lower to MethodCapture so
+     *  Resolve retrieves the function value and applies it. Class
+     *  members keep their owner a class (not a term) and still take
+     *  the field/method reflection paths.
      */
     private def isOuterMethodLocalDef(sym: Symbol)(using Context): Boolean =
       sym.exists && sym.is(Method) && !sym.isClassConstructor &&
-        sym.owner.exists && sym.owner.is(Method) && !isLocalToBody(sym)
+        sym.owner.exists && sym.owner.isTerm && !isLocalToBody(sym)
 
     private def getField(tree: Tree, qual: Tree, field: TermSymbol)(using Context): Tree =
       // Result type stays at the member type *as seen from the use
