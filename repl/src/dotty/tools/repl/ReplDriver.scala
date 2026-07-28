@@ -303,7 +303,69 @@ class ReplDriver(settings: Array[String],
         enclosingSource: String
     ): Either[Eval.CompileFailure, Any] =
       evalDynamic(code, bindings, expectedType, enclosingSource)
+
+    override def compileTopLevel(
+        defs: String,
+        contextHeader: String
+    ): Either[Eval.CompileFailure, Eval.TopLevel] =
+      compileTopLevelDynamic(defs, contextHeader)
   }
+
+  /** Everything the eval driver's inner compiles take from the live
+   *  session, snapshotted from the current `State`: classloader,
+   *  output dir, wrapper + user imports, forwarded CLI settings, the
+   *  session's exact classpath, and the eval log dir.
+   */
+  private class SessionCompileInputs(state: State):
+    val ctx = state.context
+    val classLoader: ClassLoader = rendering.classLoader()(using ctx)
+    val replOutDir = ctx.settings.outputDir.value(using ctx)
+
+    // Skip indexes whose compile failed before bytecode was emitted.
+    // Their classfile isn't on the classpath, so importing them would
+    // error before the user's actual error can surface.
+    private def hasClassfile(idx: Int): Boolean =
+      ReplCompiler.objectNames.get(idx).exists { wrapperName =>
+        replOutDir.lookupName(s"$wrapperName$$.class", directory = false) != null
+      }
+    // For each valid line: the wrapper import (when its classfile exists)
+    // followed by the user-typed top-level imports collected at that line
+    // (e.g. `import A.*`). Wildcard-importing the wrapper module doesn't
+    // re-export imports declared inside it, so without this the eval
+    // driver would lose `import A.*`-style names that the live session has.
+    // Force color off when rendering, otherwise the live session's
+    // syntax-highlighting setting embeds ANSI escapes into the source
+    // we hand to the eval compiler.
+    val replWrapperImports: Array[String] =
+      val printCtx = ctx.fresh.setSetting(ctx.settings.color, "never")
+      state.validObjectIndexes.flatMap { i =>
+        val wrapperImport =
+          if hasClassfile(i) then Some(s"import ${ReplCompiler.objectNames(i)}.{given, *}")
+          else None
+        val userImports = state.imports.getOrElse(i, Nil).map(_.show(using printCtx))
+        wrapperImport ++ userImports
+      }.toArray
+
+    // Forward CLI settings from the live session (minus those incompatible
+    // with the eval driver's standalone setup).
+    val forwardedSettings: Array[String] = settings.filterNot(incompatibleOptions.contains)
+    val evalLogDir: String = ctx.settings.XreplEvalLogDir.value(using ctx)
+    // Pass the REPL session's *actual* compile-time classpath
+    // (`ctx.settings.classpath.value`) directly to the adapter
+    // instead of letting it synthesise one from cliCp + classloader
+    // + java.class.path. The REPL successfully compiles every line
+    // it sees against this exact classpath; the inner compile
+    // should see the same view, no more, no less. Avoids the
+    // duplicate-stdlib trap when `java.class.path` overlays the
+    // session's own classpath in dotty's test build.
+    val replClasspath: String = ctx.settings.classpath.value(using ctx)
+  end SessionCompileInputs
+
+  private def currentSessionInputs(): SessionCompileInputs =
+    val state = currentState
+    if state == null then
+      throw new IllegalStateException("Eval.eval has no current REPL state")
+    new SessionCompileInputs(state)
 
   /** Runtime `eval(code, bindings*)` callback. Compiles via a fresh,
    *  standalone Driver because dotc isn't re-entrant: we can't recursively
@@ -322,55 +384,27 @@ class ReplDriver(settings: Array[String],
       expectedType: String,
       enclosingSource: String
   ): Either[Eval.CompileFailure, Any] =
-    val state = currentState
-    if state == null then
-      throw new IllegalStateException("Eval.eval has no current REPL state")
-    val ctx = state.context
-    val classLoader = rendering.classLoader()(using ctx)
-    val replOutDir = ctx.settings.outputDir.value(using ctx)
-
-    // Skip indexes whose compile failed before bytecode was emitted.
-    // Their classfile isn't on the classpath, so importing them would
-    // error before the user's actual error can surface.
-    def hasClassfile(idx: Int): Boolean =
-      ReplCompiler.objectNames.get(idx).exists { wrapperName =>
-        replOutDir.lookupName(s"$wrapperName$$.class", directory = false) != null
-      }
-    // For each valid line: the wrapper import (when its classfile exists)
-    // followed by the user-typed top-level imports collected at that line
-    // (e.g. `import A.*`). Wildcard-importing the wrapper module doesn't
-    // re-export imports declared inside it, so without this the eval
-    // driver would lose `import A.*`-style names that the live session has.
-    // Force color off when rendering, otherwise the live session's
-    // syntax-highlighting setting embeds ANSI escapes into the source
-    // we hand to the eval compiler.
-    val printCtx = ctx.fresh.setSetting(ctx.settings.color, "never")
-    val replWrapperImports = state.validObjectIndexes.flatMap { i =>
-      val wrapperImport =
-        if hasClassfile(i) then Some(s"import ${ReplCompiler.objectNames(i)}.{given, *}")
-        else None
-      val userImports = state.imports.getOrElse(i, Nil).map(_.show(using printCtx))
-      wrapperImport ++ userImports
-    }.toArray
-
-    // Forward CLI settings from the live session (minus those incompatible
-    // with the eval driver's standalone setup).
-    val forwardedSettings = settings.filterNot(incompatibleOptions.contains)
-    val evalLogDir = ctx.settings.XreplEvalLogDir.value(using ctx)
-    // Pass the REPL session's *actual* compile-time classpath
-    // (`ctx.settings.classpath.value`) directly to the adapter
-    // instead of letting it synthesise one from cliCp + classloader
-    // + java.class.path. The REPL successfully compiles every line
-    // it sees against this exact classpath; the inner compile
-    // should see the same view, no more, no less. Avoids the
-    // duplicate-stdlib trap when `java.class.path` overlays the
-    // session's own classpath in dotty's test build.
-    val replClasspath = ctx.settings.classpath.value(using ctx)
+    val in = currentSessionInputs()
     new eval.EvalAdapter().evalIsolated(
-      code, classLoader, bindings, replOutDir, replWrapperImports,
-      forwardedSettings, expectedType, enclosingSource, replClasspath, evalLogDir
+      code, in.classLoader, bindings, in.replOutDir, in.replWrapperImports,
+      in.forwardedSettings, expectedType, enclosingSource, in.replClasspath, in.evalLogDir
     )
   end evalDynamic
+
+  /** Runtime `Eval.topLevel(defs)` callback: one-time compile of the
+   *  defs against the live session's context. Same fresh-Driver
+   *  rationale as [[evalDynamic]].
+   */
+  private def compileTopLevelDynamic(
+      defs: String,
+      contextHeader: String
+  ): Either[Eval.CompileFailure, Eval.TopLevel] =
+    val in = currentSessionInputs()
+    new eval.EvalAdapter().compileTopLevel(
+      defs, in.classLoader, in.replOutDir, in.replWrapperImports,
+      in.forwardedSettings, contextHeader, in.replClasspath, in.evalLogDir
+    )
+  end compileTopLevelDynamic
 
   // TODO: i5069
   final def bind(name: String, value: Any)(using state: State): State = state

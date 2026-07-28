@@ -53,6 +53,24 @@ private[eval] object EvalNames:
   /** Key object for non-local `return` out of the eval body. */
   val ReturnKeyBinding: String = "__evalReturnKey__"
 
+  /** Reserved prefix for [[Eval.TopLevel]] handle bindings. A
+   *  `TopLevel.eval` call appends one synthetic binding per handle
+   *  (name built by [[topLevelBinding]], value the handle itself);
+   *  [[EvalAdapter.evalIsolated]] extracts them to put the handle's
+   *  compiled definitions on the wrapper compile's classpath, import
+   *  them into the wrapper, and chain the handle's classloader for
+   *  the wrapper load. The generated code never reads the binding.
+   */
+  val TopLevelBindingPrefix: String = "__evalTopLevel_"
+
+  /** Handle binding name for the top-level defs object `objectName`.
+   *  The object name is unique per handle (UUID-flavoured), so the
+   *  binding name discriminates handles in the wrapper cache key via
+   *  the bindings fingerprint.
+   */
+  def topLevelBinding(objectName: String): String =
+    s"$TopLevelBindingPrefix${objectName}__"
+
   /** Reserved prefix for captured enclosing instances. The bare
    *  `__this__` binding holds the call site's innermost `this`; the
    *  qualified `__this__<C>` form (built by [[thisBinding]]) holds

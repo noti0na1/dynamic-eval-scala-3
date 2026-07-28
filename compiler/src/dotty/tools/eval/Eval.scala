@@ -254,6 +254,81 @@ object Eval:
         enclosingSource: String
     ): Either[CompileFailure, Any]
 
+    /** Compile [[topLevel]] definitions once into a persistent handle.
+     *  `contextHeader` is the file-level import context of the
+     *  `topLevel` call site (the leading import lines of its
+     *  enclosing-source slice; empty in the REPL, where session
+     *  imports reach the compile through the adapter instead).
+     *
+     *  Default implementation refuses, so third-party adapters that
+     *  only implement `evalCode` keep compiling; the in-tree REPL and
+     *  standalone adapters override it.
+     */
+    def compileTopLevel(defs: String, contextHeader: String): Either[CompileFailure, TopLevel] =
+      Left(new CompileFailure(
+        Array("Eval.topLevel is not supported by the installed eval adapter"), defs))
+
+  /** A handle to definitions compiled once, at the top level of the
+   *  package where the [[topLevel]] call was written.
+   *
+   *  The handle owns the compiled output directory and a dedicated
+   *  classloader, both created by the adapter at [[topLevel]] time.
+   *  Every `handle.eval` wrapper compile puts the output directory on
+   *  its classpath and loads against the same classloader, so all
+   *  eval calls through one handle share a single JVM identity for
+   *  the definitions: an `object`'s `var` mutated by one call is seen
+   *  by the next, and instances of a class defined here can flow
+   *  between calls.
+   *
+   *  Name resolution inside a body follows "like a global function":
+   *  call-site locals shadow the handle's definitions; the handle's
+   *  definitions shadow same-named session/global definitions.
+   *
+   *  Fields are `private[eval]` and JVM-simple (`Object` for the
+   *  output directory) so the class crosses the eval classloader
+   *  boundary without dragging compiler types into the API surface.
+   */
+  @caps.assumeSafe
+  final class TopLevel private[eval] (
+      private[eval] val objectName: String,
+      private[eval] val outputDir: Object,
+      private[eval] val loader: ClassLoader,
+      val defs: String
+  ):
+    private def withHandle(bindings: Array[Binding]): Array[Binding] =
+      bindings :+ bindSynthetic(EvalNames.topLevelBinding(objectName), this)
+
+    /** Evaluate `code` at this call site's local context with the
+     *  handle's definitions in scope. Throws [[EvalCompileException]]
+     *  if `code` does not compile; use [[evalSafe]] to get the
+     *  failure as a value instead. The synthetic parameters are
+     *  filled by the rewriter exactly as for [[Eval.eval]].
+     */
+    @evalLike
+    def eval[T](
+        code: String,
+        bindings: Array[Binding] = Array.empty[Binding],
+        expectedType: String = "",
+        enclosingSource: String = ""
+    ): T =
+      Eval.eval[T](code, withHandle(bindings), expectedType, enclosingSource)
+
+    /** Non-throwing [[eval]]: a compile failure of `code` comes back
+     *  as `EvalResult.Failure` carrying the diagnostics. Runtime
+     *  exceptions the body itself raises still propagate.
+     */
+    @evalSafeLike
+    def evalSafe[T](
+        code: String,
+        bindings: Array[Binding] = Array.empty[Binding],
+        expectedType: String = "",
+        enclosingSource: String = ""
+    ): EvalResult[T] =
+      Eval.evalSafe[T](code, withHandle(bindings), expectedType, enclosingSource)
+
+    override def toString: String = s"Eval.TopLevel($objectName)"
+  end TopLevel
+
   // Inheritable so a body that spawns a Future / Thread can still
   // reach the live adapter from the new thread. The snapshot is taken
   // at *thread creation*, which sets the propagation contract:
@@ -363,6 +438,58 @@ object Eval:
   ): EvalResult[T] =
     val ctx = new EvalContext(bindings, expectedType, enclosingSource)
     evalSafeImpl[T](gen.apply(ctx), bindings, expectedType, enclosingSource)
+
+  /** Compile `defs` once, at the top level of the current package,
+   *  and return a [[TopLevel]] handle for evaluating expressions
+   *  against them. The defs compile in the *global* context of this
+   *  call site: package members, file-level imports, and previous
+   *  REPL lines resolve; method-local values and types do not (the
+   *  captured bindings are deliberately not passed to the compile,
+   *  which is what makes the isolation structural). Compilation is
+   *  eager: a compile error in `defs` throws [[EvalCompileException]]
+   *  here, not at the first `handle.eval`.
+   *
+   *  The synthetic parameters are filled by the rewriter like
+   *  [[eval]]'s; only `enclosingSource`'s leading file-level import
+   *  lines are consumed (as the defs' compilation context in
+   *  standalone mode).
+   */
+  @evalLike
+  def topLevel(
+      defs: String,
+      bindings: Array[Binding] = Array.empty[Binding],
+      expectedType: String = "",
+      enclosingSource: String = ""
+  ): TopLevel =
+    topLevelSafe(defs, bindings, expectedType, enclosingSource).get
+
+  /** Non-throwing [[topLevel]]: a compile failure of `defs` comes
+   *  back as `EvalResult.Failure` carrying the diagnostics, so an
+   *  agent can feed `result.error.errors` back into a generator and
+   *  retry.
+   */
+  @evalSafeLike
+  def topLevelSafe(
+      defs: String,
+      bindings: Array[Binding] = Array.empty[Binding],
+      expectedType: String = "",
+      enclosingSource: String = ""
+  ): EvalResult[TopLevel] =
+    activeAdapter().compileTopLevel(defs, leadingImports(enclosingSource)) match
+      case Right(handle) => EvalResult.success(handle)
+      case Left(f) => EvalResult.failure(f)
+
+  /** Leading `import` lines of an enclosing-source slice: in
+   *  standalone mode the rewriter embeds the call site's file-level
+   *  context (top-level imports, the package import, the
+   *  enclosing-object import) as import lines at the head of the
+   *  slice. Empty for REPL slices, whose session imports travel
+   *  through the adapter instead.
+   */
+  private def leadingImports(enclosingSource: String): String =
+    enclosingSource.linesIterator
+      .takeWhile(l => l.trim.isEmpty || l.trim.startsWith("import "))
+      .mkString("\n")
 
   private def evalImpl[T](
       code: String,

@@ -978,6 +978,13 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
           sym.name.toString match
             case "eval" => EvalKind.PlainEval
             case "evalSafe" => EvalKind.PlainEvalSafe
+            // `topLevel` / `topLevelSafe` have the standard synthetic
+            // parameter slots and forward like user `@evalLike`
+            // wrappers, but live on the `Eval` module, which this
+            // owner branch claims before the annotation checks run.
+            // Classify them as the wrapper kinds explicitly.
+            case "topLevel" => EvalKind.EvalLike
+            case "topLevelSafe" => EvalKind.EvalSafeLike
             case _ => EvalKind.NotEval
         else if evalLikeAnnotCache.exists && sym.hasAnnotation(evalLikeAnnotCache) then
           EvalKind.EvalLike

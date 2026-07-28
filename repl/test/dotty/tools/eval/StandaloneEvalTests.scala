@@ -613,6 +613,55 @@ class StandaloneEvalTests:
     assertEquals(42, r)
 
   // ===========================================================================
+  // Eval.topLevel: compile-once definitions with shared state
+  // ===========================================================================
+
+  @Test def topLevelDefsSeePackageContextNotLocals(): Unit =
+    // The defs compile in the file-level context of the `topLevel`
+    // call site (here: the top-level `helper` def, reachable through
+    // the embedded `<file>$package` import), while a method-local is
+    // rejected at construction with the standard diagnostic.
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.{topLevel, topLevelSafe}
+        |def helper(x: Int): Int = x * 10
+        |object Main:
+        |  def run(): Any =
+        |    val h = topLevel("def f(x: Int): Int = helper(x) + 1")
+        |    val mystery = 5
+        |    val ok = h.eval[Int]("f(mystery)")
+        |    val iso = topLevelSafe("def g = mystery") match
+        |      case r if r.isFailure => r.error.errors.head.linesIterator.next()
+        |      case _ => "LEAKED"
+        |    (ok, iso)
+        |""".stripMargin)
+    assertEquals((51, "Not found: mystery"), r)
+
+  @Test def topLevelModuleStateSharedAcrossCallSites(): Unit =
+    // The defs compile once per handle: two different `.eval` call
+    // sites mutate one copy of the module state.
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.topLevel
+        |object Main:
+        |  def run(): Any =
+        |    val h = topLevel("object C { var n = 0 }\ndef inc(): Int = { C.n += 1; C.n }")
+        |    val warm = (1 to 3).map(_ => h.eval[Int]("inc()")).toList
+        |    val next = h.eval[Int]("inc()")
+        |    (warm, next)
+        |""".stripMargin)
+    assertEquals((List(1, 2, 3), 4), r)
+
+  @Test def topLevelClassIdentityStableAcrossCalls(): Unit =
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.topLevel
+        |object Main:
+        |  def run(): Any =
+        |    val h = topLevel("class Box(var v: Int)")
+        |    val b = h.eval[Any]("new Box(41)")
+        |    h.eval[Int]("b.asInstanceOf[Box].v + 1")
+        |""".stripMargin)
+    assertEquals(42, r)
+
+  // ===========================================================================
   // Flag gating
   // ===========================================================================
 
