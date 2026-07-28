@@ -11,6 +11,7 @@ import dotc.core.Constants.Constant
 import dotc.core.Contexts.*
 import dotc.core.Decorators.*
 import dotc.core.Flags
+import dotc.config.Feature
 import dotc.core.NameKinds.{DefaultGetterName, UniqueName}
 import dotc.core.Names.{TermName, termName}
 import dotc.core.Symbols.*
@@ -1552,11 +1553,36 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
      *  surrounding 4-arg overload solves correctly. `extra` carries
      *  pre-built bind trees appended after the scope captures
      *  (currently only the non-local-return key).
+     *
+     *  The array is routed through `Eval.withInheritedHandles` at
+     *  runtime: the rewriter can only capture names it sees, and a
+     *  `TopLevel` handle binding has none — it arrives in the
+     *  *incoming* array of the wrapper this call site may be
+     *  compiled into, or belongs to the defs object the call site
+     *  was compiled inside. The runtime re-attaches both kinds, so
+     *  a captured bindings array that outlives its eval call keeps
+     *  its definitions linked. A no-op for ordinary call sites.
      */
     private def buildBindingsArray(caps: List[CapturedSym], span: Span, extra: List[Tree] = Nil)(using Context): Tree =
       val elemTpe: Type = EvalRewriteTyped.bindingClass.typeRef
       val elems: List[Tree] = caps.map(c => buildBind(c, span)) ++ extra
-      JavaSeqLiteral(elems, TypeTree(elemTpe)).withSpan(span)
+      val arr = JavaSeqLiteral(elems, TypeTree(elemTpe)).withSpan(span)
+      ref(EvalRewriteTyped.withInheritedHandlesSym)
+        .appliedTo(Literal(Constant(enclosingDefsObjectName)), arr)
+        .withSpan(span)
+
+    /** The name of the `topLevel` defs object this call site is
+     *  compiled inside, or "" — its handle does not exist during the
+     *  defs compile, so the emitted code resolves it at runtime by
+     *  this name (see `Eval.withInheritedHandles`). */
+    private def enclosingDefsObjectName(using Context): String =
+      var s = ctx.owner
+      while s.exists do
+        if s.is(Flags.ModuleClass) then
+          val n = s.sourceModule.name.toString
+          if n.startsWith(EvalNames.TopLevelObjectPrefix) then return n
+        s = s.maybeOwner
+      ""
 
     /** The method a body `return` would target, when the eval call
      *  sits directly inside a real (named, non-constructor) method.
@@ -2167,6 +2193,9 @@ object EvalRewriteTyped:
   private def bindSyntheticSym(using Context): Symbol =
     requiredModule("dotty.tools.eval.Eval").requiredMethod("bindSynthetic")
 
+  private def withInheritedHandlesSym(using Context): Symbol =
+    requiredModule("dotty.tools.eval.Eval").requiredMethod("withInheritedHandles")
+
   private def evalNonLocalReturnClass(using Context): ClassSymbol =
     requiredClass("dotty.tools.eval.EvalNonLocalReturn")
 
@@ -2191,11 +2220,12 @@ object EvalRewriteTyped:
    *  globally reachable names resolve, so a local name in the
    *  ascription would fail the compile.
    *
-   *  Capture annotations (`^`, `^{...}`) are kept when capture
-   *  checking is enabled in the live session, so the inner verify
-   *  compile sees the exact capability set the user declared.
-   *  Otherwise they're stripped — the wrapper's val type only needs
-   *  the underlying erased shape.
+   *  Capture annotations (`^`, `^{...}`) are always stripped here:
+   *  a capture set's references are typically call-site-local paths
+   *  (a parameter, a block val), exactly the names the isolated
+   *  fallback context cannot resolve — and the local-symbol bailout
+   *  above cannot see them, since retains annotations carry their
+   *  references in annotation trees, not as type parts.
    */
   private[eval] def renderType(tpe: Type)(using Context): String =
     renderTypeImpl(tpe, strict = true)
@@ -2212,6 +2242,14 @@ object EvalRewriteTyped:
    *  runtime re-typechecks the string as the spliced
    *  `val __evalResult: <tpe>` ascription at the marker position
    *  inside the slice, where exactly these names resolve.
+   *
+   *  Capture annotations (`^`, `^{...}`) are kept whenever capture
+   *  checking is on for this unit — [[Feature.ccEnabled]], which
+   *  covers `-language:experimental.captureChecking`, safe mode
+   *  (which implies it), and a per-unit language import — so the
+   *  wrapper's ascription holds the body to the capability set the
+   *  call site declared. The set's references are call-site names,
+   *  which resolve at the marker position like any other.
    */
   private[eval] def renderTypeInfo(tpe: Type)(using Context): String =
     renderTypeImpl(tpe, strict = false)
@@ -2229,7 +2267,7 @@ object EvalRewriteTyped:
     val resolved = if strict then dealiasLocalAliases(widened) else widened
     if strict && mentionsLocallyScopedSymbol(resolved) then return ""
     val cleaned =
-      if ctx.settings.YccNew.value || ctx.settings.language.value.contains("experimental.captureChecking")
+      if !strict && (Feature.ccEnabled || ctx.settings.YccNew.value)
       then resolved
       else stripCaptureAnnotations(resolved)
     val printCtx = ctx.fresh.setSetting(ctx.settings.color, "never")

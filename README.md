@@ -373,10 +373,54 @@ The import's position is what fixes the resolution order: it sits
 inner to the file-level session imports (handle beats session) and
 outer to the enclosing statement (locals beat handle; an import
 placed inside the body would instead make that collision a
-"defined and imported subsequently" ambiguity error). One
-limitation: an eval call written *inside* the defs is left
-unrewritten, so at runtime it compiles in the isolated global
-context, without the defs or any call-site scope.
+"defined and imported subsequently" ambiguity error).
+
+### Eval calls inside the defs
+
+The defs compile runs the eval rewrite phase too, so an eval call
+(or an `@evalLike` capture) written *inside* the defs behaves like
+one written anywhere else: it captures the enclosing member's
+parameters and locals, and its enclosing-source slice — the member
+around the marker, with the defs-object import and the defs' own
+leading imports in front — re-resolves when a later eval splices
+against it. The handle itself does not exist while the defs
+compile, so the link is re-attached at runtime: every
+rewriter-built bindings array passes through
+`Eval.withInheritedHandles`, which appends the handle bindings of
+the eval calls executing on the current thread and, for code
+compiled inside a defs object, the object's own handle (resolved
+by name from a weak registry the adapter fills when the handle is
+built). A bindings array captured inside a handle's world therefore
+keeps working after the call returns:
+
+```scala
+scala> @evalLike def snap(bindings: Array[Eval.Binding] = Array.empty,
+     |   expectedType: String = "", enclosingSource: String = "") = (bindings, enclosingSource)
+
+scala> val h = topLevel("case class M(v: Int)\ndef probe(v: Int): Any = snap()")
+scala> val (bs, encl) = h.eval[Any]("probe(7)").asInstanceOf[(Array[Eval.Binding], String)]
+
+scala> Eval.eval[Int]("M(v).v + 1", bs, "", encl)   // spliced back inside probe's body
+val res0: Int = 8
+```
+
+This is the primitive an agent-style `getState()` inside a
+top-level function needs: the captured state is the function
+body's scope — exactly the parameters the instance was passed —
+and every later step against it still links the defs.
+`TopLevel.binding` exposes the handle's synthetic binding for
+embedders that assemble binding arrays by hand.
+
+### Capture checking and `expectedType`
+
+When capture checking is on for the unit (`-language:experimental.captureChecking`,
+safe mode, or a per-unit language import), the rewriter's rendering
+of an eval call's `[T]` keeps capture annotations: `eval[F^{f}]("f")`
+ascribes the body to `F^{f}` rather than the stripped base type,
+which a capturing body could never conform to. The strict rendering
+used when no enclosing slice exists still strips them — a capture
+set's references are call-site paths an isolated context cannot
+resolve.
 
 ## Safety
 
