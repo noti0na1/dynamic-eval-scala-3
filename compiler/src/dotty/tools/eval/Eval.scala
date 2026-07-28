@@ -355,7 +355,11 @@ object Eval:
   //     driver, which the test suite does routinely.
   private val active = new InheritableThreadLocal[Adapter]
 
-  def withAdapter[T](adapter: Adapter)(thunk: => T): T =
+  /** `adapter` may be null — that is the documented way to REMOVE the
+   *  session's adapter for a block (an embedder compiling agent code under
+   *  its own rules does exactly this), and an embedder built with
+   *  `-Yexplicit-nulls` must be able to say so without a cast. */
+  def withAdapter[T](adapter: Adapter | Null)(thunk: => T): T =
     val prev = active.get
     active.set(adapter)
     try thunk
