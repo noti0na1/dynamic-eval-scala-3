@@ -57,6 +57,20 @@ object CheckCaptures:
    */
   val DiscardUses: Property.StickyKey[Unit] = Property.StickyKey()
 
+  /** An attachment marking an `Apply` tree whose RESULT is rechecked
+   *  with `unsafeAssumePure` semantics: the application itself (and
+   *  its arguments) recheck normally, but the result type's capture
+   *  set is stripped. Lets a compiler-internal rewriter treat a
+   *  synthesised plumbing call — the eval rewriter's
+   *  `Eval.withInheritedHandles(...)` around a captured bindings
+   *  array, whose `Array` result would otherwise pick up a fresh
+   *  mutability capture no pure parameter type accepts — as the
+   *  inert value it is, without emitting a source-level call to the
+   *  safe-mode-rejected `caps.unsafe.unsafeAssumePure`. Sticky for
+   *  the same reason as [[DiscardUses]].
+   */
+  val AssumePure: Property.StickyKey[Unit] = Property.StickyKey()
+
   enum EnvKind derives CanEqual:
     case Regular        // normal case
     case NestedInOwner  // environment is a temporary one nested in the owner's environment,
@@ -906,6 +920,15 @@ class CheckCaptures extends Recheck, SymTransformer:
         // tree copies, and an attached `caps.freeze` call must not
         // silently skip freeze semantics.
         withDiscardedUses(super.recheckApply(tree, pt))
+      else if tree.hasAttachment(AssumePure) then
+        // A compiler-internal rewriter asked for `unsafeAssumePure`
+        // semantics on this call's result (see [[AssumePure]]): the
+        // application rechecks normally, then the result's capture
+        // set is stripped.
+        val res = super.recheckApply(tree, pt)
+        val purified = if res.captureSet.isAlwaysEmpty then res else res.widen.stripCapturing
+        includeCallCaptures(meth, purified, tree)
+        purified
       else
         val res = super.recheckApply(tree, pt)
         includeCallCaptures(meth, res, tree)
