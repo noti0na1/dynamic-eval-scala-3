@@ -48,6 +48,20 @@ class EvalCaptureTypeTests extends ReplTest(ReplTest.defaultOptions :+ "-languag
       "val r: Int = 42")
   }
 
+  @Test def capturePolymorphicWrapperRendersInstantiatedResult = initially {
+    // An @evalLike wrapper generic in a CAPTURE SET: the rewriter
+    // must render the call's instantiated RESULT (`AnyRef^{f}`) as
+    // the expected type, not the bare capture-set argument, which is
+    // no ascription at all.
+    expectSteps(
+      """import dotty.tools.eval.{Eval, evalLike}""",
+      """@evalLike def pick[C^](code: String, bindings: Array[Eval.Binding] = Array.empty[Eval.Binding], expectedType: String = "", enclosingSource: String = ""): AnyRef^{C} = Eval.eval[AnyRef](code, bindings, expectedType, enclosingSource)""",
+      """trait F extends caps.SharedCapability""",
+      """def use(f: F^): AnyRef^{f} = pick[{f}]("f")""",
+      """val ok = { val ff = new F {}; use(ff) eq ff }""")(
+      "val ok: Boolean = true")
+  }
+
   @Test def captureCallInsideCcCheckedBody = initially {
     // An @evalLike capture INSIDE a cc-checked eval body: the
     // rewriter's `withInheritedHandles` wrap around the captured

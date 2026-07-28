@@ -1394,7 +1394,16 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
      *  call's prototype recorded by the typer hook
      *  ([[EvalRewriteTyped.recordEvalProto]]).
      *
-     *  The fallback recovers the inference case: in
+     *  A CAPTURE-SET argument (the call instantiates a `[C^]`
+     *  parameter, as in a capture-polymorphic
+     *  `create[C^](...): Handle^{C}`) is no ascription at all;
+     *  there the call's INSTANTIATED RESULT type is rendered
+     *  instead — the full type the call site expects, capture set
+     *  included. Only capture-set arguments take this path: an
+     *  ordinary wrapper may legitimately embed `T` in a composite
+     *  result (`(T, Int)`) while its body is a plain `T`.
+     *
+     *  The prototype fallback recovers the inference case: in
      *  `val a: A = eval("...")` the typer's only constraint on `T`
      *  is `T <: A`, so interpolation minimizes `T := Nothing` and
      *  the constraint's upper bound survives only as the recorded
@@ -1403,17 +1412,23 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
      *  itself.
      */
     private def effectiveTypeArg(app: Apply, kind: EvalKind)(using Context): Type | Null =
+      def unwrapSafe(tpe: Type): Type =
+        if !kind.isSafe then tpe
+        else tpe.baseType(EvalRewriteTyped.evalResultClass) match
+          case AppliedType(_, arg :: Nil) if !arg.isInstanceOf[TypeBounds] => arg
+          case _ => NoType
       val tArg = extractTypeArg(app.fun)
-      if isInformativeType(tArg) then tArg
+      val isCapSetArg =
+        (tArg ne null) && tArg.exists && tArg.derivesFrom(defn.Caps_CapSet)
+      val fromResult = if isCapSetArg then unwrapSafe(app.tpe.widen) else NoType
+      if isInformativeType(fromResult) then fromResult
+      else if !isCapSetArg && isInformativeType(tArg) then tArg
       else
         val recorded = recordedProto(app)
-        val fallback =
-          if !recorded.exists then NoType
-          else if !kind.isSafe then recorded
-          else recorded.baseType(EvalRewriteTyped.evalResultClass) match
-            case AppliedType(_, arg :: Nil) if !arg.isInstanceOf[TypeBounds] => arg
-            case _ => NoType
-        if isInformativeType(fallback) then fallback else tArg
+        val fallback = if !recorded.exists then NoType else unwrapSafe(recorded)
+        if isInformativeType(fallback) then fallback
+        else if isCapSetArg then null
+        else tArg
 
     /** The prototype attached to this call by the typer hook,
      *  resolved against the final state of inference; `NoType` when
