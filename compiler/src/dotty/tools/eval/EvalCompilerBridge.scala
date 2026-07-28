@@ -5,7 +5,7 @@ import java.nio.file.Path
 
 import scala.util.control.NonFatal
 
-import dotty.tools.dotc.Driver
+import dotty.tools.dotc.{Compiler, Driver}
 import dotty.tools.dotc.classpath.ClassPathFactory
 import dotty.tools.dotc.core.Contexts.{Context, ContextBase, inContext}
 import dotty.tools.dotc.core.Mode
@@ -91,7 +91,39 @@ class EvalCompilerBridge:
       replOutDir: AbstractFile | Null,
       compilerSettings: Array[String],
       replClasspath: String,
-      config: EvalCompilerConfig
+      config: EvalCompilerConfig,
+      extraClassDirs: List[AbstractFile] = Nil
+  ): Either[Seq[String], Unit] =
+    compileWith(source, outDir, classLoader, replOutDir, extraClassDirs,
+      compilerSettings, replClasspath, () => new EvalCompiler(config))
+
+  /** Compile plain definitions (no eval body, no splice marker)
+   *  through the standard `Compiler` pipeline against the same
+   *  classpath view as [[compile]]. Used for the one-time
+   *  `Eval.topLevel` defs compile: the output classes persist for the
+   *  handle's lifetime and later [[compile]] calls see them via
+   *  `extraClassDirs`.
+   */
+  def compileDefs(
+      source: String,
+      outDir: AbstractFile,
+      classLoader: ClassLoader,
+      replOutDir: AbstractFile | Null,
+      compilerSettings: Array[String],
+      replClasspath: String
+  ): Either[Seq[String], Unit] =
+    compileWith(source, outDir, classLoader, replOutDir, Nil,
+      compilerSettings, replClasspath, () => new Compiler)
+
+  private def compileWith(
+      source: String,
+      outDir: AbstractFile,
+      classLoader: ClassLoader,
+      replOutDir: AbstractFile | Null,
+      extraClassDirs: List[AbstractFile],
+      compilerSettings: Array[String],
+      replClasspath: String,
+      mkCompiler: () => Compiler
   ): Either[Seq[String], Unit] =
     val driver = new EvalDriver
     val (classpath, settingsWithoutCp) =
@@ -118,18 +150,24 @@ class EvalCompilerBridge:
           .addMode(Mode.Interactive)
           .setSetting(ctx0.settings.outputDir, outDir)
           .setReporter(storeReporter)
-        if replOutDir != null then
+        // In-memory dirs joining the compile's classpath: the REPL
+        // session output (rs$line$N modules) plus any `Eval.topLevel`
+        // handle output dirs the call links against.
+        val classDirs =
+          (if replOutDir == null then Nil else List(replOutDir)) ++ extraClassDirs
+        if classDirs.nonEmpty then
           freshCtx.base.initialize()(using freshCtx)
-          val replClassPath = ClassPathFactory.newClassPath(replOutDir)(using freshCtx)
-          freshCtx.platform.addToClassPath(replClassPath)(using freshCtx)
-          SymbolLoaders.mergeNewEntries(
-            defn(using freshCtx).RootClass,
-            ClassPath.RootPackage,
-            replClassPath,
-            freshCtx.platform.classPath(using freshCtx)
-          )(using freshCtx)
+          for dir <- classDirs do
+            val dirClassPath = ClassPathFactory.newClassPath(dir)(using freshCtx)
+            freshCtx.platform.addToClassPath(dirClassPath)(using freshCtx)
+            SymbolLoaders.mergeNewEntries(
+              defn(using freshCtx).RootClass,
+              ClassPath.RootPackage,
+              dirClassPath,
+              freshCtx.platform.classPath(using freshCtx)
+            )(using freshCtx)
         try
-          val compiler = new EvalCompiler(config)
+          val compiler = mkCompiler()
           val run = compiler.newRun(using freshCtx)
           run.compileFromStrings(source :: Nil)
           if storeReporter.hasErrors then
@@ -146,7 +184,7 @@ class EvalCompilerBridge:
           Left(Seq(s"Internal compiler error: ${e.getClass.getName}: ${e.getMessage}\n${sw.toString}"))
       case None =>
         Left(Seq("Failed to set up eval driver"))
-  end compile
+  end compileWith
 
   /** Driver subclass exposing `initCtx` so [[compile]] can install a
    *  buffering reporter before `setup`.

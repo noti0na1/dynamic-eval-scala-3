@@ -67,6 +67,25 @@ class EvalAdapter:
     val initialScope: Array[(String, Boolean)] =
       bindings.map(b => (b.name, b.isVar))
 
+    // `Eval.TopLevel` handles smuggled through synthetic bindings by
+    // `TopLevel.eval`: their compiled defs join this compile's
+    // classpath, an import inside the wrapper object brings them into
+    // scope, and the wrapper load chains their classloaders so every
+    // eval call through one handle shares a single class identity
+    // (and thus one copy of the defs' module state). The bindings
+    // stay in the array; the generated code never reads them, and
+    // their unique names discriminate handles in the cache key via
+    // the bindings fingerprint.
+    // Deduplicated by defs-object name: a nested call can carry the
+    // outer call's handle binding (propagated with the outer scope)
+    // plus its own appended copy, and a doubled wildcard import of
+    // the same object would make every defs name ambiguous.
+    val topLevelHandles: Array[Eval.TopLevel] =
+      bindings.collect {
+        case b if b.isSynthetic && b.name.startsWith(EvalNames.TopLevelBindingPrefix) =>
+          b.value.asInstanceOf[Eval.TopLevel]
+      }.distinctBy(_.objectName)
+
     // Cache key spans everything that affects the synthesised
     // bytecode: the body, its lexical context, the session imports,
     // the compiler settings, and the session classloader
@@ -176,9 +195,19 @@ class EvalAdapter:
     // top-level statements (typically a `def` or `val`) become valid
     // module-body members. The marker stays as an Ident for the
     // tree-level splice phase.
+    //
+    // Handle imports sit at the top of the wrapper object: inner to
+    // the file-level session imports, so a handle def wins a name
+    // collision with a session definition (like a nearer import), and
+    // outer to the enclosing statement, so call-site locals shadow
+    // the handle's defs. (An import inside the body instead would
+    // turn the local collision into a "defined and imported
+    // subsequently" ambiguity rather than choosing the local.)
+    val topLevelImports =
+      topLevelHandles.map(h => s"import ${h.objectName}.{given, *}\n").mkString
     val wrappedSource =
       s"""${importBlock}object $wrapperName {
-         |$effectiveEnclosing
+         |$topLevelImports$effectiveEnclosing
          |}
          |""".stripMargin
 
@@ -195,7 +224,8 @@ class EvalAdapter:
     )
 
     val bridge = EvalCompilerBridge()
-    bridge.compile(wrappedSource, outDir, classLoader, replOutDir, compilerSettings, replClasspath, config) match
+    val topLevelDirs = topLevelHandles.map(_.outputDir.asInstanceOf[AbstractFile]).toList
+    bridge.compile(wrappedSource, outDir, classLoader, replOutDir, compilerSettings, replClasspath, config, topLevelDirs) match
       case Left(errors) =>
         // Splice the body into the placeholder for display: a wrapper
         // showing `def f(...) = __evalBodyPlaceholder__` is opaque
@@ -210,9 +240,70 @@ class EvalAdapter:
         if cacheKey != null && !isTransient then EvalAdapter.cache.put(cacheKey, Left(failure))
         Left(failure)
       case Right(()) =>
-        val compiled = loadCompiled(outDir, classLoader, outputClassName)
+        val loadParent =
+          if topLevelHandles.isEmpty then classLoader
+          else new EvalAdapter.TopLevelChainLoader(topLevelHandles, classLoader)
+        val compiled = loadCompiled(outDir, loadParent, outputClassName)
         if cacheKey != null then EvalAdapter.cache.put(cacheKey, Right(compiled))
         invokeCached(compiled, bindings)
+
+  /** Compile `Eval.topLevel` definitions once. The defs are wrapped
+   *  in a fresh top-level object and compiled through the standard
+   *  pipeline (no splice, no marker) against the session's classpath,
+   *  imports, and settings. The returned handle owns the output dir
+   *  and a dedicated classloader parented on the session loader;
+   *  every later eval call that carries the handle compiles against
+   *  the dir and loads through the loader, so the defs keep one JVM
+   *  identity for the handle's lifetime (shared module state, stable
+   *  class identity across calls).
+   *
+   *  `contextHeader` is the file-level import context of the
+   *  `topLevel` call site (standalone mode); it is replayed inside
+   *  the defs object so the defs see the call site's package the way
+   *  top-level code in that file would. In the REPL it is empty and
+   *  the session imports arrive via `replWrapperImports`.
+   *
+   *  `-Xdynamic-eval` is stripped from the forwarded settings: an
+   *  eval call written inside the defs stays unrewritten (it would
+   *  otherwise capture an enclosing-source slice the runtime cannot
+   *  re-link, since the defs object is only on the classpath of eval
+   *  calls that carry the handle).
+   */
+  def compileTopLevel(
+      defs: String,
+      classLoader: ClassLoader,
+      replOutDir: AbstractFile | Null,
+      replWrapperImports: Array[String],
+      compilerSettings: Array[String],
+      contextHeader: String,
+      replClasspath: String = "",
+      evalLogDir: String = ""
+  ): Either[Eval.CompileFailure, Eval.TopLevel] =
+    val uuid = UUID.randomUUID().toString.replace('-', '_')
+    val objectName = s"__EvalTopLevel_$uuid"
+    val evalImport = "import _root_.dotty.tools.eval.Eval.{eval, evalSafe}\n"
+    val importBlock =
+      if replWrapperImports.isEmpty then evalImport
+      else evalImport + replWrapperImports.mkString("", "\n", "\n")
+    val headerBlock = if contextHeader.isEmpty then "" else s"$contextHeader\n"
+    // Plain concatenation, no stripMargin: user defs lines may begin
+    // with `|` (e.g. inside pattern matches) and must survive.
+    val source =
+      importBlock + s"object $objectName {\n" + headerBlock + defs + "\n}\n"
+    val logTimestamp =
+      if evalLogDir.isEmpty then ""
+      else writeEvalLogStart(evalLogDir, source, defs)
+    val settings = compilerSettings.filterNot(_ == "-Xdynamic-eval")
+    val outDir = new VirtualDirectory("<eval-toplevel>")
+    val bridge = EvalCompilerBridge()
+    bridge.compileDefs(source, outDir, classLoader, replOutDir, settings, replClasspath) match
+      case Left(errors) =>
+        val failure = new Eval.CompileFailure(errors.toArray, source)
+        if logTimestamp.nonEmpty then writeEvalLogError(evalLogDir, logTimestamp, failure)
+        Left(failure)
+      case Right(()) =>
+        val loader = new EvalAdapter.WrapperLoader(outDir, classLoader)
+        Right(new Eval.TopLevel(objectName, outDir, loader, defs))
 
   /** Load `__Expression` from the in-memory output dir and snapshot
    *  its constructor + `evaluate` method. The loader is rooted at
@@ -400,6 +491,36 @@ object EvalAdapter:
           try findClass(name)
           catch case _: ClassNotFoundException => parent.loadClass(name)
       }
+
+  /** Parent chain for wrapper loads that link `Eval.topLevel`
+   *  handles. Classes belonging to a handle's defs object (the object
+   *  class and everything nested under it, all named
+   *  `<objectName>` / `<objectName>$…`) resolve through that handle's
+   *  own long-lived loader, so every eval call through the handle
+   *  shares one `Class` identity, and thus one copy of the defs'
+   *  module state. Everything else delegates to the session loader.
+   *  Extends `URLClassLoader` with no URLs for the same
+   *  `ClasspathFromClassloader`-walkability reason as
+   *  [[WrapperLoader]].
+   */
+  private[eval] class TopLevelChainLoader(
+      handles: Array[Eval.TopLevel],
+      parent: ClassLoader
+  ) extends java.net.URLClassLoader(Array.empty[java.net.URL], parent):
+    override def loadClass(name: String): Class[?] =
+      var i = 0
+      while i < handles.length do
+        val h = handles(i)
+        if name == h.objectName || name.startsWith(h.objectName + "$") then
+          return h.loader.loadClass(name)
+        i += 1
+      // Delegate through the parent's *1-arg* `loadClass`, exactly as
+      // [[WrapperLoader]] does: `super.loadClass` would take the JVM's
+      // protected 2-arg delegation path, bypassing the session
+      // [[AbstractFileClassLoader]]'s routing override and redefining
+      // `dotty.tools.eval.*` via the compiler-classpath URLClassLoader
+      // (`LinkageError: loader constraint violation` on `Eval$Binding`).
+      parent.loadClass(name)
 
   /** Replace the first `__evalBodyPlaceholder__` in `wrappedSource`
    *  with `body` so compile-error messages show the actual code that

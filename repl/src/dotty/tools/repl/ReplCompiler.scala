@@ -315,17 +315,20 @@ object ReplCompiler:
   val ReplState: Property.StickyKey[State] = Property.StickyKey()
   val objectNames = mutable.Map.empty[Int, TermName]
 
-  /** An `import dotty.tools.eval.Eval.{eval, evalSafe}` at root-import
-   *  precedence (like `scala.*` and `Predef.*`), so the bare names
-   *  resolve in every REPL line while remaining shadowable by user
-   *  definitions. Built like [[ImportInfo.rootImport]] but with named
-   *  selectors: a wildcard would leak the whole `Eval` surface
-   *  (`bind`, `varRef`, `withAdapter`, ...) into the root namespace.
+  /** An `import dotty.tools.eval.Eval.{eval, evalSafe, topLevel,
+   *  topLevelSafe}` at root-import precedence (like `scala.*` and
+   *  `Predef.*`), so the bare names resolve in every REPL line while
+   *  remaining shadowable by user definitions. Built like
+   *  [[ImportInfo.rootImport]] but with named selectors: a wildcard
+   *  would leak the whole `Eval` surface (`bind`, `varRef`,
+   *  `withAdapter`, ...) into the root namespace.
    */
   private def evalRootImport(using Context): ImportInfo =
     val selectors =
       untpd.ImportSelector(untpd.Ident("eval".toTermName))
       :: untpd.ImportSelector(untpd.Ident("evalSafe".toTermName))
+      :: untpd.ImportSelector(untpd.Ident("topLevel".toTermName))
+      :: untpd.ImportSelector(untpd.Ident("topLevelSafe".toTermName))
       :: Nil
     def sym(using Context) =
       val expr = tpd.Ident(requiredModuleRef("dotty.tools.eval.Eval"))

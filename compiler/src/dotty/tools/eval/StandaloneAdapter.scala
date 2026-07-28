@@ -54,6 +54,21 @@ private[eval] object StandaloneAdapter:
         standalone = true
       )
 
+    override def compileTopLevel(
+        defs: String,
+        contextHeader: String
+    ): Either[Eval.CompileFailure, Eval.TopLevel] =
+      adapter.compileTopLevel(
+        defs = defs,
+        classLoader = callerClassLoader(),
+        replOutDir = null,
+        replWrapperImports = Array.empty,
+        compilerSettings = settingsFromProperty(),
+        contextHeader = contextHeader,
+        replClasspath = property("dotty.tools.eval.classpath"),
+        evalLogDir = property("dotty.tools.eval.logDir")
+      )
+
   private def property(name: String): String =
     val v = System.getProperty(name)
     if v == null then "" else v

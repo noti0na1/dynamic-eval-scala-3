@@ -20,6 +20,12 @@ computable at runtime. Identifiers in scope at the call site
 definitions, class members) are visible inside the body by their
 source name.
 
+A companion primitive, `topLevel(defs)`, compiles *definitions*
+once at the top level of the current package and returns a handle
+whose `eval` runs expressions against them at any later call
+site's local context, with state shared across calls (see
+"Top-level definitions" below).
+
 ## Quick start
 
 From a checkout of this repo, the fastest loop is the quick build
@@ -143,18 +149,20 @@ context parameter. A body reference that still cannot link (for
 example a by-name argument proxy of an inline call) is rejected with
 a diagnostic at body-compile time rather than failing at runtime.
 
-Other diagnosed limitations: an `Array` of a method-local class
-cannot cross the eval boundary (rejected with a diagnostic; use a
-`List`), and an eval call written inside an `inline def` warns that
-expansion sites will see the unrewritten call (the inline body is
-recorded before the rewriter runs). In the REPL, an eval body that
-names a session val *redefined* on a later line fails with an
-ambiguity error: the wrapper compile sees the session lines as
-same-scope wildcard imports, which do not shadow each other the way
-the REPL's own nested line contexts do. The narrower edges around
-linked local classes (a body-local class extending one, by-name
-constructor params, a user-defined `unapply` on a local module) are
-listed at the end of `EVAL-BINDINGS-DESIGN.md`.
+Other diagnosed limitations: a class declared in the body cannot
+*extend* a method-local class of the call site (rejected with a
+diagnostic;
+the subclass's `super.<init>` cannot be routed through the
+call-site factory closure), and an eval call written inside an
+`inline def` warns that expansion sites will see the unrewritten
+call (the inline body is recorded before the rewriter runs). In the
+REPL, an eval body that names a session val *redefined* on a later
+line fails with an ambiguity error: the wrapper compile sees the
+session lines as same-scope wildcard imports, which do not shadow
+each other the way the REPL's own nested line contexts do. The one
+remaining narrow edge around linked local classes (two same-named
+local classes resolving innermost-wins) is listed at the end of
+`EVAL-BINDINGS-DESIGN.md`.
 
 ## The idea
 
@@ -234,6 +242,141 @@ The compiler sees the original method's signature, its parameters,
 the enclosing class, the nearby imports. The body resolves
 identifiers against that context and is type checked against `T`
 exactly as if the user had written the expression in place.
+
+## Top-level definitions: `topLevel`
+
+`eval` fills a hole at an *expression* position. Its companion
+primitive fills the other kind of hole a program has: definitions
+at the top level of the current package.
+
+```scala
+scala> val h = topLevel("def f[T](x: List[T]): T = x.head")
+val h: dotty.tools.eval.Eval.TopLevel = Eval.TopLevel(__EvalTopLevel_…)
+
+scala> List(1, 2, 3).map(z => h.eval[Int]("f(List(z))"))
+val res0: List[Int] = List(1, 2, 3)
+```
+
+The two halves have opposite scoping rules, and each is enforced
+by construction rather than by a checker:
+
+* `topLevel(defs)` compiles `defs` once, eagerly, in the *global*
+  context of its call site: the enclosing package's members, the
+  file's top-level imports, and (in the REPL) previous session
+  lines all resolve; method-local values and types do not. The
+  primitive deliberately captures no bindings, so a def naming a
+  call-site local fails at the `topLevel` call itself, with the
+  ordinary "Not found" diagnostic.
+* `handle.eval(expr)` compiles `expr` at its own call site's
+  *local* context (lambda parameters, block locals, method type
+  parameters, everything plain `eval` captures), with the handle's
+  definitions additionally in scope, like calls to global
+  functions. In the example above, `f`'s type parameter
+  instantiates from the lambda parameter `z`, a value the defs
+  compile could never name.
+
+"Like a global function" pins the name-resolution order. A
+call-site local shadows a same-named handle def; a handle def
+shadows a same-named session or package-level definition:
+
+```scala
+scala> def sq(x: Int): Int = x + 1000
+scala> val h = topLevel("def sq(x: Int): Int = x * x")
+
+scala> h.eval[Int]("sq(5)")          // handle def beats the session def
+val res0: Int = 25
+
+scala> def m() = { def sq(x: Int) = x + 1; h.eval[Int]("sq(5)") }
+scala> m()                           // a local beats the handle def
+val res1: Int = 6
+```
+
+### One compile, one identity
+
+The defs compile once per handle, into a persistent output
+directory with a dedicated classloader, and every `handle.eval`
+links against those loaded classes. All eval calls through one
+handle therefore share a single JVM identity for the definitions.
+Mutable state carries across calls, including calls at different
+call sites:
+
+```scala
+scala> val h = topLevel("object C { var n = 0 }\ndef inc(): Int = { C.n += 1; C.n }")
+
+scala> (1 to 3).map(_ => h.eval[Int]("inc()"))
+val res0: IndexedSeq[Int] = Vector(1, 2, 3)
+
+scala> h.eval[Int]("inc()")          // a different call site, same C
+val res1: Int = 4
+```
+
+Class identity is stable the same way: an instance created by one
+call is usable by another, because both calls resolve the class to
+the same loaded `Class`:
+
+```scala
+scala> val h = topLevel("class Box(var v: Int)")
+scala> val b = h.eval[Any]("new Box(41)")
+scala> h.eval[Int]("b.asInstanceOf[Box].v + 1")
+val res0: Int = 42
+```
+
+Two `topLevel` calls with identical text are two compiles and two
+handles, like defining the object twice: each gets fresh state.
+
+### Givens across the boundary
+
+Context parameters resolve in every direction, with the same
+local-first priority as names. A def with a `using` clause can be
+satisfied by a given at the `.eval` call site (arriving through
+the given-binding capture), by a given the defs declare, or by a
+session-level given; when both the call site and the defs provide
+one, the call site's wins:
+
+```scala
+scala> trait Show[T] { def show(t: T): String }
+scala> val h = topLevel("def render[T](x: T)(using s: Show[T]): String = s.show(x)")
+
+scala> def demo() =
+     |   given Show[Int] = new Show[Int] { def show(t: Int) = "int:" + t }
+     |   h.eval[String]("render(5)")
+scala> demo()
+val res0: String = "int:5"
+```
+
+### `topLevelSafe`
+
+The non-throwing variant returns `EvalResult[TopLevel]`, carrying
+the defs' compile diagnostics as data. Since the defs compile
+eagerly, this is the natural shape for an agent that *generates
+library code*: on failure, feed `result.error.errors` back into
+the generator and retry, then hand the successful handle's `eval`
+to downstream tasks.
+
+Both forms work in ordinary programs under `-Xdynamic-eval` too.
+There the rewriter supplies the `topLevel` call site's file-level
+import header (top-level imports, the package import, the
+enclosing-object import), so the defs see the package exactly the
+way top-level code in that file would.
+
+### Mechanism in brief
+
+`Adapter.compileTopLevel` wraps the defs in a uniquely named
+top-level object and compiles it through the standard pipeline
+(one time, no splice marker). Each subsequent `handle.eval` rides
+the normal eval pipeline with three additions: the handle's output
+directory joins the wrapper compile's classpath, an
+`import <obj>.{given, *}` lands at the top of the synthesised
+wrapper object, and the compiled `__Expression` loads through a
+loader that routes the defs' classes to the handle's classloader.
+The import's position is what fixes the resolution order: it sits
+inner to the file-level session imports (handle beats session) and
+outer to the enclosing statement (locals beat handle; an import
+placed inside the body would instead make that collision a
+"defined and imported subsequently" ambiguity error). One
+limitation: an eval call written *inside* the defs is left
+unrewritten, so at runtime it compiles in the isolated global
+context, without the defs or any call-site scope.
 
 ## Safety
 
@@ -448,8 +591,10 @@ keep the surface API honest.
 `EvalRewriteTyped` runs after PostTyper, so it classifies an Apply
 into the eval pipeline using the resolved `Symbol` of the call
 target. Plain `Eval.eval` and `Eval.evalSafe` are matched by
-`sym.owner == Eval.moduleClass`. User defined generators are
-matched by an `@evalLike` or `@evalSafeLike` annotation on the
+`sym.owner == Eval.moduleClass`, as are `Eval.topLevel` and
+`Eval.topLevelSafe` (classified as the wrapper kinds, since they
+forward like user `@evalLike` wrappers). User defined generators
+are matched by an `@evalLike` or `@evalSafeLike` annotation on the
 method. A user who defines `def eval(s: String): Int` shadowing
 the import does *not* trigger the rewriter; the warning instead
 says
@@ -460,10 +605,11 @@ says
 > annotate the function with `@evalLike` (or `@evalSafeLike`).
 
 The rewriter cannot mis fire on unrelated code that happens to use
-the name `eval`. In the REPL the built-in names come in at
-root-import precedence (like `Predef` members), so a user
-definition of `eval` or `evalSafe`, on the same line or any earlier
-line, shadows the built-in and resolves like any ordinary method.
+the name `eval`. In the REPL the built-in names (`eval`,
+`evalSafe`, `topLevel`, `topLevelSafe`) come in at root-import
+precedence (like `Predef` members), so a user definition of any of
+them, on the same line or any earlier line, shadows the built-in
+and resolves like any ordinary method.
 
 **All or nothing on synthetic arguments.** Three of `eval`'s
 arguments are *synthetic*: `bindings`, `expectedType`, and
@@ -868,7 +1014,21 @@ marker-bearing methods out of their enclosing declarations:
   so the body resolves members against the live runtime module
   (state is shared, and a `case class` declared inside the object
   keeps one runtime identity) instead of a re-elaborated copy with
-  fresh state.
+  fresh state;
+* an *extension method*'s slice is widened to the `extension`
+  clause (the desugared def's span starts at `def`, which would
+  lose the extension parameter), and the marker-bearing member of
+  an extension group is renamed so recursion resolves to the live
+  session copy.
+
+Modules the lift cannot reach — an `object` nested in a *class*
+(one live module per enclosing instance) and a `private object`
+(its wildcard import would not typecheck) — keep the re-elaborated
+copy, and the call site captures the live module instance instead
+(`__this__`, `__this__<B>`, `__evalModule_<B>__`); the typed path
+then treats the wrapper-owned re-elaboration like a method-local
+class, so member access reflects against the live module and state
+is shared.
 
 After the lift, `this` references in the body are rewritten to
 `__this__` (or to the object's own name for a lifted singleton),
@@ -898,6 +1058,7 @@ reference into a `reflectEval(...)` placeholder carrying a
 | `MethodCall`         | private/protected method call     | `callMethod(qual, className, name, paramTpes, retTpe, args)` |
 | `MethodCapture`      | outer block local def call        | `getValue(name).asInstanceOf[FunctionN].apply(args*)`        |
 | `ConstructLocal`     | `new C(...)` on a linked local class | `getValue("__evalNew_C__$i").asInstanceOf[FunctionN].apply(args*)` |
+| `NewLinkedArray`     | `new Array[C](n)` of a linked local class | `newLinkedArray("C", n)` (reflective `Array.newInstance`) |
 | `BindingValue`       | linked module read / return key   | `getRaw("__evalModule_M__")` / `getRaw("__evalReturnKey__")` |
 
 Enclosing instances further out come in through the
@@ -916,8 +1077,15 @@ wrapper's re elaborated copy would force a wrong `checkcast`).
 Typed `catch` clauses naming a linked class are folded into a
 catch-all with explicit `isInstanceOf` tests here too: the JVM's
 exception table would otherwise name the re-elaborated class.
-Arrays of linked classes cannot cross the boundary; the phase
-rejects them with a known-limitation diagnostic (use a `List`).
+Arrays of linked classes (any dimension count) cross the boundary:
+captured reads cast to the `Object`-array type of the same depth
+(sound through JVM array covariance at every level; store checks
+run against the *runtime* component class), `new Array[…[C]…](n)`
+lowers to a reflective `newLinkedArray` helper, `Array.ofDim`'s
+`newArray` intrinsic lowers to `newLinkedArrayDims`, and
+`Array(...)` literals get their `ClassTag`'s `classOf` constants
+forwarded to the original (array) class in the post-erasure sweep,
+which also lowers array casts and type tests depth-aware.
 Body references to values introduced by inline expansion (the
 wrapper re-expands the same inline calls the call site did) lower
 to reads of the matching `__evalInlined_<name>__` bindings; a
@@ -1192,9 +1360,10 @@ scala3-repl/test
 ```
 
 The eval tests are split into suites by axis. The end-to-end
-suites (in `repl/test/dotty/tools/eval/DynamicEvalTests.scala`)
-drive the real REPL by feeding it source lines and asserting on
-the session output:
+suites (in `repl/test/dotty/tools/eval/DynamicEvalTests.scala`,
+plus `TopLevelEvalTests.scala` for the last row) drive the real
+REPL by feeding it source lines and asserting on the session
+output:
 
 | Suite                            | What it covers                                                                 | REPL flags exercised                          |
 |----------------------------------|--------------------------------------------------------------------------------|-----------------------------------------------|
@@ -1204,6 +1373,7 @@ the session output:
 | `DynamicEvalSafeModeTests`       | Safe-mode checks applied to the body, including the verify-compile pass.        | `-language:experimental.safe`                 |
 | `DynamicEvalAgentApiTests`       | The `@evalLike` / `@evalSafeLike` wrapper API, the `eval { ctx => ... }` closure form, and `EvalContext`. | (defaults)                                    |
 | `DynamicEvalLogTests`            | The per-invocation log files written by `-Xrepl-eval-log-dir`.                 | `-Xrepl-eval-log-dir:<dir>`                   |
+| `TopLevelEvalTests`              | The `topLevel` primitive: defs applied to call-site locals and local type arguments, shared module state and stable class identity across call sites, local-first name resolution, `using`/`given` in every direction, isolation and eager errors. | (defaults)                                    |
 
 `StandaloneEvalTests` (in
 `repl/test/dotty/tools/eval/StandaloneEvalTests.scala`) covers the
@@ -1214,8 +1384,11 @@ through the standalone adapter. It covers basics, captures of every
 kind, live module state (top-level, method-local, and nested
 objects, including their case classes and private members),
 top-level definitions, named packages, class members, nested eval,
-compile-error reporting, non-local `return`, flag gating, and
-settings forwarding via `dotty.tools.eval.settings`.
+compile-error reporting, non-local `return`, flag gating,
+settings forwarding via `dotty.tools.eval.settings`, and the
+`topLevel` primitive (package-context visibility with call-site
+isolation, shared module state across call sites, stable class
+identity).
 
 The lower-level unit tests (in
 `repl/test/dotty/tools/eval/`) exercise the pipeline without
