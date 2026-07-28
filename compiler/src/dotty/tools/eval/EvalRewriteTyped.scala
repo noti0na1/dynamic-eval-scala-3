@@ -1570,6 +1570,12 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       ref(EvalRewriteTyped.withInheritedHandlesSym)
         .appliedTo(Literal(Constant(enclosingDefsObjectName)), arr)
         .withSpan(span)
+        // Under capture checking the method's `Array` result picks up
+        // a fresh mutability capture the pure `bindings` parameter
+        // type cannot accept; the array is inert plumbing, so its
+        // result is assumed pure — the same posture the bare literal
+        // had before the wrap.
+        .withAttachment(CheckCaptures.AssumePure, ())
 
     /** The name of the `topLevel` defs object this call site is
      *  compiled inside, or "" — its handle does not exist during the

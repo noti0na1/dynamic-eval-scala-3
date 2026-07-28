@@ -47,3 +47,18 @@ class EvalCaptureTypeTests extends ReplTest(ReplTest.defaultOptions :+ "-languag
       """val r = twice(21)""")(
       "val r: Int = 42")
   }
+
+  @Test def captureCallInsideCcCheckedBody = initially {
+    // An @evalLike capture INSIDE a cc-checked eval body: the
+    // rewriter's `withInheritedHandles` wrap around the captured
+    // bindings array must recheck as pure (the AssumePure
+    // attachment), or its `Array` result picks up a fresh mutability
+    // capture the pure `bindings` parameter type refuses and the
+    // body fails to compile.
+    expectSteps(
+      """import dotty.tools.eval.{Eval, evalLike}""",
+      """@evalLike def count(bindings: Array[Eval.Binding] = Array.empty[Eval.Binding], expectedType: String = "", enclosingSource: String = ""): Int = bindings.count(!_.isSynthetic)""",
+      """def m(x: Int): Int = eval[Int]("count()")""",
+      """val n = m(3)""")(
+      "val n: Int = 1")
+  }
