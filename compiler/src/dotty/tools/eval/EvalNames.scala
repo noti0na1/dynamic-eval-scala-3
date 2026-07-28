@@ -53,6 +53,15 @@ private[eval] object EvalNames:
   /** Key object for non-local `return` out of the eval body. */
   val ReturnKeyBinding: String = "__evalReturnKey__"
 
+  /** Reserved prefix of the synthetic object a `topLevel` defs
+   *  compile wraps the definitions in. The rewriter recognises a
+   *  call site compiled inside such an object by this prefix, so the
+   *  capture re-attaches the object's own handle at runtime through
+   *  the registry — the handle itself does not exist yet while the
+   *  defs compile.
+   */
+  val TopLevelObjectPrefix: String = "__EvalTopLevel_"
+
   /** Reserved prefix for [[Eval.TopLevel]] handle bindings. A
    *  `TopLevel.eval` call appends one synthetic binding per handle
    *  (name built by [[topLevelBinding]], value the handle itself);

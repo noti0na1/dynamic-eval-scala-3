@@ -293,3 +293,67 @@ class TopLevelEvalTests extends ReplTest:
       """val r = h.evalSafe[Int]("undefinedName123").isFailure""")(
       "val r: Boolean = true")
   }
+
+  // ===========================================================================
+  // 6. Captures keep the link: a bindings array taken inside a
+  //    handle's world stays usable after the call returns.
+  // ===========================================================================
+
+  @Test def captureInsideBodyKeepsHandleBinding = initially {
+    // `snap()` is an @evalLike capture taken INSIDE `h.eval`'s body.
+    // The rewriter cannot see the handle binding (it has no name in
+    // the source), so the runtime re-attaches it: the captured array
+    // carries a `__evalTopLevel_…` entry, and a later eval against
+    // that array still resolves the defs.
+    expectSteps(
+      """import dotty.tools.eval.{Eval, evalLike}""",
+      """@evalLike def snap(bindings: Array[Eval.Binding] = Array.empty[Eval.Binding], expectedType: String = "", enclosingSource: String = ""): Array[Eval.Binding] = bindings""",
+      """val h = topLevel("case class N(v: Int)\ndef mk(v: Int): N = N(v)")""",
+      """val st = h.eval[Array[Eval.Binding]]("snap()")""",
+      """val kept = st.exists(_.name.startsWith("__evalTopLevel_"))""",
+      """val out = Eval.eval[Int]("mk(20).v + 1", st, "", "")""")(
+      "val kept: Boolean = true",
+      "val out: Int = 21")
+  }
+
+  @Test def captureInsideDefsRelinks = initially {
+    // The defs compile runs the rewrite phase too: an @evalLike call
+    // inside a defs member captures the member's own scope (the
+    // parameter `v`), its slice (the member around the marker, with
+    // the defs-object import in front), and — at runtime, through the
+    // registry — the handle of the defs object it was compiled
+    // inside. Splicing a later eval against the captured slice runs
+    // inside `probe`'s body: the parameter and the defs' classes both
+    // resolve. This is what makes an agent-style `getState()` written
+    // inside a topLevel function work.
+    // `probe` declares `Any`, so a later body of any type conforms in
+    // the captured slice's result position — the same shape an
+    // embedder's chain wrapper uses.
+    expectSteps(
+      """import dotty.tools.eval.{Eval, evalLike}""",
+      """@evalLike def snap2(bindings: Array[Eval.Binding] = Array.empty[Eval.Binding], expectedType: String = "", enclosingSource: String = ""): (Array[Eval.Binding], String) = (bindings, enclosingSource)""",
+      """val h = topLevel("case class M(v: Int)\ndef probe(v: Int): Any = snap2()")""",
+      """val st = h.eval[Any]("probe(7)").asInstanceOf[(Array[Eval.Binding], String)]""",
+      """val hasParam = st._1.exists(_.name == "v")""",
+      """val hasHandle = st._1.exists(_.name.startsWith("__evalTopLevel_"))""",
+      """val hasMarker = st._2.contains("__evalBodyPlaceholder__")""",
+      """val out = Eval.eval[Int]("M(v).v + 1", st._1, "", st._2)""")(
+      "val hasParam: Boolean = true",
+      "val hasHandle: Boolean = true",
+      "val hasMarker: Boolean = true",
+      "val out: Int = 8")
+  }
+
+  @Test def defsImportsReachACapturedSlice = initially {
+    // Leading import lines of the defs sit at FILE level of the
+    // synthesised unit, so the rewriter records them into slices: a
+    // capture inside the defs re-resolves `ListBuffer` when a later
+    // eval splices against it.
+    expectSteps(
+      """import dotty.tools.eval.{Eval, evalLike}""",
+      """@evalLike def snap3(bindings: Array[Eval.Binding] = Array.empty[Eval.Binding], expectedType: String = "", enclosingSource: String = ""): (Array[Eval.Binding], String) = (bindings, enclosingSource)""",
+      """val h = topLevel("import scala.collection.mutable.ListBuffer\ndef gather(seed: Int): Any = { val buf = ListBuffer(seed); snap3() }")""",
+      """val st = h.eval[Any]("gather(5)").asInstanceOf[(Array[Eval.Binding], String)]""",
+      """val out = Eval.eval[Int]("buf.sum + ListBuffer(1).sum", st._1, "", st._2)""")(
+      "val out: Int = 6")
+  }

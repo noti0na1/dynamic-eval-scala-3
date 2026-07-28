@@ -104,6 +104,7 @@ class EvalCaptureInlined(
     private var apiResolved = false
     private var evalModuleCls: Symbol = NoSymbol
     private var bindSyntheticFn: Symbol = NoSymbol
+    private var withInheritedFn: Symbol = NoSymbol
     private var evalLikeAnnot: Symbol = NoSymbol
     private var evalSafeLikeAnnot: Symbol = NoSymbol
 
@@ -114,6 +115,7 @@ class EvalCaptureInlined(
         if mod.exists then
           evalModuleCls = mod.moduleClass
           bindSyntheticFn = mod.requiredMethod("bindSynthetic")
+          withInheritedFn = mod.requiredMethod("withInheritedHandles")
         evalLikeAnnot = getClassIfDefined("dotty.tools.eval.evalLike")
         evalSafeLikeAnnot = getClassIfDefined("dotty.tools.eval.evalSafeLike")
 
@@ -126,14 +128,23 @@ class EvalCaptureInlined(
       }
 
     /** A rewriter-built bindings argument: a `JavaSeqLiteral` whose
-     *  element type is `Eval.Binding`.
+     *  element type is `Eval.Binding`, possibly inside the
+     *  `Eval.withInheritedHandles(<defsObject>, <literal>)` wrap the
+     *  rewriter routes every array through. Returns the literal and
+     *  a rebuild that re-establishes the original shape around a
+     *  replacement literal.
      */
-    private def isFilledBindingsArg(arg: Tree)(using Context): Boolean =
+    private def filledBindingsArg(arg: Tree)(using Context): Option[(JavaSeqLiteral, JavaSeqLiteral => Tree)] =
+      def isBindingsLiteral(lit: JavaSeqLiteral): Boolean =
+        val elem = lit.elemtpt.tpe.typeSymbol
+        elem.name.toString == "Binding" && elem.maybeOwner == evalModuleCls
       arg match
-        case lit: JavaSeqLiteral =>
-          val elem = lit.elemtpt.tpe.typeSymbol
-          elem.name.toString == "Binding" && elem.maybeOwner == evalModuleCls
-        case _ => false
+        case lit: JavaSeqLiteral if isBindingsLiteral(lit) =>
+          Some((lit, identity))
+        case app @ Apply(fun, List(defsObj, lit: JavaSeqLiteral))
+            if withInheritedFn.exists && fun.symbol == withInheritedFn && isBindingsLiteral(lit) =>
+          Some((lit, newLit => cpy.Apply(app)(fun, List(defsObj, newLit))))
+        case _ => None
 
     override def transform(tree: Tree)(using Context): Tree = tree match
       case tree: Inlined =>
@@ -182,9 +193,9 @@ class EvalCaptureInlined(
       case _ => super.transform(tree)
 
     private def appendInlinedBindings(app: Apply)(using Context): Tree =
-      val argIdx = app.args.indexWhere(isFilledBindingsArg)
+      val argIdx = app.args.indexWhere(a => filledBindingsArg(a).isDefined)
       if argIdx < 0 then return app
-      val lit = app.args(argIdx).asInstanceOf[JavaSeqLiteral]
+      val (lit, rebuild) = filledBindingsArg(app.args(argIdx)).get
       val span = app.span
       val seen = mutable.Set.empty[String]
       val appended = frames.flatMap { frame =>
@@ -207,7 +218,7 @@ class EvalCaptureInlined(
       if appended.isEmpty then app
       else
         val newLit = cpy.SeqLiteral(lit)(lit.elems ++ appended, lit.elemtpt)
-        cpy.Apply(app)(app.fun, app.args.updated(argIdx, newLit))
+        cpy.Apply(app)(app.fun, app.args.updated(argIdx, rebuild(newLit.asInstanceOf[JavaSeqLiteral])))
 
   end Capture
 

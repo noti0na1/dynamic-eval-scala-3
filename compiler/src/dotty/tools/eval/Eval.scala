@@ -296,7 +296,16 @@ object Eval:
       val defs: String
   ):
     private def withHandle(bindings: Array[Binding]): Array[Binding] =
-      bindings :+ bindSynthetic(EvalNames.topLevelBinding(objectName), this)
+      bindings :+ binding
+
+    /** The synthetic binding that links this handle's definitions
+     *  into an eval call: the reserved name scheme with the handle
+     *  itself as the value. Public so an embedder holding a captured
+     *  bindings array (a chain kept across steps) can re-attach the
+     *  link explicitly instead of reconstructing the reserved name.
+     *  Appending it twice is harmless: the adapter deduplicates
+     *  handle bindings per defs object. */
+    def binding: Binding = bindSynthetic(EvalNames.topLevelBinding(objectName), this)
 
     /** Evaluate `code` at this call site's local context with the
      *  handle's definitions in scope. Throws [[EvalCompileException]]
@@ -351,6 +360,62 @@ object Eval:
     active.set(adapter)
     try thunk
     finally if prev == null then active.remove() else active.set(prev)
+
+  /** [[TopLevel]] handles whose wrapper `evaluate()` is on this
+   *  thread's stack right now (or an ancestor thread's at creation
+   *  time — inheritable for the same reason as the adapter above).
+   *  Set around the wrapper invocation by the adapter; read by
+   *  [[withInheritedHandles]] so a capture taken while a handle's
+   *  code runs keeps the handle's link. */
+  private val activeHandles = new InheritableThreadLocal[List[TopLevel]]:
+    override def initialValue(): List[TopLevel] = Nil
+
+  private[eval] def currentActiveHandles: List[TopLevel] = activeHandles.get
+
+  private[eval] def setActiveHandles(hs: List[TopLevel]): Unit =
+    if hs.isEmpty then activeHandles.remove() else activeHandles.set(hs)
+
+  /** Live handles by defs-object name. Registered when the adapter
+   *  builds a handle; weakly held, so the registry never keeps a
+   *  handle (and its classloader) alive on its own. Lets code
+   *  compiled *inside* a defs object re-attach its own handle at
+   *  capture time even when it runs outside any `handle.eval` call. */
+  private object TopLevelRegistry:
+    private val entries =
+      java.util.concurrent.ConcurrentHashMap[String, java.lang.ref.WeakReference[TopLevel]]()
+    def register(h: TopLevel): Unit =
+      entries.put(h.objectName, java.lang.ref.WeakReference(h))
+      ()
+    def lookup(objectName: String): TopLevel | Null =
+      val ref = entries.get(objectName)
+      if ref == null then null
+      else
+        val h = ref.get()
+        if h == null then entries.remove(objectName)
+        h
+
+  private[eval] def registerTopLevel(h: TopLevel): Unit = TopLevelRegistry.register(h)
+
+  /** Called by rewriter-generated code around every captured bindings
+   *  array (see `EvalRewriteTyped.buildBindingsArray`): appends the
+   *  handle bindings a capture would otherwise lose — the handles of
+   *  the eval calls executing on this thread, and the handle of the
+   *  `topLevel` defs object the call site was compiled inside
+   *  (`defsObject`, empty when it was not). Deduplicated against the
+   *  array and each other by binding name; a no-op returning the
+   *  array unchanged when there is nothing to add. JVM-simple
+   *  signature, like the rest of the generated-code surface. */
+  def withInheritedHandles(defsObject: String, bindings: Array[Binding]): Array[Binding] =
+    val own =
+      if defsObject.isEmpty then Nil
+      else TopLevelRegistry.lookup(defsObject) match
+        case null         => Nil
+        case h: TopLevel  => h :: Nil
+    val extra = (activeHandles.get ++ own)
+      .distinctBy(_.objectName)
+      .map(_.binding)
+      .filterNot(b => bindings.exists(_.name == b.name))
+    if extra.isEmpty then bindings else bindings ++ extra
 
   /** Compile and run `code` against the current REPL session.
    *

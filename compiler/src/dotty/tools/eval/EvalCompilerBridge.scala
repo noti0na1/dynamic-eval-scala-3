@@ -103,6 +103,13 @@ class EvalCompilerBridge:
    *  `Eval.topLevel` defs compile: the output classes persist for the
    *  handle's lifetime and later [[compile]] calls see them via
    *  `extraClassDirs`.
+   *
+   *  The eval rewrite phase is forced on ([[DefsCompiler]]) rather
+   *  than left to `-Xdynamic-eval`: a REPL session compiles defs
+   *  without the flag, and an eval-like call written inside the defs
+   *  must still capture its scope — its slice re-links later through
+   *  the handle the capture re-attaches at runtime (see
+   *  `Eval.withInheritedHandles`).
    */
   def compileDefs(
       source: String,
@@ -113,7 +120,7 @@ class EvalCompilerBridge:
       replClasspath: String
   ): Either[Seq[String], Unit] =
     compileWith(source, outDir, classLoader, replOutDir, Nil,
-      compilerSettings, replClasspath, () => new Compiler)
+      compilerSettings, replClasspath, () => new EvalCompilerBridge.DefsCompiler)
 
   private def compileWith(
       source: String,
@@ -233,3 +240,18 @@ class EvalCompilerBridge:
       else kept += a
       i += 1
     (found, kept.result())
+
+object EvalCompilerBridge:
+  /** The standard pipeline with the eval rewrite phase forced on.
+   *  The `Eval.topLevel` defs compile goes through this: an
+   *  eval-like call written inside the defs must capture its scope
+   *  like any other call site, and gating on `-Xdynamic-eval` would
+   *  leave it unrewritten in a REPL session, which never passes the
+   *  flag. */
+  private[eval] class DefsCompiler extends Compiler:
+    override protected def frontendPhases: List[List[dotty.tools.dotc.core.Phases.Phase]] =
+      super.frontendPhases.map(_.map {
+        case p if p.phaseName == EvalRewriteTyped.name =>
+          new EvalRewriteTyped(None, alwaysEnabled = true)
+        case p => p
+      })

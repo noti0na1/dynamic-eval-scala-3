@@ -80,11 +80,7 @@ class EvalAdapter:
     // outer call's handle binding (propagated with the outer scope)
     // plus its own appended copy, and a doubled wildcard import of
     // the same object would make every defs name ambiguous.
-    val topLevelHandles: Array[Eval.TopLevel] =
-      bindings.collect {
-        case b if b.isSynthetic && b.name.startsWith(EvalNames.TopLevelBindingPrefix) =>
-          b.value.asInstanceOf[Eval.TopLevel]
-      }.distinctBy(_.objectName)
+    val topLevelHandles: Array[Eval.TopLevel] = topLevelHandlesIn(bindings)
 
     // Cache key spans everything that affects the synthesised
     // bytecode: the body, its lexical context, the session imports,
@@ -258,16 +254,21 @@ class EvalAdapter:
    *  class identity across calls).
    *
    *  `contextHeader` is the file-level import context of the
-   *  `topLevel` call site (standalone mode); it is replayed inside
-   *  the defs object so the defs see the call site's package the way
-   *  top-level code in that file would. In the REPL it is empty and
-   *  the session imports arrive via `replWrapperImports`.
+   *  `topLevel` call site (standalone mode); in the REPL it is empty
+   *  and the session imports arrive via `replWrapperImports`.
    *
-   *  `-Xdynamic-eval` is stripped from the forwarded settings: an
-   *  eval call written inside the defs stays unrewritten (it would
-   *  otherwise capture an enclosing-source slice the runtime cannot
-   *  re-link, since the defs object is only on the classpath of eval
-   *  calls that carry the handle).
+   *  All imports — the context header and the defs' own leading
+   *  import lines — are placed at the FILE level of the synthesised
+   *  unit, not inside the object. Same resolution for the defs
+   *  themselves, but file-level imports are what the rewriter records
+   *  into an enclosing-source slice: an eval-like call *inside* the
+   *  defs is rewritten like any other (the defs compile runs the
+   *  rewrite phase unconditionally, see
+   *  `EvalCompilerBridge.compileDefs`), and its captured slice must
+   *  re-resolve those imports when a later eval splices against it.
+   *  The capture re-attaches this object's handle at runtime through
+   *  the registry (`Eval.withInheritedHandles`), which is what puts
+   *  the defs back on that later eval's classpath.
    */
   def compileTopLevel(
       defs: String,
@@ -280,30 +281,52 @@ class EvalAdapter:
       evalLogDir: String = ""
   ): Either[Eval.CompileFailure, Eval.TopLevel] =
     val uuid = UUID.randomUUID().toString.replace('-', '_')
-    val objectName = s"__EvalTopLevel_$uuid"
+    val objectName = s"${EvalNames.TopLevelObjectPrefix}$uuid"
     val evalImport = "import _root_.dotty.tools.eval.Eval.{eval, evalSafe}\n"
     val importBlock =
       if replWrapperImports.isEmpty then evalImport
       else evalImport + replWrapperImports.mkString("", "\n", "\n")
     val headerBlock = if contextHeader.isEmpty then "" else s"$contextHeader\n"
+    val (defsImports, defsBody) = splitLeadingImports(defs)
+    val importsBlock = if defsImports.isEmpty then "" else s"$defsImports\n"
     // Plain concatenation, no stripMargin: user defs lines may begin
     // with `|` (e.g. inside pattern matches) and must survive.
     val source =
-      importBlock + s"object $objectName {\n" + headerBlock + defs + "\n}\n"
+      importBlock + headerBlock + importsBlock +
+        s"object $objectName {\n" + defsBody + "\n}\n"
     val logTimestamp =
       if evalLogDir.isEmpty then ""
       else writeEvalLogStart(evalLogDir, source, defs)
-    val settings = compilerSettings.filterNot(_ == "-Xdynamic-eval")
     val outDir = new VirtualDirectory("<eval-toplevel>")
     val bridge = EvalCompilerBridge()
-    bridge.compileDefs(source, outDir, classLoader, replOutDir, settings, replClasspath) match
+    bridge.compileDefs(source, outDir, classLoader, replOutDir, compilerSettings, replClasspath) match
       case Left(errors) =>
         val failure = new Eval.CompileFailure(errors.toArray, source)
         if logTimestamp.nonEmpty then writeEvalLogError(evalLogDir, logTimestamp, failure)
         Left(failure)
       case Right(()) =>
         val loader = new EvalAdapter.WrapperLoader(outDir, classLoader)
-        Right(new Eval.TopLevel(objectName, outDir, loader, defs))
+        val handle = new Eval.TopLevel(objectName, outDir, loader, defs)
+        Eval.registerTopLevel(handle)
+        Right(handle)
+
+  /** The leading blank/`import` lines of a defs string, split off so
+   *  they can sit at file level of the synthesised unit. */
+  private def splitLeadingImports(defs: String): (String, String) =
+    val lines = defs.linesWithSeparators.toList
+    val (imports, rest) = lines.span(l => l.trim.isEmpty || l.trim.startsWith("import "))
+    (imports.mkString.strip, rest.mkString)
+
+  /** The [[Eval.TopLevel]] handles smuggled through a bindings array
+   *  by `TopLevel.eval` (or re-attached by a capture), deduplicated
+   *  by defs object: a nested call can carry the outer call's handle
+   *  binding plus its own appended copy, and a doubled wildcard
+   *  import of the same object would make every defs name ambiguous. */
+  private def topLevelHandlesIn(bindings: Array[Eval.Binding]): Array[Eval.TopLevel] =
+    bindings.collect {
+      case b if b.isSynthetic && b.name.startsWith(EvalNames.TopLevelBindingPrefix) =>
+        b.value.asInstanceOf[Eval.TopLevel]
+    }.distinctBy(_.objectName)
 
   /** Load `__Expression` from the in-memory output dir and snapshot
    *  its constructor + `evaluate` method. The loader is rooted at
@@ -353,12 +376,23 @@ class EvalAdapter:
       bindings: Array[Eval.Binding]
   ): Either[Eval.CompileFailure, Any] =
     val thisObject = extractThisObject(bindings)
+    // While the wrapper body runs, its handles are "active" on this
+    // thread: a capture the body takes (a nested eval-like call
+    // building a bindings array) re-attaches them through
+    // `Eval.withInheritedHandles`, so a bindings array that outlives
+    // this call keeps the defs linked. Restored in a finally — the
+    // stack nests with recursive evals.
+    val handles = topLevelHandlesIn(bindings)
+    val savedHandles = Eval.currentActiveHandles
+    if handles.nonEmpty then Eval.setActiveHandles(handles.toList ::: savedHandles)
     try
       val instance = compiled.ctor.newInstance(thisObject, bindings).asInstanceOf[AnyRef]
       Right(compiled.evaluate.invoke(instance))
     catch case e: java.lang.reflect.InvocationTargetException =>
       val cause = e.getCause
       if cause != null then throw cause else throw e
+    finally
+      if handles.nonEmpty then Eval.setActiveHandles(savedHandles)
 
   /** Write the per-invocation log files for an eval call:
    *
