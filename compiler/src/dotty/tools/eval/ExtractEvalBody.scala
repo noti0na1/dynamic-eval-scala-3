@@ -825,7 +825,7 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
      */
     private def isAccessibleViaStaticPrefix(tree: Tree)(using Context): Boolean =
       val sym = tree.symbol
-      if sym.exists && (sym.isPrivate || sym.is(Protected)) then false
+      if sym.exists && (sym.is(Private) || sym.is(Protected)) then false
       else tree.tpe match
         case tref: TermRef => isStaticPrefix(tref.prefix)
         case _ => false
@@ -846,12 +846,12 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
     private def isInaccessibleField(tree: Tree)(using Context): Boolean =
       val sym = tree.symbol
       sym.exists && sym.isField && sym.enclosingClass.isClass &&
-        (sym.isPrivate || sym.is(Protected)) && !isLocalToBody(sym)
+        (sym.is(Private) || sym.is(Protected)) && !isLocalToBody(sym)
 
     private def isInaccessibleMethod(tree: Tree)(using Context): Boolean =
       val sym = tree.symbol
       sym.exists && sym.isRealMethod && sym.enclosingClass.isClass &&
-        (sym.isPrivate || sym.is(Protected)) && !isLocalToBody(sym)
+        (sym.is(Private) || sym.is(Protected)) && !isLocalToBody(sym)
 
     /** Field or val-getter of a class declared inside a method body.
      *  The wrapper compile re-elaborates the class as a fresh JVM
@@ -870,7 +870,7 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
       sym.exists && sym.isField && sym.enclosingClass.isClass &&
         isTermOwnedSymbol(sym.enclosingClass) &&
         !isLocalToBody(sym) &&
-        !sym.isPrivate && !sym.is(Protected)
+        !sym.is(Private) && !sym.is(Protected)
 
     private def isTermOwnedClassMethodCall(tree: Tree)(using Context): Boolean =
       val sym = tree.symbol
@@ -878,7 +878,7 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
         sym.enclosingClass.isClass &&
         isTermOwnedSymbol(sym.enclosingClass) &&
         !isLocalToBody(sym) &&
-        !sym.isPrivate && !sym.is(Protected)
+        !sym.is(Private) && !sym.is(Protected)
 
     /** True when `cls` is a class the wrapper compile *re-elaborated*,
      *  i.e. its runtime instances belong to a different JVM class
@@ -1152,7 +1152,7 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
      */
     private def isGloballyAccessible(sym: Symbol)(using Context): Boolean =
       if !sym.exists then false
-      else if sym.isPrivate || sym.is(Protected) then false
+      else if sym.is(Private) || sym.is(Protected) then false
       else if sym.is(Package) || sym.is(PackageClass) then true
       else
         val owner = sym.owner

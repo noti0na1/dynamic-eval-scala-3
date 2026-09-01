@@ -39,6 +39,16 @@ class ReplHistoryTests
       s.contains("hello world"))
   }
 
+  @Test def preservesUnicodeInLiveAndRecordedOutput = initially {
+    run("""val unicode = "→ 🤪 T²"""")
+    val live = storedOutput()
+    val recorded = historyContent
+    assertTrue(s"expected Unicode in live output, got:\n$live",
+      live.contains("→ 🤪 T²"))
+    assertTrue(s"expected Unicode in recorded output, got:\n$recorded",
+      recorded.contains("→ 🤪 T²"))
+  }
+
   @Test def appendsAcrossLines = initially {
     run("val a = 1")
     run("val b = 2")
@@ -69,6 +79,44 @@ class ReplHistoryTests
     val s = historyContent
     assertTrue(s"expected `scala> :imports` to be recorded, got:\n$s",
       s.contains("scala> :imports"))
+  }
+
+  @Test def allCommandShapesAreRecorded = initially {
+    val afterSave = run(":save")
+    val afterReplay = run(":replay")(using afterSave)
+    val afterToolkit = run(":toolkit")(using afterReplay)
+    val afterRepository = run(":repository")(using afterToolkit)
+    run(":paste")(using afterRepository)
+
+    val s = historyContent
+    List(":save", ":replay", ":toolkit", ":repository", ":paste").foreach: command =>
+      assertTrue(s"expected `scala> $command` to be recorded, got:\n$s",
+        s.contains(s"scala> $command"))
+  }
+
+  @Test def commandThenCodeIsRecordedAsOneEntry = initially {
+    run(":settings -deprecation\nval afterCommand = 1")
+    val s = historyContent
+    assertTrue(s"expected the command as the entry input, got:\n$s",
+      s.contains("scala> :settings -deprecation"))
+    assertTrue(s"expected the code as a continuation line, got:\n$s",
+      s.contains("     | val afterCommand = 1"))
+    assertFalse(s"expected no detached entry for the trailing code, got:\n$s",
+      s.contains("scala> val afterCommand = 1"))
+  }
+
+  @Test def replayIsRecordedAsOneEntry = initially {
+    val populated = run("val replayed = 42")
+    ReplHistoryTests.historyFile.delete()
+
+    run(":replay")(using populated)
+    val s = historyContent
+    assertTrue(s"expected the replay command as the entry input, got:\n$s",
+      s.startsWith("scala> :replay\n"))
+    assertTrue(s"expected replayed output in the command entry, got:\n$s",
+      s.contains("val replayed: Int = 42"))
+    assertEquals(s"expected no nested transcript entries, got:\n$s",
+      1, "scala> ".r.findAllMatchIn(s).size)
   }
 
   @Test def oversizedOutputIsTruncatedWithMarker = initially {

@@ -541,15 +541,16 @@ class ReplDriver(settings: Array[String],
 
   /** The raw input text associated with `res`, for history bookkeeping.
    *  Returns "" for non-input results (Newline, SigKill) so they aren't
-   *  recorded. Command input is reconstructed from the parsed command
-   *  (the parser does not retain the raw line), so a history entry for
-   *  `:imports` etc. records what was typed, not just its output.
+   *  recorded. Command input is reconstructed canonically from the parsed
+   *  command (the parser does not retain aliases, prefixes, or spacing), so
+   *  a history entry for `:imports` etc. still includes an input prompt.
    */
   private def parseResultInput(res: ParseResult): String = res match
-    case p: Parsed       => p.source.content().mkString
-    case s: SyntaxErrors => s.sourceCode
-    case cmd: Command    => commandInput(cmd)
-    case _               => ""
+    case p: Parsed                  => p.source.content().mkString
+    case s: SyntaxErrors            => s.sourceCode
+    case CommandThenCode(cmd, code) => s"${commandInput(cmd)}\n$code"
+    case cmd: Command               => commandInput(cmd)
+    case _                          => ""
 
   private def commandInput(cmd: Command): String =
     def withArg(name: String, arg: String) =
@@ -558,16 +559,21 @@ class ReplDriver(settings: Array[String],
       case UnknownCommand(c)      => c
       case AmbiguousCommand(c, _) => c
       case Dep(dep)               => withArg(Dep.command, dep)
+      case Save(path)             => withArg(Save.command, path)
       case Load(path)             => withArg(Load.command, path)
       case Require(path)          => withArg(Require.command, path)
       case JarCmd(path)           => withArg(JarCmd.command, path)
+      case ToolkitCmd(coords)     => withArg(ToolkitCmd.command, coords)
+      case RepoCmd(repositories)  => withArg(RepoCmd.command, repositories)
       case KindOf(expr)           => withArg(KindOf.command, expr)
       case TypeOf(expr)           => withArg(TypeOf.command, expr)
       case DocOf(expr)            => withArg(DocOf.command, expr)
       case Settings(arg)          => withArg(Settings.command, arg)
       case Reset(arg)             => withArg(Reset.command, arg)
+      case Replay(arg)            => withArg(Replay.command, arg)
       case Sh(expr)               => withArg(Sh.command, expr)
       case Imports                => Imports.command
+      case Paste                  => Paste.command
       case Silent                 => Silent.command
       case Quit                   => Quit.command
       case Help                   => Help.command
@@ -841,6 +847,9 @@ class ReplDriver(settings: Array[String],
         out.println("Replaying REPL session.")
 
       resetToInitial(tokens)
+      // As with `:reset`, the fresh session cannot reuse wrappers keyed by
+      // the old session classloader, so release them before replaying.
+      EvalAdapter.clearCache()
       replayEntries(state.pastInputs.reverse, initialState)
 
     case Imports =>

@@ -23,7 +23,7 @@ import org.junit.{After, Before}
 import org.junit.Assert._
 
 class ReplTest(options: Array[String] = ReplTest.defaultOptions, out: ByteArrayOutputStream = new ByteArrayOutputStream)
-extends ReplDriver(options, new PrintStream(out, true, StandardCharsets.UTF_8.name)) with MessageRendering:
+extends ReplDriver(options, ReplTest.utf8PrintStream(out)) with MessageRendering:
   /** Get the stored output from `out`, resetting the buffer */
   def storedOutput(): String = {
     val output = stripColor(out.toString(StandardCharsets.UTF_8.name))
@@ -124,6 +124,10 @@ extends ReplDriver(options, new PrintStream(out, true, StandardCharsets.UTF_8.na
   }
 
 object ReplTest:
+  private def utf8PrintStream(out: ByteArrayOutputStream): PrintStream =
+    new PrintStream(out, true, StandardCharsets.UTF_8.name) with ReplHistory.CharsetCarrier:
+      def replCharset: java.nio.charset.Charset = StandardCharsets.UTF_8
+
   // Because we test REPL features like completion,
   // we don't want other test stuff to get in the way,
   // e.g., "Pred" should complete to "Predef" and not "PredefTest" just because some dependency has a test named like that

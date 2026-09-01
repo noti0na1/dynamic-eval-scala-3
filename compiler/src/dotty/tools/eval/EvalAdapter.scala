@@ -4,7 +4,7 @@ package eval
 import java.util.UUID
 
 import dotty.tools.dotc.core.StdNames.str
-import dotty.tools.io.{AbstractFile, VirtualDirectory}
+import dotty.tools.io.{AbstractFile, virtualDirectory}
 
 /** REPL-side implementation of [[Eval.Adapter]]. Wraps a call's
  *  inputs (code, classloader, bindings, REPL session imports +
@@ -207,7 +207,7 @@ class EvalAdapter:
          |}
          |""".stripMargin
 
-    val outDir = new VirtualDirectory("<eval-output>")
+    val outDir = virtualDirectory("<eval-output>")
     val config = EvalCompilerConfig(
       outputClassName = outputClassName,
       body = code,
@@ -297,7 +297,7 @@ class EvalAdapter:
     val logTimestamp =
       if evalLogDir.isEmpty then ""
       else writeEvalLogStart(evalLogDir, source, defs)
-    val outDir = new VirtualDirectory("<eval-toplevel>")
+    val outDir = virtualDirectory("<eval-toplevel>")
     val bridge = EvalCompilerBridge()
     bridge.compileDefs(source, outDir, classLoader, replOutDir, compilerSettings, replClasspath) match
       case Left(errors) =>

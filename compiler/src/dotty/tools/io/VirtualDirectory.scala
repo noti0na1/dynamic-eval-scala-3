@@ -42,7 +42,7 @@ class VirtualDirectory private[io] (val name: String, maybeContainer: Option[Vir
 
   override def fileNamed(name: String): AbstractFile =
     Option(lookupName(name, directory = false)) getOrElse {
-      val newFile = new VirtualFile(s"$path/$name", Array.emptyByteArray)
+      val newFile = new VirtualFile(s"$path/$name", Array.emptyByteArray, Some(this))
       files(name) = newFile
       newFile
     }

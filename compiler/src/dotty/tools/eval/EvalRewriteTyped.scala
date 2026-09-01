@@ -407,7 +407,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
      *  inside such an object need live-instance captures instead.
      */
     private def isModuleChainReachable(cls: Symbol)(using Context): Boolean =
-      !cls.isPrivate && !cls.is(Flags.Protected) && {
+      !cls.is(Flags.Private) && !cls.is(Flags.Protected) && {
         val owner = cls.maybeOwner
         owner.is(Flags.Package) || isModuleChainReachable(owner)
       }
@@ -928,7 +928,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
         if cls.is(Flags.Trait) || cls.is(Flags.Abstract) then Nil
         else
           constructorsOf(cls).zipWithIndex.collect {
-            case (ctor, i) if !ctor.isPrivate =>
+            case (ctor, i) if !ctor.is(Flags.Private) =>
               CapturedSym(
                 ctor, EvalNames.ctorBinding(src, i), isVar = false,
                 ctorFactory = Some((cls, ctor)))

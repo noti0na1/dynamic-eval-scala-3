@@ -46,6 +46,12 @@ import scala.util.control.NonFatal
  */
 object ReplHistory:
 
+  /** Package-local charset metadata for explicit streams on JDK 17, where
+   *  `PrintStream.charset()` is not yet public.
+   */
+  private[repl] trait CharsetCarrier:
+    def replCharset: Charset
+
   /** Per-line capture cap. Output beyond this many bytes is dropped
    *  from the history entry (never from the live stream) and recorded
    *  as a truncation marker.
@@ -71,7 +77,10 @@ object ReplHistory:
       historyFile: String,
       input: => String
   )(work: => A): A =
-    if historyFile.isEmpty then return work
+    // Nested interpretation (`:load`, `:replay`, init scripts) belongs to the
+    // initiating submission. Keep writing to its installed capture and let
+    // only that outermost call append a transcript entry.
+    if historyFile.isEmpty || tee.isCapturing then return work
 
     val buf = new BoundedCapture(captureLimit)
     try tee.withCapture(buf)(work)
@@ -147,14 +156,18 @@ object ReplHistory:
   end BoundedCapture
 
   // `PrintStream.charset()` exists since JDK 18; probe reflectively so
-  // we still run on JDK 17. The fallback matches what `PrintStream`
-  // itself defaults to.
+  // we still run on JDK 17. A caller that explicitly chose a non-default
+  // charset on JDK 17 can be wrapped internally with CharsetCarrier;
+  // otherwise the fallback matches PrintStream's default constructors.
   private def charsetOf(ps: java.io.PrintStream): Charset =
-    try
-      ps.getClass.getMethod("charset").invoke(ps) match
-        case cs: Charset => cs
-        case _ => Charset.defaultCharset()
-    catch case _: ReflectiveOperationException => Charset.defaultCharset()
+    ps match
+      case carrier: CharsetCarrier => carrier.replCharset
+      case _ =>
+        try
+          ps.getClass.getMethod("charset").invoke(ps) match
+            case cs: Charset => cs
+            case _ => Charset.defaultCharset()
+        catch case _: ReflectiveOperationException => Charset.defaultCharset()
 
   /** A `PrintStream` that forwards to a primary destination and, when
    *  a capture is installed, also writes everything to the capture.
@@ -168,6 +181,8 @@ object ReplHistory:
     private[repl] val charset: Charset = charsetOf(primary)
 
     @volatile private var capture: java.io.OutputStream | Null = null
+
+    private[repl] def isCapturing: Boolean = capture != null
 
     /** Install `buf` as the capture target for the duration of `work`,
      *  then restore whatever capture was installed before. Reentrant.

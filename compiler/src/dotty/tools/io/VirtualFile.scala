@@ -15,18 +15,30 @@ import java.net.{URI, URL}
  *
  *  ''Note:  This library is considered experimental and should not be used unless you know what you are doing.''
  */
-class VirtualFile(override val path: String, initialContents: Array[Byte]) extends AbstractFile {
+class VirtualFile(
+    override val path: String,
+    initialContents: Array[Byte],
+    maybeContainer: Option[AbstractFile]
+) extends AbstractFile {
+  def this(path: String, initialContents: Array[Byte]) =
+    this(path, initialContents, None)
+
+  override def container: Option[AbstractFile] = maybeContainer
+
   private var content = initialContents
 
-  override val name: String = {
-    // We support fake names like `<example>` and `"example"` even on Windows where Path.of would throw.
-    // TODO: Proper path support for VirtualFile, should be integrated with VirtualDirectory...
-    if path.startsWith("<") || path.startsWith("\"") then path
+  override val name: String =
+    // VirtualDirectory always joins a child with `/`. Peel that leaf before
+    // handling standalone fake names such as `<example>`, whose parent path
+    // might not be accepted by the host platform's Path implementation.
+    val lastSlash = path.lastIndexOf('/')
+    if lastSlash >= 0 && lastSlash < path.length - 1 then
+      path.substring(lastSlash + 1)
+    else if path.startsWith("<") || path.startsWith("\"") then path
     else
       val fileName = java.nio.file.Path.of(path).getFileName
       if fileName == null then ""
       else fileName.toString
-  }
 
   // For compatibility, until we remove `AbstractFile.jpath`.
   override def jpath: JPath | Null = try java.nio.file.Path.of(path) catch case _: Exception => null

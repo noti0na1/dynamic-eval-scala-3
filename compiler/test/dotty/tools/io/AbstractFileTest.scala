@@ -7,6 +7,21 @@ import java.nio.file.Files.*
 import java.nio.file.attribute.PosixFilePermissions
 
 class AbstractFileTest {
+  @Test def virtualDirectoryChildrenHaveLeafNames(): Unit =
+    val dir = virtualDirectory("<test output>")
+    val child = dir.fileNamed("Example.class")
+    val tasty = dir.fileNamed("Example.tasty")
+    val pkg = dir.subdirectoryNamed("pkg")
+    val nested = pkg.fileNamed("Nested.class")
+
+    assert(child.name == "Example.class")
+    assert(child.path == "<test output>/Example.class")
+    assert(child.container.contains(dir))
+    assert(child.resolveSibling("Example.tasty") eq tasty)
+    assert(nested.name == "Nested.class")
+    assert(nested.path == "<test output>/pkg/Nested.class")
+    assert(nested.container.contains(pkg))
+
   //
   // Cope with symbolic links. Exercised by -d output.
   //
