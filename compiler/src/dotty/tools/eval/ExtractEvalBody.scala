@@ -488,14 +488,7 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
      *  secondary constructors by source position.
      */
     private def ctorIndexOf(cls: ClassSymbol, ctor: Symbol)(using Context): Int =
-      val primary = cls.primaryConstructor
-      if ctor == primary then 0
-      else
-        val secondaries = cls.info.decls.toList
-          .filter(s => s.isConstructor && s != primary)
-          .sortBy(_.span.start)
-        val i = secondaries.indexOf(ctor)
-        if primary.exists then i + 1 else i
+      EvalRewriteTyped.constructorsOf(cls).indexOf(ctor)
 
     /** Whether a direct catch clause tests a linked local class.
      */
@@ -781,7 +774,18 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
       if target < 0 then
         report.error(s"internal error: class `${cls.name}` not in classOwners", tree.srcPos)
         return getThisObject(tree, cls)
-      if target == 0 then getThisObject(tree, owners.head.asClass)
+      if target == 0 then
+        // The rewriter captures no instance inside constructor arguments
+        // (see `EvalRewriteTyped.isSelfReferenceCapture`); diagnose a body
+        // naming `this` there instead of running against a null receiver.
+        if !config.testMode && !config.bindingNames.contains(EvalNames.ThisBinding) then
+          report.error(
+            s"eval: cannot reach `this` of class `${cls.name}` from the eval body: " +
+              "the call site captured no enclosing instance. An eval call in a " +
+              "constructor argument cannot refer to the instance under construction.",
+            tree.srcPos
+          )
+        getThisObject(tree, owners.head.asClass)
       else
         // Module-class bindings use the source name without the `$` suffix.
         import dotty.tools.dotc.core.NameOps.stripModuleClassSuffix
@@ -849,7 +853,7 @@ private[eval] class ExtractEvalBody(config: EvalCompilerConfig, store: EvalStore
   end ExtractTransformer
 
   private val reflHelperNames: Set[Name] =
-    Set(termName("__refl_get__"), termName("__refl_set__"), termName("__refl_call__"))
+    Set(termName("__refl_get__"), termName("__refl_get_as__"), termName("__refl_set__"), termName("__refl_call__"))
 
   private def evalExpressionBaseClass(using Context): ClassSymbol =
     requiredClass("dotty.tools.eval.EvalExpressionBase")

@@ -118,40 +118,13 @@ class AbstractFileClassLoader(
           case null => ()
 
       name match {
-      // Keep compiler and runtime interfaces in their parent loaders so values
-      // crossing the dynamic evaluation boundary retain the same class identities.
-      case "dotty.tools.repl.StopRepl"
-          if !interruptInstrumentation.is(InterruptInstrumentation.Enabled) =>
-        super.loadClass(name)
-      case s"dotty.tools.repl.$_" if name != "dotty.tools.repl.StopRepl" =>
-        classOf[AbstractFileClassLoader].getClassLoader.loadClass(name)
-      case s"dotty.tools.eval.$_" =>
-        classOf[AbstractFileClassLoader].getClassLoader.loadClass(name)
-      case s"scala.$_" => super.loadClass(name)
-      case s"dotty.$_" if name != "dotty.tools.repl.StopRepl" => super.loadClass(name)
-      case s"rs$$line$$$_" =>
-        // New wrappers must link against this epoch's classpath.
-        try findClass(name)
-        catch case _: ClassNotFoundException => super.loadClass(name)
-
-      case _ if interruptInstrumentation.isOneOf(InterruptInstrumentation.Disabled, InterruptInstrumentation.Local) =>
-        super.loadClass(name)
-
-      // Don't instrument JDK classes. These are often restricted to load from a single classloader
-      // due to the JDK module system, and so instrumenting them and loading the modified copy of the class
-      // results in runtime exceptions
-      case s"java.$_" => super.loadClass(name)
-      case s"javax.$_" => super.loadClass(name)
-      case s"sun.$_" => super.loadClass(name)
-      case s"jdk.$_" => super.loadClass(name)
-      case s"org.xml.sax.$_" => super.loadClass(name) // XML SAX API (part of java.xml module)
-      case s"org.w3c.dom.$_" => super.loadClass(name) // W3C DOM API (part of java.xml module)
-      case s"com.sun.org.apache.$_" => super.loadClass(name) // Internal Xerces implementation
       // Instrumented bytecode calls StopRepl, so instrumenting StopRepl would
-      // recurse. Independent sessions define separate copies, while output
-      // loaders from the same session share one stop flag.
+      // recurse. Without instrumentation the shared copy is fine. With it,
+      // independent sessions define separate copies, while output loaders
+      // from the same session share one stop flag.
       case "dotty.tools.repl.StopRepl" =>
-        previousSessionLoader match
+        if !interruptInstrumentation.is(InterruptInstrumentation.Enabled) then super.loadClass(name)
+        else previousSessionLoader match
           case previous: AbstractFileClassLoader => previous.loadClass(name)
           case null =>
             val classFileName = name.replace('.', '/') + ".class"
@@ -163,6 +136,26 @@ class AbstractFileClassLoader(
               val bytes = is.readAllBytes()
               defineClass(name, bytes, 0, bytes.length)
             finally is.close()
+      // Keep compiler and runtime interfaces in their parent loaders so values
+      // crossing the dynamic evaluation boundary retain the same class identities.
+      case s"dotty.tools.repl.$_" | s"dotty.tools.eval.$_" =>
+        classOf[AbstractFileClassLoader].getClassLoader.loadClass(name)
+      case s"scala.$_" | s"dotty.$_" => super.loadClass(name)
+      case s"rs$$line$$$_" =>
+        // New wrappers must link against this epoch's classpath.
+        try findClass(name)
+        catch case _: ClassNotFoundException => super.loadClass(name)
+
+      case _ if interruptInstrumentation.isOneOf(InterruptInstrumentation.Disabled, InterruptInstrumentation.Local) =>
+        super.loadClass(name)
+
+      // Don't instrument JDK classes. These are often restricted to load from a single classloader
+      // due to the JDK module system, and so instrumenting them and loading the modified copy of the class
+      // results in runtime exceptions. The `org.*` and `com.sun.*` prefixes are
+      // the SAX / DOM APIs of `java.xml` and the internal Xerces implementation.
+      case s"java.$_" | s"javax.$_" | s"sun.$_" | s"jdk.$_"
+         | s"org.xml.sax.$_" | s"org.w3c.dom.$_" | s"com.sun.org.apache.$_" =>
+        super.loadClass(name)
       case _ =>
         try findClass(name)
         catch case _: ClassNotFoundException =>

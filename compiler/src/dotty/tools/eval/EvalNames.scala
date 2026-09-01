@@ -3,11 +3,10 @@ package eval
 
 import dotty.tools.dotc.core.Names.Name
 
-/** Shared representation of the marker in recorded enclosing source.
- *  [[emit]] wraps a body so it remains valid in any expression position.
+/** Wraps a body replacing [[EvalContext.placeholder]] so it remains valid in
+ *  any expression position.
  */
 private[eval] object EvalBodyPlaceholder:
-  inline def Marker: String = EvalContext.placeholder
   def emit(body: String): String = s"({ $body })"
 
 /** Reserved binding names shared by the call-site and wrapper compiles. */

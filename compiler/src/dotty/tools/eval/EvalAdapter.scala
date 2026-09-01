@@ -69,7 +69,7 @@ class EvalAdapter:
       EvalAdapter.cache.get(cacheKey) match
         case null => () // miss; fall through
         case Left(failure) => return Left(EvalAdapter.copyFailure(failure))
-        case Right(compiled) => return invokeCached(compiled, bindings)
+        case Right(compiled) => return invokeCached(compiled, bindings, topLevelHandles)
 
     // A cache hit performs no compilation and therefore writes no new logs.
     // Logging failures are reported without failing the eval call.
@@ -92,8 +92,7 @@ class EvalAdapter:
     // Keep built-in eval methods available to nested bodies. When no TopLevel
     // handle is present, imports inside the wrapper can shadow these names as
     // they would at the original prompt.
-    val evalImport =
-      "import _root_.dotty.tools.eval.Eval.{eval, evalSafe, topLevel, topLevelSafe}\n"
+    val evalImport = EvalAdapter.EvalImport
     val contextImports =
       if replWrapperImports.isEmpty then ""
       else replWrapperImports.mkString("", "\n", "\n")
@@ -153,7 +152,7 @@ class EvalAdapter:
           else new EvalAdapter.TopLevelChainLoader(topLevelHandles, classLoader)
         val compiled = loadCompiled(outDir, loadParent, outputClassName)
         if cacheKey != null then EvalAdapter.cache.put(cacheKey, Right(compiled))
-        invokeCached(compiled, bindings)
+        invokeCached(compiled, bindings, topLevelHandles)
 
   /** Compiles [[Eval.topLevel]] definitions into a fresh object. The returned
    *  handle owns its output and classloader, preserving class identity and
@@ -178,11 +177,9 @@ class EvalAdapter:
   ): Either[Eval.CompileFailure, Eval.TopLevel] =
     val uuid = UUID.randomUUID().toString.replace('-', '_')
     val objectName = s"${EvalNames.TopLevelObjectPrefix}$uuid"
-    val evalImport =
-      "import _root_.dotty.tools.eval.Eval.{eval, evalSafe, topLevel, topLevelSafe}\n"
     val importBlock =
-      if replWrapperImports.isEmpty then evalImport
-      else evalImport + replWrapperImports.mkString("", "\n", "\n")
+      if replWrapperImports.isEmpty then EvalAdapter.EvalImport
+      else EvalAdapter.EvalImport + replWrapperImports.mkString("", "\n", "\n")
     val headerBlock = if contextHeader.isEmpty then "" else s"$contextHeader\n"
     val (defsImports, defsBody) = splitLeadingImports(defs)
     val importsBlock = if defsImports.isEmpty then "" else s"$defsImports\n"
@@ -243,12 +240,12 @@ class EvalAdapter:
    */
   private def invokeCached(
       compiled: EvalAdapter.CompiledExpression,
-      bindings: Array[Eval.Binding]
+      bindings: Array[Eval.Binding],
+      handles: Array[Eval.TopLevel]
   ): Either[Eval.CompileFailure, Any] =
     val thisObject = extractThisObject(bindings)
     // Active handles are inherited by nested captures and restored for recursive
     // evals. The wrapper loader is also the context loader while user code runs.
-    val handles = topLevelHandlesIn(bindings)
     val savedHandles = Eval.currentActiveHandles
     val thread = Thread.currentThread()
     val savedContextClassLoader = thread.getContextClassLoader
@@ -319,6 +316,12 @@ class EvalAdapter:
 end EvalAdapter
 
 object EvalAdapter:
+
+  /** Root-qualified import of the built-in entry points, placed at the top of
+   *  every generated wrapper and definitions object.
+   */
+  private val EvalImport: String =
+    "import _root_.dotty.tools.eval.Eval.{eval, evalSafe, topLevel, topLevelSafe}\n"
 
   /** Copies mutable diagnostics so callers cannot alter a cached failure.
    */

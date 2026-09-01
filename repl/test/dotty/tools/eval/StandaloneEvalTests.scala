@@ -699,3 +699,63 @@ class StandaloneEvalTests:
     finally
       if saved == null then System.clearProperty(propName)
       else System.setProperty(propName, saved)
+
+  // ===========================================================================
+  // Enclosing code around the call refers to the instance
+  // ===========================================================================
+
+  @Test def enclosingCodeReadsPrivateMemberBeforeEval(): Unit =
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |
+        |class Counter(private var count: Int):
+        |  def next(): Int =
+        |    count = count + 1
+        |    val snapshot = this.count
+        |    eval[Int]("snapshot + 1")
+        |
+        |object Main:
+        |  def run(): Any = new Counter(40).next()
+        |""".stripMargin)
+    assertEquals(42, r)
+
+  @Test def enclosingCodeInNestedObjectReadsPrivateMember(): Unit =
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |
+        |object Main:
+        |  object Registry:
+        |    private val entries = List(1, 2, 3)
+        |    def total: Int =
+        |      val n = entries.size
+        |      eval[Int]("n * 14")
+        |  def run(): Any = Registry.total
+        |""".stripMargin)
+    assertEquals(42, r)
+
+  @Test def evalInParentConstructorArgument(): Unit =
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |
+        |class Base(val v: Int)
+        |class Derived extends Base(eval[Int]("41 + 1"))
+        |
+        |object Main:
+        |  def run(): Any = new Derived().v
+        |""".stripMargin)
+    assertEquals(42, r)
+
+  @Test def enumMethodSeesCases(): Unit =
+    val r = compileAndRun(
+      """import dotty.tools.eval.Eval.eval
+        |
+        |enum Op:
+        |  case Add, Mul
+        |  def run(a: Int, b: Int): Int = this match
+        |    case Add => eval[Int]("a + b + ordinal")
+        |    case Mul => eval[Int]("a * b + ordinal")
+        |
+        |object Main:
+        |  def run(): Any = Op.Add.run(20, 22) + Op.Mul.run(6, 7)
+        |""".stripMargin)
+    assertEquals(85, r)

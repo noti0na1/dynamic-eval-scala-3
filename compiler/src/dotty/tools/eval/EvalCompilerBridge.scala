@@ -33,7 +33,7 @@ class EvalCompilerBridge:
     val args = Array(
       "-d", outputDir.toString,
       "-classpath", classPath
-    ) ++ options :+ sourceFile.toString
+    ) ++ options ++ Array("-Xdynamic-eval", sourceFile.toString)
     val driver = new Driver:
       override protected def newCompiler(using Context): EvalCompiler = EvalCompiler(config)
     val reporter = EvalReporter(error => config.errorReporter.accept(error))

@@ -10,10 +10,11 @@ import dotc.core.Annotations.Annotation
 import dotc.core.Constants.Constant
 import dotc.core.Contexts.*
 import dotc.core.Decorators.*
-import dotc.core.Flags
+import dotc.core.{Flags, Mode}
 import dotc.config.Feature
 import dotc.core.NameKinds.{DefaultGetterName, UniqueName}
 import dotc.core.Names.{TermName, termName}
+import dotc.core.StdNames.nme
 import dotc.core.Symbols.*
 import dotc.core.Types.*
 import dotc.report
@@ -268,7 +269,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
      *  being processed — i.e. the outermost user-written declaration
      *  that contains this eval call. The encl-source slice is taken
      *  from this range with the eval call's span replaced by
-     *  `EvalBodyPlaceholder.Marker`. Updated by the wrapper-Template
+     *  `EvalContext.placeholder`. Updated by the wrapper-Template
      *  case as we descend into each member of the REPL wrapper's body.
      */
     private var topLevelStart: Int = -1
@@ -409,16 +410,16 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
         owner.is(Flags.Package) || isModuleChainReachable(owner)
       }
 
-    /** Live-instance captures for eval calls inside a module the
-     *  wrapper compile re-elaborates (instance-dependent, or static
-     *  but `private`): the `__this__` / `__this__<B>` synthetics
-     *  carry the module instance (the runtime `thisObject` and the
-     *  bare-member qualifier), and `__evalModule_<B>__` serves
-     *  name-qualified references. The module-class name suffix is
-     *  stripped so the binding names match the wrapper's source-name
-     *  derivation.
+    /** Live-instance captures for eval calls inside a class or module
+     *  the wrapper compile re-elaborates: the `__this__` /
+     *  `__this__<C>` synthetics carry the instance (the runtime
+     *  `thisObject` and the bare-member qualifier; the qualified form
+     *  lets a nested class body reach an outer instance), and, for a
+     *  module, `__evalModule_<M>__` serves name-qualified references.
+     *  The module-class name suffix is stripped so the binding names
+     *  match the wrapper's source-name derivation.
      */
-    private def moduleInstanceCaptures(classSym: ClassSymbol)(using Context): List[CapturedSym] =
+    private def instanceCaptures(classSym: ClassSymbol)(using Context): List[CapturedSym] =
       import dotc.core.NameOps.stripModuleClassSuffix
       val plainName = classSym.name.stripModuleClassSuffix
       val thises = List(
@@ -427,7 +428,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       )
       val modVal = classSym.sourceModule
       val moduleRef =
-        if modVal.exists then
+        if classSym.is(Flags.Module) && modVal.exists then
           CapturedSym(modVal, EvalNames.moduleBinding(plainName.toString),
             isVar = false, isModuleRef = true) :: Nil
         else Nil
@@ -452,13 +453,37 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
      *  same-named keeper (keepers are never read by name at
      *  runtime; only their bind-site read matters).
      */
-    private def currentBindings: List[CapturedSym] =
+    private def currentBindings(using Context): List[CapturedSym] =
       val visible = mutable.LinkedHashMap.empty[String, CapturedSym]
       val keepers = mutable.LinkedHashMap.empty[Symbol, CapturedSym]
       for frame <- frameStack.toList.reverse; c <- frame do
         if c.classMemberOf.isDefined then keepers(c.sym) = c
         else visible(c.sourceName) = c
-      visible.values.toList ++ keepers.values.toList
+      val all = visible.values.toList ++ keepers.values.toList
+      if constructorArgsOf.exists then all.filterNot(isSelfReferenceCapture) else all
+
+    /** The class whose constructor arguments are being transformed, or
+     *  `NoSymbol`. Inside the arguments of a parent or `this(...)`
+     *  constructor call, a read of the instance under construction is
+     *  illegal however deeply it nests in lambdas or anonymous classes
+     *  (`CheckNoSuperThis` rejects it after this phase), so the call site
+     *  captures no instance there. The wrapper compile keeps the class for
+     *  those positions, and a body naming `this` is diagnosed by
+     *  [[ExtractEvalBody]] instead of crashing on a missing binding.
+     */
+    private var constructorArgsOf: Symbol = NoSymbol
+
+    private def withConstructorArgs[T](cls: Symbol)(action: => T): T =
+      val saved = constructorArgsOf
+      constructorArgsOf = cls
+      try action
+      finally constructorArgsOf = saved
+
+    private def isSelfReferenceCapture(c: CapturedSym)(using Context): Boolean =
+      val cls = constructorArgsOf
+      c.selfThisCls.contains(cls)
+        || c.classMemberOf.contains(cls)
+        || (c.isModuleRef && c.sym == cls.sourceModule)
 
     override def transform(tree: Tree)(using Context): Tree =
       tree match
@@ -726,77 +751,47 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
             )
           }
 
-        case impl: Template
-            if ctx.owner.isClass
-            && ctx.owner.is(Flags.Module)
-            && !ctx.owner.maybeOwner.is(Flags.Package)
-            && isStaticModuleChain(ctx.owner) =>
-          // A *nested* static `object` (every enclosing layer up to
-          // the package is also a module; the top-level case is
-          // handled above). Eval calls inside it go through the
-          // wrapper compile's module lift, which reroutes the
-          // object's private members through runtime reflection.
-          // Like class members, those members need a typed reference
-          // at the call site to survive DCE: an unreferenced
-          // `private val` of an object is otherwise elided from the
-          // emitted module class, and the runtime lookup misses it.
-          // When the chain is reachable, no `__this__` synthetics:
-          // the lift reaches the live module by its static path, not
-          // through a captured instance. A chain with a `private`
-          // layer vetoes the lift (the wrapper keeps a re-elaborated
-          // copy), so the typed path needs the live-instance
-          // synthetics instead — same as an instance-dependent
-          // module below.
-          val members = collectClassMembers(impl, ctx.owner.asClass)
-          val instanceCaps =
-            if isModuleChainReachable(ctx.owner) then Nil
-            else moduleInstanceCaptures(ctx.owner.asClass)
-          withClassFrame(withScope(instanceCaps ++ members)(super.transform(impl)))
-
-        case impl: Template
-            if ctx.owner.isClass
-            && ctx.owner.is(Flags.Module)
-            && !ctx.owner.maybeOwner.is(Flags.Package) =>
-          // An *instance-dependent* module: an `object` nested in a
-          // class (one live module per enclosing instance) or local
-          // to a method. The wrapper compile keeps a re-elaborated
-          // copy (no static path to lift against), so eval calls
-          // inside its methods link like class members: `__this__` /
-          // `__this__<B>` carry the live module instance for `this`
-          // and bare-member access, `__evalModule_<B>__` serves
-          // name-qualified references (`B.x`), and the member
-          // keepers protect privates from DCE.
-          val classSym = ctx.owner.asClass
-          val members = collectClassMembers(impl, classSym)
-          withClassFrame(
-            withScope(moduleInstanceCaptures(classSym) ++ members)(super.transform(impl)))
-
-        case impl: Template
-            if ctx.owner.isClass
-            && !ctx.owner.is(Flags.Module)
-            && !ctx.owner.is(Flags.Package) =>
-          val classSym = ctx.owner.asClass
-          // `__this__` lets the runtime body-rewrite turn `this.x`
-          // references into `__this__.x` reflective accesses; the
-          // qualified form (`__this__<ClassName>`) lets a *nested*
-          // class body reach the outer class's `this` after that
-          // rewrite. Both bind the class's `This(cls)` value.
-          val syntheticThises = List(
-            CapturedSym(NoSymbol, EvalNames.ThisBinding, isVar = false, selfThisCls = Some(classSym)),
-            CapturedSym(NoSymbol, EvalNames.thisBinding(classSym.name), isVar = false, selfThisCls = Some(classSym))
-          )
+        case impl: Template if ctx.owner.isClass && !ctx.owner.is(Flags.Package) =>
+          // A class, or a module below the top level (the top-level
+          // module case is handled above).
+          //
           // Class val/var members are emitted as bindings even though
           // the body's bare `x` resolves lexically through the encl
           // source. The bindings exist to KEEP the member alive across
           // DCE: SpliceEvalBody lifts the eval-bearing method out of
-          // its enclosing class, after which a private `val x` has no
-          // remaining typed-tree reference (the body rewrite replaces
-          // `this.x` with a reflective `__refl_get__` call by name).
-          // A `Eval.bind("x", this.x)` at the call site forces the
-          // typed reference to stay live, so the field survives to
-          // runtime where reflection can find it.
+          // its enclosing class or module, after which a private
+          // `val x` has no remaining typed-tree reference (the body
+          // rewrite replaces `this.x` with a reflective `__refl_get__`
+          // call by name). A `Eval.bind("x", this.x)` at the call site
+          // forces the typed reference to stay live, so the field
+          // survives to runtime where reflection can find it.
+          //
+          // A nested static `object` whose chain is reachable by a
+          // static path is linked by the wrapper compile's module
+          // lift through that path, so it needs no instance captures.
+          // Every other shape is re-elaborated by the wrapper compile
+          // and links through the captured live instance instead: a
+          // class (`__this__` / `__this__<C>` carry `this` for the
+          // body rewrite and for a nested class reaching its outer
+          // instance), a module nested in a class or method (one live
+          // module per enclosing instance), and a static chain with a
+          // `private` layer, which vetoes the lift. See
+          // [[instanceCaptures]] for the synthetics emitted.
+          val classSym = ctx.owner.asClass
+          val liftedStatically =
+            classSym.is(Flags.Module)
+              && isStaticModuleChain(classSym)
+              && isModuleChainReachable(classSym)
+          val instanceCaps = if liftedStatically then Nil else instanceCaptures(classSym)
           val members = collectClassMembers(impl, classSym)
-          withClassFrame(withScope(syntheticThises ++ members)(super.transform(impl)))
+          withClassFrame:
+            withScope(instanceCaps ++ members):
+              cpy.Template(impl)(
+                transformSub(impl.constr),
+                withConstructorArgs(classSym)(transform(impl.parents)(using ctx.superCallContext)),
+                Nil,
+                transformSelf(impl.self),
+                transformStats(impl.body, impl.symbol))
 
         case impl: Template =>
           // Any remaining class shape (e.g. a module class nested
@@ -818,11 +813,19 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
             case mt: MethodType => mt.paramInfos
             case _ => Nil
           val newFun = transform(app.fun)
-          val newArgs = app.args.zipWithIndex.map { (arg, i) =>
-            if i < formals.length && formals(i).isInstanceOf[ExprType] then
-              withReturnWrapSuppressed(transform(arg))
-            else transform(arg)
-          }
+          // The arguments of a secondary constructor's `this(...)` call can no
+          // more refer to the instance under construction than parent
+          // arguments can, which `Template` transforms under
+          // `superCallContext`; see [[isSelfReferenceCapture]].
+          val selfCallOf = app.fun match
+            case Select(_: This, nme.CONSTRUCTOR) => ctx.owner.enclosingClass
+            case _ => constructorArgsOf
+          val newArgs = withConstructorArgs(selfCallOf):
+            app.args.zipWithIndex.map { (arg, i) =>
+              if i < formals.length && formals(i).isInstanceOf[ExprType] then
+                withReturnWrapSuppressed(transform(arg))
+              else transform(arg)
+            }
           val withChildren = cpy.Apply(app)(newFun, newArgs)
           if withChildren.tpe.widen.isInstanceOf[MethodOrPoly] then
             // A partial application of a multi-clause method (e.g.
@@ -922,25 +925,13 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       val ctorCaps =
         if cls.is(Flags.Trait) || cls.is(Flags.Abstract) then Nil
         else
-          constructorsOf(cls).zipWithIndex.collect {
+          EvalRewriteTyped.constructorsOf(cls).zipWithIndex.collect {
             case (ctor, i) if !ctor.is(Flags.Private) =>
               CapturedSym(
                 ctor, EvalNames.ctorBinding(src, i), isVar = false,
                 ctorFactory = Some((cls, ctor)))
           }
       classOfCap :: ctorCaps
-
-    /** Constructors of `cls` in the order both compiles agree on:
-     *  primary first, then secondaries by source position. The
-     *  wrapper compile re-elaborates the same class source, so the
-     *  index identifies the same constructor on both sides.
-     */
-    private def constructorsOf(cls: ClassSymbol)(using Context): List[Symbol] =
-      val primary = cls.primaryConstructor
-      val secondaries = cls.info.decls.toList
-        .filter(s => s.isConstructor && s != primary)
-        .sortBy(_.span.start)
-      if primary.exists then primary :: secondaries else secondaries
 
     /** Classify an Apply into the eval-pipeline category whose call
      *  contract it follows. Pure symbol + annotation based — never
@@ -969,24 +960,81 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       if !sym.exists then EvalKind.NotEval
       else
         resolveEvalApi()
-        val owner = sym.maybeOwner
-        if evalModuleClassCache.exists && owner == evalModuleClassCache then
-          sym.name.toString match
-            case "eval" => EvalKind.PlainEval
-            case "evalSafe" => EvalKind.PlainEvalSafe
-            // `topLevel` / `topLevelSafe` have the standard synthetic
-            // parameter slots and forward like user `@evalLike`
-            // wrappers, but live on the `Eval` module, which this
-            // owner branch claims before the annotation checks run.
-            // Classify them as the wrapper kinds explicitly.
-            case "topLevel" => EvalKind.EvalLike
-            case "topLevelSafe" => EvalKind.EvalSafeLike
-            case _ => EvalKind.NotEval
-        else if evalLikeAnnotCache.exists && sym.hasAnnotation(evalLikeAnnotCache) then
+        // Annotated wrappers come first: `Eval.topLevel`, `Eval.topLevelSafe`,
+        // and `TopLevel.eval` / `evalSafe` are themselves `@evalLike` /
+        // `@evalSafeLike` members of the eval API and forward like user
+        // wrappers. Only the two primitives are matched by owner and name.
+        if evalLikeAnnotCache.exists && sym.hasAnnotation(evalLikeAnnotCache) then
           EvalKind.EvalLike
         else if evalSafeLikeAnnotCache.exists && sym.hasAnnotation(evalSafeLikeAnnotCache) then
           EvalKind.EvalSafeLike
+        else if evalModuleClassCache.exists && sym.maybeOwner == evalModuleClassCache then
+          sym.name.toString match
+            case "eval" => EvalKind.PlainEval
+            case "evalSafe" => EvalKind.PlainEvalSafe
+            case _ => EvalKind.NotEval
         else EvalKind.NotEval
+
+    /** The synthetic arguments of one eval-like call at `span`, computed
+     *  from the typed scope, and the non-local-return wrap that goes
+     *  around the filled call. Shared by the closure-form expansion and
+     *  the default-slot fill.
+     *
+     *    - `enclosingSource`: the current top-level statement's slice
+     *      with the call replaced by the marker. Safe-flavor calls wrap
+     *      the marker in `Eval.handleCompileError(...)` so the inner
+     *      verify compile lifts the body's `T` to `EvalResult[T]`.
+     *    - `expectedType`: the typed `[T]` rendered to source, falling
+     *      back to the typer-recorded prototype (see
+     *      [[effectiveTypeArg]]). With a slice the string is
+     *      re-typechecked at the marker position, where locally scoped
+     *      names resolve, so it gets the informational rendering;
+     *      without one the wrapper's isolated fallback context only sees
+     *      global names, so the strict rendering applies.
+     *    - `bindingsArray`: the captures in scope, plus the non-local
+     *      return key when the call sits directly inside a real method.
+     */
+    private class SyntheticArgs(app: Apply, kind: EvalKind, span: Span)(using Context):
+      private val encl = computeEnclosingSource(span)
+
+      val enclosingSource: String =
+        if kind.isSafe && encl.contains(EvalContext.placeholder) then
+          encl.replace(
+            EvalContext.placeholder,
+            s"_root_.dotty.tools.eval.Eval.handleCompileError(${EvalContext.placeholder})"
+          )
+        else encl
+
+      val expectedType: String =
+        val tArg = effectiveTypeArg(app, kind)
+        if tArg eq null then ""
+        else if encl.nonEmpty then EvalRewriteTyped.renderTypeInfo(tArg)
+        else EvalRewriteTyped.renderType(tArg)
+
+      private val wrapTarget = returnWrapTarget
+      private val keySym: Option[Symbol] = wrapTarget.map { _ =>
+        newSymbol(
+          ctx.owner, UniqueName.fresh(termName("__evalReturnKey")),
+          Flags.Synthetic, defn.ObjectType, coord = span)
+      }
+
+      def enclosingSourceLit(argSpan: Span): Tree =
+        Literal(Constant(enclosingSource)).withSpan(argSpan)
+
+      def expectedTypeLit(argSpan: Span): Tree =
+        Literal(Constant(expectedType)).withSpan(argSpan)
+
+      def bindingsArray(argSpan: Span): Tree =
+        val extraBinds = keySym.map(k => buildBindReturnKey(k, span)).toList
+        buildBindingsArray(currentBindings, argSpan, extraBinds)
+
+      /** Wraps the filled call in the non-local-return handler when the
+       *  call has a return target (see [[wrapWithReturnHandler]]).
+       */
+      def wrapReturn(filled: Tree): Tree = (wrapTarget, keySym) match
+        case (Some((meth, resTpe)), Some(k)) => wrapWithReturnHandler(filled, k, meth, resTpe, span)
+        case _ => filled
+    end SyntheticArgs
 
     /** Expand a 1-arg closure-form call (`eval[T]({ ctx => "..." })`)
      *  to a fully-filled 4-arg call by switching to the 4-arg
@@ -1008,36 +1056,13 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
             else
               ref(fourArgSym).withSpan(fun.span)
           val span = app.span
-          val encl = computeEnclosingSource(span)
-          // Same renderer split as [[fillEvalArgs]]: informational
-          // with a slice, strict without one.
-          val tArg = effectiveTypeArg(app, kind)
-          val rendered =
-            if tArg eq null then ""
-            else if encl.nonEmpty then EvalRewriteTyped.renderTypeInfo(tArg)
-            else EvalRewriteTyped.renderType(tArg)
-          val wrappedEncl =
-            if kind.isSafe && encl.contains(EvalContext.placeholder) then
-              encl.replace(
-                EvalContext.placeholder,
-                s"_root_.dotty.tools.eval.Eval.handleCompileError(${EvalContext.placeholder})"
-              )
-            else encl
-          val wrapTarget = returnWrapTarget
-          val keySymOpt = wrapTarget.map { _ =>
-            newSymbol(
-              ctx.owner, UniqueName.fresh(termName("__evalReturnKey")),
-              Flags.Synthetic, defn.ObjectType, coord = span)
-          }
-          val extraBinds = keySymOpt.map(k => buildBindReturnKey(k, span)).toList
-          val bindingsArg = buildBindingsArray(currentBindings, span, extraBinds)
-          val expTpeArg = Literal(Constant(rendered)).withSpan(span)
-          val enclArg = Literal(Constant(wrappedEncl)).withSpan(span)
-          val filled = Apply(newFun, List(closureArg, bindingsArg, expTpeArg, enclArg)).withSpan(span)
-          (wrapTarget, keySymOpt) match
-            case (Some((meth, resTpe)), Some(keySym)) =>
-              wrapWithReturnHandler(filled, keySym, meth, resTpe, span)
-            case _ => filled
+          val synth = SyntheticArgs(app, kind, span)
+          val filled = Apply(newFun, List(
+            closureArg,
+            synth.bindingsArray(span),
+            synth.expectedTypeLit(span),
+            synth.enclosingSourceLit(span))).withSpan(span)
+          synth.wrapReturn(filled)
         }
       }
 
@@ -1168,58 +1193,20 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
         return app
 
       // All three default — fill them in from the typed scope.
+      val synth = SyntheticArgs(app, kind, span)
       val argsBuf = args.toBuffer
-
-      // enclosingSource: slice from the current top-level statement.
-      // Safe-flavor wraps the placeholder in `handleCompileError`.
-      val encl = computeEnclosingSource(span)
-      val wrappedEncl =
-        if kind.isSafe && encl.contains(EvalContext.placeholder) then
-          encl.replace(
-            EvalContext.placeholder,
-            s"_root_.dotty.tools.eval.Eval.handleCompileError(${EvalContext.placeholder})"
-          )
-        else encl
-      argsBuf(enclIdx) = Literal(Constant(wrappedEncl)).withSpan(argsBuf(enclIdx).span)
-
-      // expectedType: rendered from the typed `[T]`, falling back to
-      // the typer-recorded prototype when `[T]` was minimized to
-      // `Nothing` (see [[effectiveTypeArg]]). The string is
-      // re-typechecked at the marker position inside the spliced
-      // slice, where locally-scoped names resolve, so a slice gets
-      // the informational rendering. Without a slice the wrapper's
-      // isolated fallback context only sees global names, so the
-      // strict resolvable-only rendering applies.
-      val tArg = effectiveTypeArg(app, kind)
-      val renderedTpe =
-        if tArg eq null then ""
-        else if encl.nonEmpty then EvalRewriteTyped.renderTypeInfo(tArg)
-        else EvalRewriteTyped.renderType(tArg)
-      argsBuf(expIdx) = Literal(Constant(renderedTpe)).withSpan(argsBuf(expIdx).span)
-
-      // bindings: rebuilt from the typed scope, plus the non-local-
-      // return key when the call sits directly inside a real method.
-      val wrapTarget = returnWrapTarget
-      val keySymOpt = wrapTarget.map { _ =>
-        newSymbol(
-          ctx.owner, UniqueName.fresh(termName("__evalReturnKey")),
-          Flags.Synthetic, defn.ObjectType, coord = span)
-      }
-      val extraBinds = keySymOpt.map(k => buildBindReturnKey(k, span)).toList
-      argsBuf(bindIdx) = buildBindingsArray(currentBindings, argsBuf(bindIdx).span, extraBinds)
+      argsBuf(enclIdx) = synth.enclosingSourceLit(argsBuf(enclIdx).span)
+      argsBuf(expIdx) = synth.expectedTypeLit(argsBuf(expIdx).span)
+      argsBuf(bindIdx) = synth.bindingsArray(argsBuf(bindIdx).span)
 
       val newClauseApp = cpy.Apply(clauseApp)(clauseApp.fun, argsBuf.toList)
       // If the synthetic clause is the outer Apply (single-clause
       // method) we're done; otherwise re-thread the rewritten clause
       // through the chain of intervening Applies.
       val filled =
-        if (newClauseApp eq clauseApp) || (clauseApp eq app) then
-          if clauseApp eq app then newClauseApp else app
+        if clauseApp eq app then newClauseApp
         else rethreadApply(app, clauseApp, newClauseApp)
-      (wrapTarget, keySymOpt) match
-        case (Some((meth, resTpe)), Some(keySym)) =>
-          wrapWithReturnHandler(filled, keySym, meth, resTpe, span)
-        case _ => filled
+      synth.wrapReturn(filled)
 
     /** Walk `app.fun` down to find the `Apply` whose direct args are
      *  the parameter clause declaring `bindings` / `expectedType` /
@@ -1507,7 +1494,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       found
 
     /** Slice the current top-level statement's source text, replacing
-     *  the eval-call's span with `EvalBodyPlaceholder.Marker`. The
+     *  the eval-call's span with `EvalContext.placeholder`. The
      *  result is the `enclosingSource` the wrapper compile uses to
      *  re-typecheck the body in its original lexical context.
      *
@@ -1530,7 +1517,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
           return composeChainedEncl(evalSpan, cfg.body, cfg.outerEnclosingSource)
         case _ =>
 
-      val markerText = EvalBodyPlaceholder.Marker
+      val markerText = EvalContext.placeholder
       val sourceFile = topLevelSource
       if topLevelStart < 0 || !evalSpan.exists || sourceFile == null then return ""
       val src = sourceFile.content
@@ -1580,9 +1567,9 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       // Trailing space for the same lexer-gluing reason as the
       // direct slice above.
       val outerBodyWithInnerMarker =
-        outerBody.substring(0, s) + EvalBodyPlaceholder.Marker + " " + outerBody.substring(e)
+        outerBody.substring(0, s) + EvalContext.placeholder + " " + outerBody.substring(e)
       def markerCount(text: String): Int =
-        val marker = EvalBodyPlaceholder.Marker
+        val marker = EvalContext.placeholder
         var count = 0
         var from = 0
         var idx = text.indexOf(marker, from)
@@ -1597,12 +1584,12 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       if markerCount(outerEncl) != 1 || markerCount(outerBodyWithInnerMarker) != 1 then
         report.error(
           s"nested eval cannot compose its enclosing source because reserved marker text " +
-            s"`${EvalBodyPlaceholder.Marker}` occurs outside the nested eval call",
+            s"`${EvalContext.placeholder}` occurs outside the nested eval call",
           ctx.source.atSpan(innerSpan)
         )
         return ""
       outerEncl.replace(
-        EvalBodyPlaceholder.Marker,
+        EvalContext.placeholder,
         EvalBodyPlaceholder.emit(outerBodyWithInnerMarker)
       )
 
@@ -1793,7 +1780,37 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
     private def buildBindCtorFactory(c: CapturedSym, span: Span)(using Context): Tree =
       val (cls, ctor) = c.ctorFactory.get
       val nameLit = Literal(Constant(c.sourceName)).withSpan(span)
-      val (typeArgs: List[Type], methodLikeTpe: Type) = ctor.info match
+      val factory = flattenedLambda(ctor.info, span) { (typeArgs, argss) =>
+        val clsTpe = if typeArgs.isEmpty then cls.typeRef else cls.typeRef.appliedTo(typeArgs)
+        val ctorSel = New(clsTpe).select(ctor)
+        val ctorTyped = if typeArgs.isEmpty then ctorSel else ctorSel.appliedToTypes(typeArgs)
+        ctorTyped.appliedToArgss(argss)
+      }
+      discardUses:
+        ref(EvalRewriteTyped.bindSyntheticSym)
+          .appliedTo(nameLit, factory, bindingTpeLit(null, span))
+          .withSpan(span)
+
+    /** A single uncurried `(Any, …) => Any` lambda around a method-like
+     *  `info`, the representation shared by captured defs and local-class
+     *  constructor factories. Type parameters are instantiated to their
+     *  upper bounds (`Any` when unbounded), so context bounds become
+     *  ordinary `using` values that the wrapper's typer supplies; all
+     *  clauses are uncurried into one, matching how
+     *  [[ExtractEvalBody.transformedMethodArgs]] flattens the body's
+     *  call, so a single `FunctionN.apply(args…)` lines up at runtime.
+     *
+     *  `mkCall` receives the instantiated type arguments and the value
+     *  arguments regrouped into the original clauses, each cast back to
+     *  its declared type so the typed application checks (the casts
+     *  erase to always-succeeding `checkcast`s). By-name positions keep
+     *  their `ExprType` as the lambda parameter type, because
+     *  `asInstanceOf[=> T]` is not a legal cast target. A parameterless
+     *  `info` yields a nullary lambda.
+     */
+    private def flattenedLambda(info: Type, span: Span)(
+        mkCall: (List[Type], List[List[Tree]]) => Tree)(using Context): Tree =
+      val (typeArgs: List[Type], methodLikeTpe: Type) = info match
         case poly: PolyType =>
           val highs: List[Type] = poly.paramInfos.map(_.hiBound)
           (highs, poly.instantiate(highs))
@@ -1806,33 +1823,25 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
         case _ =>
           (Nil, Nil)
       val (clauseInfos, clauseNames) = flatten(methodLikeTpe)
-      val clsTpe = if typeArgs.isEmpty then cls.typeRef else cls.typeRef.appliedTo(typeArgs)
-      val flatNames = clauseNames.flatten
       val flatInfos = clauseInfos.flatten
       val lambdaParamTpes: List[Type] = flatInfos.map {
         case et: ExprType => et
         case _ => defn.AnyType
       }
-      val methTpe = MethodType(flatNames)(_ => lambdaParamTpes, _ => defn.AnyType)
-      val factory = Lambda(methTpe, params =>
+      val methTpe = MethodType(clauseNames.flatten)(_ => lambdaParamTpes, _ => defn.AnyType)
+      def regroup(xs: List[Tree], sizes: List[Int]): List[List[Tree]] = sizes match
+        case Nil => Nil
+        case n :: rest =>
+          val (head, tail) = xs.splitAt(n)
+          head :: regroup(tail, rest)
+      Lambda(methTpe, params =>
         val callArgs = params.lazyZip(flatInfos).map { (p, t) =>
           t match
             case _: ExprType => p
             case _ => p.cast(t)
         }
-        def regroup(xs: List[Tree], sizes: List[Int]): List[List[Tree]] = sizes match
-          case Nil => Nil
-          case n :: rest =>
-            val (head, tail) = xs.splitAt(n)
-            head :: regroup(tail, rest)
-        val ctorSel = New(clsTpe).select(ctor)
-        val ctorTyped = if typeArgs.isEmpty then ctorSel else ctorSel.appliedToTypes(typeArgs)
-        ctorTyped.appliedToArgss(regroup(callArgs, clauseInfos.map(_.length)))
+        mkCall(typeArgs, regroup(callArgs, clauseInfos.map(_.length)))
       ).withSpan(span)
-      discardUses:
-        ref(EvalRewriteTyped.bindSyntheticSym)
-          .appliedTo(nameLit, factory, bindingTpeLit(null, span))
-          .withSpan(span)
 
     /** Binding whose value is wrapped in [[Eval.LazyBindingValue]]:
      *  `Eval.bind*(name, new LazyBindingValue(() => <read>))`. Used
@@ -1998,72 +2007,12 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
     private def buildBindDef(c: CapturedSym, span: Span)(using Context): Tree =
       val nameLit = Literal(Constant(c.sourceName)).withSpan(span)
       val defSym = c.sym
-
-      // Strip a leading PolyType by instantiating its type params to
-      // their upper bounds. Subsequent `MethodType` clauses then have
-      // any `T`-mentioning param/result types substituted accordingly.
-      val (typeArgs: List[Type], methodLikeTpe: Type) = defSym.info match
-        case poly: PolyType =>
-          val highs: List[Type] = poly.paramInfos.map(_.hiBound)
-          (highs, poly.instantiate(highs))
-        case other =>
-          (Nil, other)
-
-      // Walk the (possibly nested) MethodType chain and collect
-      // per-clause param infos and names. Each clause becomes one
-      // sub-list; the result type sits at the bottom.
-      def flatten(t: Type): (List[List[Type]], List[List[TermName]], Type) = t match
-        case mt: MethodType =>
-          val (rest, namesRest, result) = flatten(mt.resType)
-          (mt.paramInfos :: rest, mt.paramNames :: namesRest, result)
-        case other =>
-          (Nil, Nil, other)
-      val (clauseInfos, clauseNames, _) = flatten(methodLikeTpe)
-
-      def applyTypeArgs(t: Tree): Tree =
-        if typeArgs.isEmpty then t else t.appliedToTypes(typeArgs)
-
-      val etaTree: Tree =
-        if clauseInfos.isEmpty then
-          // No `MethodType` in the chain — `ref(defSym)` auto-applies
-          // (no-paren `def g: R`, possibly poly).
-          val methTpe = MethodType(Nil, defn.AnyType)
-          Lambda(methTpe, _ => applyTypeArgs(ref(defSym))).withSpan(span)
-        else
-          val flatNames = clauseNames.flatten
-          val flatInfos = clauseInfos.flatten
-          // By-name params can't be `cast` to: `asInstanceOf[=> T]` is
-          // not a legal cast target. Keep the original `ExprType` as
-          // the lambda's param type for those positions so the call
-          // site type-checks without a cast. Other params get `Any` and
-          // a cast inside the body.
-          val lambdaParamTpes: List[Type] = flatInfos.map {
-            case et: ExprType => et
-            case _ => defn.AnyType
-          }
-          val methTpe = MethodType(flatNames)(_ => lambdaParamTpes, _ => defn.AnyType)
-          Lambda(methTpe, params =>
-            // Cast each lambda param back to the def's expected type at
-            // that position. Required so the typed Apply tree
-            // type-checks; at runtime these are `checkcast`s against the
-            // erased Object form and always succeed for body-supplied
-            // values. By-name params skip the cast — their lambda
-            // param already carries the matching `ExprType`.
-            val callArgs = params.lazyZip(flatInfos).map { (p, t) =>
-              t match
-                case _: ExprType => p
-                case _ => p.cast(t)
-            }
-            // Re-group the flat params into the def's original clause
-            // arities so `appliedToArgss` builds the right Apply chain.
-            def regroup(xs: List[Tree], sizes: List[Int]): List[List[Tree]] = sizes match
-              case Nil => Nil
-              case n :: rest =>
-                val (head, tail) = xs.splitAt(n)
-                head :: regroup(tail, rest)
-            val grouped = regroup(callArgs, clauseInfos.map(_.length))
-            applyTypeArgs(ref(defSym)).appliedToArgss(grouped)
-          ).withSpan(span)
+      // A no-paren `def g: R` (possibly poly) has no clauses: `ref(defSym)`
+      // auto-applies inside a nullary lambda.
+      val etaTree = flattenedLambda(defSym.info, span) { (typeArgs, argss) =>
+        val fn = if typeArgs.isEmpty then ref(defSym) else ref(defSym).appliedToTypes(typeArgs)
+        fn.appliedToArgss(argss)
+      }
       // The recorded type is the def's declared signature (e.g.
       // `(x: Int): String`), not the `Any`-typed eta-expansion the
       // value actually carries.
@@ -2148,6 +2097,15 @@ object EvalRewriteTyped:
   private val EvalMethodName: TermName = termName("eval")
   private val EvalSafeMethodName: TermName = termName("evalSafe")
 
+  /** Whether a driver in this context can run the rewrite at all: regular
+   *  compilation under `-Xdynamic-eval`, or an interactive compile (the REPL,
+   *  the wrapper and definitions compiles), which enables it unconditionally.
+   *  Ordinary compiles skip the typer hook entirely, so they pay nothing for
+   *  it.
+   */
+  private def rewriteMayRun(using Context): Boolean =
+    ctx.settings.XdynamicEval.value || ctx.mode.is(Mode.Interactive)
+
   /** Typer-side identification of an eval-like callee, mirroring the
    *  rewriter's `classifyCall` (symbol identity for `Eval.eval` /
    *  `Eval.evalSafe`, annotation for user generators). Resilient to
@@ -2218,7 +2176,7 @@ object EvalRewriteTyped:
    *  one, hence the `isAfterTyper` guard.
    */
   def recordEvalProto(tree: Tree, pt: Type)(using Context): Unit =
-    if ctx.isAfterTyper then return
+    if ctx.isAfterTyper || !rewriteMayRun then return
     def strip(t: Tree): Tree = t match
       case Block(_, expr) => strip(expr)
       case t => t
@@ -2226,6 +2184,19 @@ object EvalRewriteTyped:
       case app: Apply if isEvalLikeRef(methPart(app).symbol) && isRecordablePt(pt) =>
         app.putAttachment(EvalProto, pt)
       case _ =>
+
+  /** Constructors of `cls` in the order both compiles agree on: primary
+   *  first, then secondaries by source position. The wrapper compile
+   *  re-elaborates the same class source, so the index identifies the same
+   *  constructor on both sides; [[ExtractEvalBody]] uses it to select the
+   *  captured factory binding.
+   */
+  private[eval] def constructorsOf(cls: ClassSymbol)(using Context): List[Symbol] =
+    val primary = cls.primaryConstructor
+    val secondaries = cls.info.decls.toList
+      .filter(s => s.isConstructor && s != primary)
+      .sortBy(_.span.start)
+    if primary.exists then primary :: secondaries else secondaries
 
   /** Canonical parameter name for the "bindings" synthetic slot.
    *  Both `Eval.eval` and user eval-like signatures must declare

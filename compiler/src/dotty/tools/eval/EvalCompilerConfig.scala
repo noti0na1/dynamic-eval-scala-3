@@ -11,10 +11,8 @@ import java.util.function.Consumer
  *  within its classloader; callers normally include a UUID.
  */
 private[eval] case class EvalCompilerConfig(
-    packageName: String = "",
     outputClassName: String = "",
     body: String = "",
-    marker: String = EvalContext.placeholder,
     errorReporter: Consumer[String] = (_: String) => (),
     testMode: Boolean = false,
     expectedType: String = "",
@@ -39,9 +37,9 @@ private[eval] case class EvalCompilerConfig(
   /** Whether non-local returns can be lowered through [[EvalNonLocalReturn]]. */
   def hasReturnKey: Boolean = bindingNames.contains(EvalNames.ReturnKeyBinding)
 
+  /** The generated expression class, always placed in the empty package. */
   def expressionClass(using Context): ClassSymbol =
-    if packageName.isEmpty then requiredClass(outputClassName)
-    else requiredClass(s"$packageName.$outputClassName")
+    requiredClass(outputClassName)
 
   def evaluateMethod(using Context): Symbol =
     expressionClass.info.decl(termName("evaluate")).symbol

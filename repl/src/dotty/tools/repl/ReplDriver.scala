@@ -390,13 +390,33 @@ class ReplDriver(settings: Array[String],
         catch case NonFatal(_) => None
       val materialized = entries.distinct.mkString(JFile.pathSeparator)
       if materialized.nonEmpty then materialized else ctx.settings.classpath.value(using ctx)
+
+    private val settingsSnapshot = effectiveSettings
+
+    /** Whether these inputs still describe the live session: the same state,
+     *  settings, and output loader. `:jar` and `:dep` replace the loader.
+     */
+    def isCurrent(current: State): Boolean =
+      (current eq state) && (effectiveSettings eq settingsSnapshot)
+        && (rendering.classLoader()(using current.context) eq classLoader)
   end SessionCompileInputs
+
+  /** The inputs of the latest dynamic compilation, reused while the session
+   *  is unchanged. Rendering the session imports and materializing the
+   *  classpath would otherwise dominate the cost of a cache-hit eval call.
+   */
+  @volatile private var lastSessionInputs: SessionCompileInputs | Null = null
 
   private def currentSessionInputs(): SessionCompileInputs =
     val state = currentState
     if state == null then
       throw new IllegalStateException("Dynamic evaluation has no current REPL state")
-    new SessionCompileInputs(state)
+    val cached = lastSessionInputs
+    if cached != null && cached.isCurrent(state) then cached
+    else
+      val inputs = new SessionCompileInputs(state)
+      lastSessionInputs = inputs
+      inputs
 
   /** Compile an `eval` body with a fresh driver because the active compiler run
    *  is not re-entrant. [[SessionCompileInputs]] supplies the live session's

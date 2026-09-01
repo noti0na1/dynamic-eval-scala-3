@@ -54,22 +54,6 @@ abstract class EvalExpressionBase(
   protected final def getRaw(name: String): Any =
     __unwrapLazy__(__findBinding__(name).value)
 
-  /** Finds an enclosing instance by walking `$outer` fields. */
-  protected final def getOuter(obj: Object | Null, outerTypeName: String): Object | Null =
-    if obj == null then return null
-    var clazz: Class[?] | Null = obj.getClass
-    while clazz != null do
-      val fields = clazz.getDeclaredFields
-      var i = 0
-      while i < fields.length do
-        val f = fields(i)
-        if f.getName == "$outer" && f.getType.getName == outerTypeName then
-          f.setAccessible(true)
-          return f.get(obj)
-        i = i + 1
-      clazz = clazz.getSuperclass
-    throw new NoSuchFieldException("$outer (" + outerTypeName + ") on " + obj.getClass.getName)
-
   /** Finds an exact or Scala-mangled field name. Exact names take precedence
    *  over suffix matches, independent of reflection declaration order.
    */
@@ -91,12 +75,13 @@ abstract class EvalExpressionBase(
    *  when a local class was re-elaborated in the wrapper.
    */
   protected final def getField(obj: Object | Null, className: String, fieldName: String): Any =
-    var clazz: Class[?] | Null =
+    val startClass: Class[?] =
       if className.isEmpty then
         if obj == null then
           throw new NullPointerException("getField on null receiver with empty className")
         else obj.getClass
       else classLoader.loadClass(className)
+    var clazz: Class[?] | Null = startClass
     while clazz != null do
       val field = __findField__(clazz, fieldName)
       if field != null then
@@ -113,7 +98,12 @@ abstract class EvalExpressionBase(
             case e: java.lang.reflect.InvocationTargetException => throw e.getCause
         i = i + 1
       clazz = clazz.getSuperclass
-    throw new NoSuchFieldException(fieldName)
+    // A constructor parameter that is used only inside the constructor (for
+    // example by a closure in a field initializer) is not stored as a field.
+    throw new NoSuchFieldException(
+      s"$fieldName: ${startClass.getName} declares no such field or parameterless method. " +
+        "A constructor parameter that is only used inside the constructor is not " +
+        "stored as a field and cannot be read from an eval body.")
 
   /** Writes a field, walking superclasses and then trying `<name>_$eq`. An empty
    *  `className` selects the receiver's runtime class.
@@ -277,6 +267,15 @@ abstract class EvalExpressionBase(
    */
   protected final def __refl_get__(obj: Object, name: String): Any =
     getField(obj, "", name)
+
+  /** Typed read of a member whose declaration relies on type inference:
+   *  `sample` wraps a re-parsed copy of the member's initializer, never
+   *  invoked, that only pins `T` for the wrapper's typer. A JDK functional
+   *  interface keeps the signature stable across the eval classloader
+   *  boundary, where `scala.Function0` may have another `Class` identity.
+   */
+  protected final def __refl_get_as__[T](obj: Object, name: String, sample: java.util.function.Supplier[T]): T =
+    getField(obj, "", name).asInstanceOf[T]
 
   protected final def __refl_set__(obj: Object, name: String, value: Any): Unit =
     setField(obj, "", name, value.asInstanceOf[Object | Null])

@@ -203,6 +203,14 @@ Known limitations:
 * `__evalBodyPlaceholder__` is reserved within an enclosing statement. Nested
   eval composition also rejects additional occurrences of that marker text
   when it cannot identify a unique splice location.
+* A constructor parameter that is used only inside the constructor (for
+  example by a closure in a field initializer) is not stored as a field, so a
+  body cannot read it through the instance; the runtime error names the
+  parameter and this limitation.
+* An eval call in a constructor argument (a parent clause or a secondary
+  constructor's `this(...)` call) works, but its body cannot name the instance
+  under construction or its members, matching the source rule; the wrapper
+  compile reports that as a diagnostic.
 
 ## The idea
 
@@ -1117,10 +1125,23 @@ then treats the wrapper-owned re-elaboration like a method-local
 class, so member access reflects against the live module and state
 is shared.
 
-After the lift, `this` references in the body are rewritten to
-`__this__` (or to the object's own name for a lifted singleton),
-and private field/method accesses are rerouted through synthesized
-`__refl_get__`, `__refl_set__`, and `__refl_call__` helpers.
+After the lift, `this` references are rewritten to `__this__` (or
+to the object's own name for a lifted singleton), and private
+field/method accesses, including compound assignments such as
+`n += 1`, are rerouted through synthesized `__refl_get__`,
+`__refl_set__`, and `__refl_call__` helpers. A private field whose
+type is inferred from a non-literal initializer is read through
+`__refl_get_as__(recv, "x", <initializer>)`, where a re-parsed,
+never-evaluated copy of the initializer pins the static type the
+typer would otherwise have to widen to `Any`. Both rewrites apply to
+the body *and* to the enclosing code the lift hoisted along with
+it: a statement before the eval call that reads a private
+constructor parameter or writes `this.x` must still typecheck in
+the wrapper, even though only `evaluate()` ever runs. The lift also
+re-creates the scope a declaration gave its members: an enum body's
+import of its companion (so cases resolve unqualified), and the
+desugarer's invented name for an anonymous `given ... with`
+instance, which the parser has not assigned yet.
 
 #### `EvalRewriteTyped` (after PostTyper, on the wrapper)
 
@@ -1235,6 +1256,13 @@ at runtime, the adapter:
 A body runtime exception arrives wrapped in
 `InvocationTargetException`; the adapter unwraps and rethrows the
 cause so callers see the original exception.
+
+The session inputs the driver hands to the adapter (the output
+loader, the rendered session imports, the forwarded settings, and
+the materialized classpath) are snapshotted once per REPL line and
+reused while the state, settings, and loader are unchanged, so a
+cache hit costs a few microseconds rather than a re-rendering of
+every session import on each call in a loop.
 
 ### Caching compiled wrappers
 
@@ -1459,6 +1487,7 @@ output:
 | `DynamicEvalAgentApiTests`       | The `@evalLike` / `@evalSafeLike` wrapper API, the `eval { ctx => ... }` closure form, and `EvalContext`. | (defaults)                                    |
 | `DynamicEvalLogTests`            | The per-compilation log files written by `-Xrepl-eval-log-dir` on cache misses. | `-Xrepl-eval-log-dir:<dir>`                  |
 | `DynamicEvalLiveSettingsTests`   | Live `:settings` and `:reset` changes forwarded to eval and top-level compiles. | settings changed during the session           |
+| `DynamicEvalCallSiteShapeTests`  | Shapes around the call: enclosing code that reads private members or `this`, constructor-argument positions, enum bodies, anonymous givens, a user wrapper named `eval`. | (defaults)                                    |
 | `DynamicEvalDisabledInstrumentationTests`, `DynamicEvalLocalInstrumentationTests` | Session class identity under alternate interrupt-instrumentation modes. | `-Xrepl-interrupt-instrumentation:<mode>` |
 | `TopLevelEvalTests`              | The `topLevel` primitive: defs applied to call-site locals and local type arguments, shared module state and stable class identity across call sites, local-first name resolution, `using`/`given` in every direction, isolation and eager errors. | (defaults)                                    |
 
