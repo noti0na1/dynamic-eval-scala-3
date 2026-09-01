@@ -15,26 +15,14 @@ import dotty.tools.dotc.reporting.{Diagnostic, StoreReporter}
 import dotty.tools.dotc.util.ClasspathFromClassloader
 import dotty.tools.io.{AbstractFile, ClassPath}
 
-/** Compile an eval body through the eval pipeline.
+/** Entry points for compiling generated eval sources.
  *
- *  Two entry points cover the two callers we have:
- *
- *    - [[run]] for the file-based path used by unit tests: reads a
- *      source file off disk, writes class files to a real
- *      `outputDir: Path`, with a string classpath argument.
- *    - [[compile]] for in-process use by the REPL adapter: takes an
- *      [[AbstractFile]] `outDir` (which can be an in-memory
- *      `VirtualDirectory`) and an optional [[AbstractFile]]
- *      `replOutDir` registered directly via
- *      `ClassPathFactory.newClassPath` so REPL-line modules are
- *      visible without materialising them to disk.
+ *  [[run]] uses filesystem paths for tests and command-line integration.
+ *  [[compile]] accepts in-memory output and REPL directories for runtime use.
  */
 class EvalCompilerBridge:
 
-  /** File-based path for unit tests. Spawns a fresh `Driver` via
-   *  `process(args, reporter)` with a string classpath and a real
-   *  `outputDir`. Cannot accept in-memory VirtualDirectory entries.
-   */
+  /** Compiles a source file to a filesystem output directory. */
   def run(
       outputDir: Path,
       classPath: String,
@@ -52,37 +40,21 @@ class EvalCompilerBridge:
     driver.process(args, reporter)
     !reporter.hasErrors
 
-  /** In-process compile entry point. The REPL session's `replOutDir`
-   *  (an in-memory `VirtualDirectory`) is added to the inner
-   *  compile's classpath via `ClassPathFactory.newClassPath` +
-   *  `SymbolLoaders.mergeNewEntries` so body code referencing
-   *  `rs$line$N` modules resolves without writing them to disk.
+  /** Compiles generated source in process. `replOutDir` is added directly to
+   *  the classpath so generated code can resolve in-memory `rs$line$N` modules.
    *
-   *  Returns `Right(())` on success — the caller loads classes
-   *  from `outDir` via [[AbstractFileClassLoader]]. On failure
-   *  returns `Left` with the compile errors as messages.
+   *  Returns `Right(())` on success or diagnostic messages on failure.
    *
-   *  @param source            the synthesised compilation unit text.
+   *  @param source            generated compilation unit text.
    *  @param outDir            destination for compiled class files.
    *                           A `VirtualDirectory` is fine.
    *  @param classLoader       session classloader, used to derive
    *                           the base classpath.
-   *  @param replOutDir        REPL session output dir (may hold
-   *                           `rs$line$N` modules). May be `null`.
-   *  @param compilerSettings  forwarded `-X…` settings from the
-   *                           REPL session.
-   *  @param replClasspath     when non-empty, used verbatim as the
-   *                           inner compile's classpath. The REPL
-   *                           caller passes
-   *                           `state.context.settings.classpath.value`
-   *                           here so the inner compile sees exactly
-   *                           the same classpath the REPL itself
-   *                           successfully compiles against. Empty
-   *                           string falls back to the synthesised
-   *                           cliCp + classloader + java.class.path
-   *                           path used by tests / direct callers.
-   *  @param config            eval config (splice marker, output
-   *                           class name, body, error reporter).
+   *  @param replOutDir        optional REPL session output directory.
+   *  @param compilerSettings  compiler settings forwarded by the session.
+   *  @param replClasspath     live session classpath, or empty to synthesize one
+   *                           from settings, classloaders, and `java.class.path`.
+   *  @param config            splice and output configuration.
    */
   def compile(
       source: String,
@@ -97,19 +69,11 @@ class EvalCompilerBridge:
     compileWith(source, outDir, classLoader, replOutDir, extraClassDirs,
       compilerSettings, replClasspath, () => new EvalCompiler(config))
 
-  /** Compile plain definitions (no eval body, no splice marker)
-   *  through the standard `Compiler` pipeline against the same
-   *  classpath view as [[compile]]. Used for the one-time
-   *  `Eval.topLevel` defs compile: the output classes persist for the
-   *  handle's lifetime and later [[compile]] calls see them via
-   *  `extraClassDirs`.
+  /** Compiles persistent [[Eval.topLevel]] definitions through the standard
+   *  pipeline and the same classpath setup as [[compile]].
    *
-   *  The eval rewrite phase is forced on ([[DefsCompiler]]) rather
-   *  than left to `-Xdynamic-eval`: a REPL session compiles defs
-   *  without the flag, and an eval-like call written inside the defs
-   *  must still capture its scope — its slice re-links later through
-   *  the handle the capture re-attaches at runtime (see
-   *  `Eval.withInheritedHandles`).
+   *  [[DefsCompiler]] always enables eval rewriting because a nested eval call
+   *  must capture its scope even when the REPL did not pass `-Xdynamic-eval`.
    */
   def compileDefs(
       source: String,
@@ -136,30 +100,25 @@ class EvalCompilerBridge:
     val (classpath, settingsWithoutCp) =
       if replClasspath.nonEmpty then (replClasspath, splitClasspathFlag(compilerSettings)._2)
       else composeClasspath(compilerSettings, classLoader)
-    // The classpath goes through `setup`'s argument parsing (not a
-    // direct `settings.classpath.update`, whose copy-on-write result
-    // is silently dropped once any setting has been read). Setup
-    // diagnostics (e.g. a malformed forwarded option) are buffered so
-    // a failure can report the actual cause.
+    // Pass the classpath through setup: direct setting updates are copy-on-write
+    // and can be lost after settings have been read. Buffer setup diagnostics so
+    // invalid forwarded options report their actual cause.
     val setupReporter = new StoreReporter(null)
     val setupCtx = driver.initCtx.fresh.setReporter(setupReporter)
-    driver.setup(settingsWithoutCp ++ Array("-classpath", classpath), setupCtx) match
+    val setupResult = driver.setup(settingsWithoutCp ++ Array("-classpath", classpath), setupCtx)
+    val setupErrors = setupReporter.removeBufferedMessages(using setupCtx)
+      .collect { case err: Diagnostic.Error => err.message }
+    if setupErrors.nonEmpty then Left(setupErrors)
+    else setupResult match
       case Some((_, ctx0)) =>
         val storeReporter = new StoreReporter(null)
-        // The inner compile is a continuation of the live REPL session:
-        // it recompiles an eval body inside a `rs$line$<uuid>$__Eval…`
-        // wrapper whose name is an `isReplWrapperName`. Run it in
-        // `Mode.Interactive` (as `ReplDriver` does for the session
-        // itself) so those reserved `$`-containing wrapper names are
-        // accepted — `SafeRefs.allowDollarIn` and `Namer.checkDefName`
-        // both exempt REPL wrapper names only in interactive mode.
+        // Interactive mode admits the reserved `$` names used by generated REPL
+        // wrappers, matching the context of the outer session compile.
         val freshCtx = ctx0.fresh
           .addMode(Mode.Interactive)
           .setSetting(ctx0.settings.outputDir, outDir)
           .setReporter(storeReporter)
-        // In-memory dirs joining the compile's classpath: the REPL
-        // session output (rs$line$N modules) plus any `Eval.topLevel`
-        // handle output dirs the call links against.
+        // Add in-memory REPL output and linked top-level definitions.
         val classDirs =
           (if replOutDir == null then Nil else List(replOutDir)) ++ extraClassDirs
         if classDirs.nonEmpty then
@@ -178,10 +137,8 @@ class EvalCompilerBridge:
           val run = compiler.newRun(using freshCtx)
           run.compileFromStrings(source :: Nil)
           if storeReporter.hasErrors then
-            // The reporter buffers warnings alongside errors; keep only
-            // the errors so `CompileFailure.errors` (which agent
-            // retry loops feed back into generators) isn't diluted
-            // with lint output about code the user didn't write.
+            // CompileFailure contains errors only; warnings are not part of the
+            // dynamic-eval result.
             Left(storeReporter.removeBufferedMessages(using freshCtx)
               .collect { case err: Diagnostic.Error => err.message })
           else Right(())
@@ -193,21 +150,18 @@ class EvalCompilerBridge:
         Left(Seq("Failed to set up eval driver"))
   end compileWith
 
-  /** Driver subclass exposing `initCtx` so [[compile]] can install a
-   *  buffering reporter before `setup`.
-   */
+  /** Exposes `initCtx` so setup diagnostics can be buffered. */
   private class EvalDriver extends Driver:
     override def sourcesRequired: Boolean = false
     override def initCtx: Context = super.initCtx
 
-  /** Build the inner compile's classpath from three sources:
+  /** Builds the inner classpath from three sources:
    *    1. any `-classpath` flag in `compilerSettings`,
    *    2. the session classloader (`ClasspathFromClassloader`),
    *    3. the host JVM's `java.class.path`.
    *
-   *  Returns the combined path plus settings with `-classpath` /
-   *  `-cp` removed so they don't override the composed path when the
-   *  settings are re-parsed by `Driver.setup`.
+   *  Classpath flags are removed from the returned settings so `Driver.setup`
+   *  cannot override the combined path.
    */
   private def composeClasspath(
       compilerSettings: Array[String],
@@ -220,10 +174,7 @@ class EvalCompilerBridge:
     val combined = (cliCp.toSeq ++ Seq(cp, sysCp)).filter(_.nonEmpty).mkString(sep)
     (combined, stripped)
 
-  /** Split off every classpath flag in `args`, in both the two-token
-   *  (`-classpath <path>`) and colon (`-classpath:<path>`) forms the
-   *  CLI accepts. Returns the first path found (if any) and the
-   *  remaining arguments.
+  /** Removes classpath flags in either CLI form and returns the first path.
    */
   private def splitClasspathFlag(args: Array[String]): (Option[String], Array[String]) =
     val kept = Array.newBuilder[String]
@@ -242,12 +193,7 @@ class EvalCompilerBridge:
     (found, kept.result())
 
 object EvalCompilerBridge:
-  /** The standard pipeline with the eval rewrite phase forced on.
-   *  The `Eval.topLevel` defs compile goes through this: an
-   *  eval-like call written inside the defs must capture its scope
-   *  like any other call site, and gating on `-Xdynamic-eval` would
-   *  leave it unrewritten in a REPL session, which never passes the
-   *  flag. */
+  /** Standard compiler with eval rewriting enabled for top-level definitions. */
   private[eval] class DefsCompiler extends Compiler:
     override protected def frontendPhases: List[List[dotty.tools.dotc.core.Phases.Phase]] =
       super.frontendPhases.map(_.map {

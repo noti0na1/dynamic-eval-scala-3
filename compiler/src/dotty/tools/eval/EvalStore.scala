@@ -6,55 +6,32 @@ import dotty.tools.dotc.core.Symbols.*
 import dotty.tools.dotc.core.Contexts.*
 import dotty.tools.dotc.core.Types.*
 
-/** Per-compile state shared between [[ExtractEvalBody]] and
- *  [[ResolveEvalAccess]]. Mirrors `dotty.tools.debug.ExpressionStore`.
- *
- *  Populated by Extract once it finds the spliced `val __evalResult`:
- *
- *    - `symbol`: the val symbol; used as the owner-chain anchor when
- *      classifying body-local vs outer references.
- *    - `classOwners`: enclosing classes from innermost out; Extract's
- *      `thisOrOuterValue` consults this chain to decide between a
- *      `This` placeholder (innermost class) and a `__this__<C>`
- *      binding read (outer classes).
+/** Per-compilation state shared by [[ExtractEvalBody]] and
+ *  [[ResolveEvalAccess]]. `symbol` anchors body-local ownership and
+ *  `classOwners` records enclosing classes from innermost to outermost.
  */
 private[eval] class EvalStore:
   var symbol: TermSymbol | Null = null
   var classOwners: Seq[ClassSymbol] = Seq.empty
 
-  /** *Linked* local classes: term-owned classes re-elaborated by the
-   *  wrapper compile whose original runtime entities the call site
-   *  captured as synthetic bindings (`__evalClass_<C>__` /
-   *  `__evalNew_<C>__$i`). Keyed by the wrapper-side class symbol
-   *  (symbol identity is stable across phases, while names are not;
-   *  LambdaLift freshens lifted-class names), with the *source*
-   *  name as value, from which both sides derive the binding names.
-   *  Populated by [[ExtractEvalBody]]; consumed there and by
-   *  [[ResolveEvalAccess]]'s post-erasure sweep.
+  /** Wrapper-side symbols of linked local classes, mapped to their source
+   *  names. Symbol identity remains stable when LambdaLift changes names.
    */
   var linkedClasses: Map[Symbol, String] = Map.empty
 
-  /** Same for linked local modules (`__evalModule_<M>__`): both the
-   *  module *val* symbol (term references) and the module *class*
-   *  symbol (member-call owners) map to the source name.
+  /** Linked local modules. Both the module value and module class map to the
+   *  same source name because later phases may refer to either symbol.
    */
   var linkedModules: Map[Symbol, String] = Map.empty
 
-  /** Classes declared *inside* the eval body. Recorded at extract
-   *  time (symbol identity is stable across phases): by the time
-   *  [[ResolveEvalAccess]] runs, LambdaLift/Flatten have moved them
-   *  out of `__Expression`, so the placeholder sweep can no longer
-   *  find them by position and consults this set instead.
+  /** Classes declared in the body. Extraction records them by symbol so Resolve
+   *  can find them after LambdaLift and Flatten move them out of the expression
+   *  class.
    */
   var bodyLocalClasses: Set[Symbol] = Set.empty
 
-  /** Wrapper-side symbols introduced by inline expansion (`Inlined`
-   *  node bindings), mapped to their reserved
-   *  `__evalInlined_<name>__` binding names. Populated by
-   *  [[ExtractEvalBody]] as it encounters Inlined nodes; consumed by
-   *  [[ResolveEvalAccess]] when lowering `LocalValue` /
-   *  `LocalValueAssign` placeholders, whose runtime names must match
-   *  what [[EvalRewriteTyped]] captured at the call site.
+  /** Symbols introduced by inline expansion, mapped to the binding names
+   *  captured by [[EvalCaptureInlined]].
    */
   var inlinedBindingNames: Map[Symbol, String] = Map.empty
 
@@ -63,11 +40,8 @@ private[eval] class EvalStore:
     if linkedClasses.isEmpty then None
     else linkedClasses.get(tpe.typeSymbol)
 
-  /** Source name and dimension count of the linked element class
-   *  when `tpe` is a (possibly multi-dimensional) array of a linked
-   *  local class, in either the pre-erasure
-   *  (`AppliedType(Array, …)`) or post-erasure (`JavaArrayType`)
-   *  shape. `Array[Array[C]]` yields `(C, 2)`.
+  /** Returns the linked element's source name and array depth. Handles both
+   *  `AppliedType(Array, ...)` and post-erasure `JavaArrayType` shapes.
    */
   def linkedArrayElemInfo(tpe: Type)(using Context): Option[(String, Int)] =
     if linkedClasses.isEmpty then None
@@ -89,10 +63,7 @@ private[eval] class EvalStore:
   def hasLinked: Boolean =
     linkedClasses.nonEmpty || linkedModules.nonEmpty
 
-  /** True when the type *part* `p` refers to a linked entity: a
-   *  linked class, a linked module's class, or (as a TermRef) the
-   *  linked module val itself.
-   */
+  /** Whether a type part refers to a linked class or module. */
   def isLinkedPart(p: Type)(using Context): Boolean =
     p match
       case p: TermRef =>
@@ -101,15 +72,9 @@ private[eval] class EvalStore:
         val sym = p.typeSymbol
         linkedClasses.contains(sym) || linkedModules.contains(sym)
 
-  /** Substitute every linked-entity occurrence in `info` with
-   *  `Object`. Shared by [[ExtractEvalBody]] (body-local symbols
-   *  that exist when it runs, including PatternMatcher binders) and
-   *  [[ResolveEvalAccess]] (symbols minted by phases that run after
-   *  extract, e.g. LetOverApply receiver temps, Memoize fields, and
-   *  erasure temps): the runtime values flowing through these
-   *  positions belong to the *original* lifted classes, so a
-   *  descriptor or checkcast naming the wrapper's re-elaborated
-   *  copy would be wrong.
+  /** Replaces linked entities in `info` with `Object`. Runtime values belong to
+   *  the original classes, so generated descriptors must not name the wrapper's
+   *  re-elaborated copies.
    */
   def eraseLinkedRefs(info: Type)(using Context): Type =
     val mapper = new TypeMap:

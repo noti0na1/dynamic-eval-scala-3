@@ -15,37 +15,19 @@ import dotc.core.Symbols.*
 import dotc.core.Types.*
 import dotc.transform.MacroTransform
 
-/** Post-`Inlining` companion to [[EvalRewriteTyped]]: appends
- *  synthetic `__evalInlined_<name>__` bindings for values the inliner
- *  introduced around an already-filled eval call.
+/** Captures values introduced by inlining around an eval call already handled
+ *  by [[EvalRewriteTyped]].
  *
- *  [[EvalRewriteTyped]] runs before the `Inlining` phase, so its
- *  captures carry the names the user's source elaborates to (a
- *  context-function parameter for `boundary { eval(...) }`). The
- *  inliner then beta-reduces the inline call's lambda arguments,
- *  substituting those references with the expansion's internal
- *  bindings (e.g. `scala.util.boundary.apply`'s `val local` label).
- *  The wrapper compile runs the same expansion over the same source,
- *  so an eval body's reference to such a value (a body `break(42)`
- *  resolves the call site's label) lowers to a read of the
- *  *expansion's* name, which the pre-inlining capture cannot supply.
+ *  The initial rewrite runs before inlining, but the generated wrapper repeats
+ *  the same expansion and may refer to expansion-local symbols. For example, a
+ *  `boundary` label in an eval body resolves to the inliner's internal binding
+ *  rather than the context-function parameter captured earlier.
  *
- *  This phase closes the gap: for every eval call whose bindings
- *  array the rewriter filled (recognised as a `JavaSeqLiteral`
- *  argument of type `Array[Eval.Binding]`), it walks the enclosing
- *  `Inlined` nodes' val bindings and appends
- *  `Eval.bindSynthetic("__evalInlined_<name>__", <ref>)` entries,
- *  innermost layer winning on name collisions (matching the
- *  wrapper's own innermost-wins elaboration). The wrapper side
- *  ([[ExtractEvalBody]] / [[ResolveEvalAccess]]) emits the same
- *  reserved names for symbols it finds on its own `Inlined` nodes;
- *  both compiles expand the same source, so the names agree. The
- *  mangling keeps the entries clear of user names (hygiene already
- *  makes the values un-nameable from source).
+ *  This phase appends those symbols under reserved names to compiler-generated
+ *  bindings arrays. The wrapper compile derives the same names, and the nearest
+ *  expansion wins on collisions to match lexical lookup.
  *
- *  Explicitly-supplied bindings arguments are left alone (they are
- *  not rewriter-built literals), mirroring the rewriter's
- *  all-or-nothing contract for synthetic arguments.
+ *  Explicitly supplied bindings are left unchanged.
  */
 class EvalCaptureInlined(
     maybeConfig: Option[EvalCompilerConfig] = None,
@@ -56,11 +38,7 @@ class EvalCaptureInlined(
 
   override def runsAfter: Set[String] = Set(dotc.transform.Inlining.name)
 
-  /** Same three installers as [[EvalRewriteTyped]]: the main pipeline
-   *  (gated on `-Xdynamic-eval`), the REPL (always), and the wrapper
-   *  compile (config present; nested eval calls in the body need the
-   *  same treatment).
-   */
+  /** Enabled for regular dynamic eval, the REPL, and nested wrapper compiles. */
   override def isEnabled(using Context): Boolean =
     alwaysEnabled || maybeConfig.isDefined || ctx.settings.XdynamicEval.value
 
@@ -68,39 +46,36 @@ class EvalCaptureInlined(
 
   private class Capture extends Transformer:
 
-    /** Expansion-introduced val bindings in scope, innermost frame
-     *  first. Two producers: the `Inlined` node's own bindings
-     *  (parameter proxies) and the stats of blocks *inside* an
-     *  expansion region (the inline def's body locals, e.g.
-     *  `boundary.apply`'s `val local`; the inliner copies them as
-     *  ordinary block statements, not node bindings).
+    /** Expansion-local values in scope, innermost frame first. These include
+     *  `Inlined` parameter proxies and block-local values copied from the inline
+     *  method body.
      */
     private var frames: List[List[ValDef]] = Nil
 
-    /** Inside an inline expansion's own code. A nested
-     *  `Inlined(EmptyTree, ...)` region marks beta-reduced call-site
-     *  code (the user's lambda argument): its blocks are user code,
-     *  already captured under their source names by the rewriter,
-     *  and must not be re-captured here.
+    /** Whether the traversal is in expansion code. `Inlined(EmptyTree, ...)`
+     *  represents call-site code, whose source bindings were captured earlier.
      */
     private var inExpansion: Boolean = false
 
+    private def withFrame[T](frame: List[ValDef])(op: => T): T =
+      if frame.isEmpty then op
+      else
+        frames = frame :: frames
+        try op
+        finally frames = frames.tail
+
     private def collectVals(stats: List[Tree])(using Context): List[ValDef] =
       stats.collect {
-        // Vars would need the `VarRef` facade plumbing; not built
-        // here (an inline-internal var written from a body is not a
-        // known use case), and `ExtractEvalBody` diagnoses an
-        // unmatched reference cleanly. Same for `def`-shaped by-name
-        // argument proxies.
+        // Mutable values require VarRef and by-name proxies require def capture;
+        // unsupported references receive the normal missing-binding diagnostic.
         case vd: ValDef
             if !vd.name.isEmpty
             && !vd.symbol.isOneOf(Flags.Erased | Flags.Module | Flags.Mutable) =>
           vd
       }
 
-    // Resolved once per unit; `getModuleIfDefined` so a program
-    // compiled with `-Xdynamic-eval` but without the eval API on the
-    // classpath degrades to a no-op instead of crashing.
+    // Resolve once per unit. Optional lookups make the phase a no-op when a
+    // compilation enables the flag without the eval API on its classpath.
     private var apiResolved = false
     private var evalModuleCls: Symbol = NoSymbol
     private var bindSyntheticFn: Symbol = NoSymbol
@@ -127,12 +102,8 @@ class EvalCaptureInlined(
         || (evalSafeLikeAnnot.exists && sym.hasAnnotation(evalSafeLikeAnnot))
       }
 
-    /** A rewriter-built bindings argument: a `JavaSeqLiteral` whose
-     *  element type is `Eval.Binding`, possibly inside the
-     *  `Eval.withInheritedHandles(<defsObject>, <literal>)` wrap the
-     *  rewriter routes every array through. Returns the literal and
-     *  a rebuild that re-establishes the original shape around a
-     *  replacement literal.
+    /** Finds a compiler-generated bindings literal, optionally wrapped by
+     *  `withInheritedHandles`, and returns a function that preserves the wrapper.
      */
     private def filledBindingsArg(arg: Tree)(using Context): Option[(JavaSeqLiteral, JavaSeqLiteral => Tree)] =
       def isBindingsLiteral(lit: JavaSeqLiteral): Boolean =
@@ -153,33 +124,29 @@ class EvalCaptureInlined(
         try
           if !inExpansion then super.transform(tree)
           else
-            // The node bindings' own right-hand sides are transformed
-            // *without* their frame: a non-inline function argument
-            // becomes a proxy val whose rhs is the (not yet
-            // beta-reduced) argument closure, and an eval call inside
-            // it must not capture the proxy being defined (a self
-            // read of an uninitialized local; the closure's own
-            // parameters already carry the values it needs). Only the
-            // expansion, where the bindings are initialized, sees the
-            // frame.
+            // A node binding is not in scope in its own right-hand side. Only the
+            // initialized expansion sees the frame, avoiding self-captures of
+            // parameter proxies.
             val bindings1 = tree.bindings.map(b => transform(b).asInstanceOf[tpd.MemberDef])
             val frame = collectVals(tree.bindings)
-            val expansion1 =
-              if frame.isEmpty then transform(tree.expansion)
-              else
-                frames = frame :: frames
-                try transform(tree.expansion)
-                finally frames = frames.tail
+            val expansion1 = withFrame(frame)(transform(tree.expansion))
             cpy.Inlined(tree)(tree.call, bindings1, expansion1)
         finally inExpansion = saved
 
       case tree: Block if inExpansion =>
-        val frame = collectVals(tree.stats)
-        if frame.isEmpty then super.transform(tree)
+        val blockVals = collectVals(tree.stats)
+        if blockVals.isEmpty then super.transform(tree)
         else
-          frames = frame :: frames
-          try super.transform(tree)
-          finally frames = frames.tail
+          // Extend the frame after each statement: later values are not visible
+          // in earlier initializers.
+          var preceding: List[ValDef] = Nil
+          val stats1 = tree.stats.map { stat =>
+            val stat1 = withFrame(preceding)(transform(stat))
+            preceding = preceding ++ collectVals(stat :: Nil)
+            stat1
+          }
+          val expr1 = withFrame(preceding)(transform(tree.expr))
+          cpy.Block(tree)(stats1, expr1)
 
       case app: Apply =>
         resolveApi()
@@ -207,9 +174,7 @@ class EvalCaptureInlined(
             val bind = ref(bindSyntheticFn)
               .appliedTo(nameLit, ref(vd.symbol).withSpan(span), tpeLit)
               .withSpan(span)
-              // Same capture-checking exemption as the rewriter's
-              // bind calls: the reference only travels to the body,
-              // which is rechecked in its own context.
+              // The captured reference is rechecked when the body is compiled.
               .withAttachment(CheckCaptures.DiscardUses, ())
             bind :: Nil
           else Nil

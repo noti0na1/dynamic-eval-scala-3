@@ -17,6 +17,7 @@ import scala.util.control.NonFatal
 import java.util.function.Predicate
 
 import dotty.vendored.fansi
+import AbstractFileClassLoader.InterruptInstrumentation
 
 /** This rendering object uses `ClassLoader`s to accomplish crossing the 4th
  *  wall (i.e. fetching back values from the compiled class files put into a
@@ -214,11 +215,14 @@ private[repl] class Rendering(parentClassLoader: Option[ClassLoader] = None):
   }
 
 
-  /** Class loader used to load compiled code */
+  /** Classloader used for compiled code. A loader for a new output directory
+   *  delegates to the previous one so existing session classes remain visible.
+   */
   private[repl] def classLoader()(using Context) =
     if (myClassLoader != null && myClassLoader.root == ctx.settings.outputDir.value) myClassLoader
     else {
-      val parent = Option(myClassLoader).orElse(parentClassLoader).getOrElse {
+      val previousOutputLoader = myClassLoader
+      val parent = Option(previousOutputLoader).orElse(parentClassLoader).getOrElse {
         val compilerClasspath = ctx.platform.classPath(using ctx).asURLs
         // We can't use the system classloader as a parent because it would
         // pollute the user classpath with everything passed to the JVM
@@ -233,7 +237,8 @@ private[repl] class Rendering(parentClassLoader: Option[ClassLoader] = None):
       myClassLoader = new AbstractFileClassLoader(
         ctx.settings.outputDir.value,
         parent,
-        AbstractFileClassLoader.InterruptInstrumentation.fromString(ctx.settings.XreplInterruptInstrumentation.value)
+        InterruptInstrumentation.fromString(ctx.settings.XreplInterruptInstrumentation.value),
+        previousOutputLoader
       )
       myClassLoader
     }

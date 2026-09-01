@@ -3,15 +3,12 @@ package repl
 
 import java.io.{File, PrintStream, ByteArrayOutputStream}
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path}
+import java.nio.file.Files
 
-import org.junit.{After, Before, Test}
+import org.junit.{After, Test}
 import org.junit.Assert.*
 
-/** Tests for the `-Xrepl-history-file:<path>` flag, which appends a
- *  transcript of every REPL line (input + captured output) to a file
- *  for tools like `agent[T]` to read back as conversational context.
- */
+/** Tests for transcripts written by `-Xrepl-history-file:<path>`. */
 class ReplHistoryTests
     extends ReplTest(ReplHistoryTests.optionsForTempFile, new ByteArrayOutputStream):
 
@@ -21,7 +18,7 @@ class ReplHistoryTests
 
   private def historyContent: String =
     val f = ReplHistoryTests.historyFile
-    if !f.exists() then "" else new String(Files.readAllBytes(f.toPath), StandardCharsets.UTF_8)
+    if !f.exists() then "" else Files.readString(f.toPath, StandardCharsets.UTF_8)
 
   @Test def writesInputAndOutput = initially {
     run("val n = 1 + 2")
@@ -81,7 +78,7 @@ class ReplHistoryTests
       s.contains("scala> :imports"))
   }
 
-  @Test def allCommandShapesAreRecorded = initially {
+  @Test def commandsWithEmptyArgumentsAreRecorded = initially {
     val afterSave = run(":save")
     val afterReplay = run(":replay")(using afterSave)
     val afterToolkit = run(":toolkit")(using afterReplay)
@@ -123,8 +120,12 @@ class ReplHistoryTests
     // Print more than `ReplHistory.captureLimit` bytes in one line; the
     // live stream gets everything, the history entry is capped and ends
     // with a truncation marker.
-    run(s"""print("x" * ${ReplHistory.captureLimit + 1024})""")
+    val emitted = ReplHistory.captureLimit + 1024
+    run(s"""print("x" * $emitted)""")
+    val live = storedOutput()
     val s = historyContent
+    assertTrue(s"expected complete live output, size was ${live.length}",
+      live.count(_ == 'x') >= emitted)
     assertTrue(s"expected a truncation marker, got tail:\n${s.takeRight(200)}",
       s.contains("[... output truncated:"))
     assertTrue(s"expected the entry to be capped near the limit, size was ${s.length}",
@@ -145,8 +146,7 @@ class ReplHistoryTests
 end ReplHistoryTests
 
 object ReplHistoryTests:
-  // One file per JVM run. Cleaned by the @After hook between tests so
-  // each test sees only its own writes.
+  // The @After hook clears this file between tests.
   val historyFile: File =
     val f = File.createTempFile("repl-history-", ".txt")
     f.deleteOnExit()
@@ -208,6 +208,8 @@ class ReplHistoryUnwritableTests
     val out = storedOutput()
     assertTrue(s"expected the line to evaluate normally, got:\n$out",
       out.contains("val ok: Int = 42"))
+    assertTrue(s"expected one history warning, got:\n$out",
+      out.contains(s"[repl-history] WARNING: failed to append to '${ReplHistoryUnwritableTests.unwritablePath}'"))
     assertFalse("expected no history file at the unwritable path",
       new File(ReplHistoryUnwritableTests.unwritablePath).exists())
   }
@@ -226,3 +228,68 @@ object ReplHistoryUnwritableTests:
 
   val options: Array[String] =
     ReplTest.defaultOptions :+ s"-Xrepl-history-file:$unwritablePath"
+
+class ReplHistoryDriverIntegrationTests:
+
+  @Test def appendFailuresWarnOncePerPath(): Unit =
+    def exercise(path: String): String =
+      val live = new ByteArrayOutputStream
+      val driver = new ReplDriver(
+        ReplTest.defaultOptions :+ s"-Xrepl-history-file:$path",
+        new PrintStream(live, true, StandardCharsets.UTF_8)
+      )
+      val first = driver.run("val first = 1")(using driver.initialState)
+      driver.run("val second = 2")(using first)
+      live.toString(StandardCharsets.UTF_8)
+
+    val blockers = List.fill(2) {
+      val file = File.createTempFile("repl-history-warning-", ".tmp")
+      file.deleteOnExit()
+      s"${file.getAbsolutePath}${File.separator}history.txt"
+    }
+    val outputs = blockers.map(exercise)
+    outputs.zip(blockers).foreach { (output, path) =>
+      val marker = s"[repl-history] WARNING: failed to append to '$path'"
+      assertEquals(s"expected exactly one warning for $path, got:\n$output",
+        1, output.split(java.util.regex.Pattern.quote(marker), -1).length - 1)
+    }
+
+  @Test def initialPredefIsNotRecordedAsUserInput(): Unit =
+    val history = File.createTempFile("repl-history-init-", ".txt")
+    history.delete()
+    history.deleteOnExit()
+    val live = new ByteArrayOutputStream
+    val driver = new ReplDriver(
+      ReplTest.defaultOptions :+ s"-Xrepl-history-file:${history.getAbsolutePath}",
+      new PrintStream(live, true, StandardCharsets.UTF_8),
+      extraPredef = "val internalPredefValue = 42"
+    )
+    driver.initialState
+    val recorded =
+      if history.exists() then Files.readString(history.toPath, StandardCharsets.UTF_8)
+      else ""
+    assertTrue(s"expected the predef to execute, got:\n$live",
+      live.toString(StandardCharsets.UTF_8).contains("internalPredefValue"))
+    assertEquals(s"expected no synthetic history entry, got:\n$recorded", "", recorded)
+
+  @Test def explicitNonDefaultCharsetIsPreserved(): Unit =
+    val charset = StandardCharsets.UTF_16LE
+    val bytes = new ByteArrayOutputStream
+    val history = File.createTempFile("repl-history-charset-", ".txt")
+    history.delete()
+    history.deleteOnExit()
+    val primary = new PrintStream(bytes, true, charset) with ReplHistory.CharsetCarrier:
+      def replCharset: java.nio.charset.Charset = charset
+    val driver = new ReplDriver(
+      ReplTest.defaultOptions :+ s"-Xrepl-history-file:${history.getAbsolutePath}",
+      out = primary
+    )
+    val state = driver.initialState
+    driver.run("""val unicode = "→ 🤪 T²""")(using state)
+    primary.flush()
+    val rendered = bytes.toString(charset)
+    assertTrue(s"expected intact Unicode output, got:\n$rendered",
+      rendered.contains("→ 🤪 T²"))
+    val recorded = Files.readString(history.toPath, StandardCharsets.UTF_8)
+    assertTrue(s"expected intact Unicode history, got:\n$recorded",
+      recorded.contains("→ 🤪 T²"))

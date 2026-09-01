@@ -45,29 +45,18 @@ object CheckCaptures:
   /** An attachment to prevent widening of arguments to tracked parameters */
   val NoWiden: Property.Key[Unit] = Property.Key()
 
-  /** An attachment marking an `Apply` tree to be rechecked with
-   *  `unsafeDiscardUses` semantics: uses inside the call are not
-   *  recorded into enclosing environments. Lets a compiler-internal
-   *  rewriter (e.g. the REPL eval-binding rewriter) suppress capture
-   *  propagation for synthesised value references without emitting a
-   *  source-level call to `caps.unsafe.unsafeDiscardUses`, which
-   *  would be rejected in safe mode. Sticky so the marker survives
-   *  the tree copies between PostTyper-stage rewriters and the
-   *  capture-check phase.
+  /** Marks an application whose uses should not be recorded in enclosing
+   *  environments. Compiler transforms use this instead of emitting a call
+   *  to `caps.unsafe.unsafeDiscardUses`, which safe mode would reject. The
+   *  attachment is sticky because the tree is copied before capture checking.
    */
   val DiscardUses: Property.StickyKey[Unit] = Property.StickyKey()
 
-  /** An attachment marking an `Apply` tree whose RESULT is rechecked
-   *  with `unsafeAssumePure` semantics: the application itself (and
-   *  its arguments) recheck normally, but the result type's capture
-   *  set is stripped. Lets a compiler-internal rewriter treat a
-   *  synthesised plumbing call — the eval rewriter's
-   *  `Eval.withInheritedHandles(...)` around a captured bindings
-   *  array, whose `Array` result would otherwise pick up a fresh
-   *  mutability capture no pure parameter type accepts — as the
-   *  inert value it is, without emitting a source-level call to the
-   *  safe-mode-rejected `caps.unsafe.unsafeAssumePure`. Sticky for
-   *  the same reason as [[DiscardUses]].
+  /** Marks an application whose result is treated as pure. The application
+   *  and its arguments are checked normally, then captures are removed from
+   *  the result type. This gives compiler transforms the semantics of
+   *  `caps.unsafe.unsafeAssumePure` without emitting a source-level call that
+   *  safe mode would reject. Sticky for the same reason as [[DiscardUses]].
    */
   val AssumePure: Property.StickyKey[Unit] = Property.StickyKey()
 
@@ -833,20 +822,10 @@ class CheckCaptures extends Recheck, SymTransformer:
       else if meth == defn.Caps_freeze then
         freeze(super.recheckApply(tree, pt), tree.srcPos)
       else if tree.hasAttachment(DiscardUses) then
-        // A compiler-internal rewriter asked for `unsafeDiscardUses`
-        // semantics on this whole call without going through the
-        // (safe-mode-rejected) `caps.unsafe.unsafeDiscardUses` symbol.
-        // Recheck the application normally, but with use recording
-        // suppressed for everything inside it. Checked after the
-        // `defn.Caps_*` symbol dispatch: sticky attachments survive
-        // tree copies, and an attached `caps.freeze` call must not
-        // silently skip freeze semantics.
+        // Check built-in caps operations first, so an attachment copied onto
+        // `caps.freeze` cannot suppress its special semantics.
         withDiscardedUses(super.recheckApply(tree, pt))
       else if tree.hasAttachment(AssumePure) then
-        // A compiler-internal rewriter asked for `unsafeAssumePure`
-        // semantics on this call's result (see [[AssumePure]]): the
-        // application rechecks normally, then the result's capture
-        // set is stripped.
         val res = super.recheckApply(tree, pt)
         val purified = if res.captureSet.isAlwaysEmpty then res else res.widen.stripCapturing
         includeCallCaptures(meth, purified, tree)

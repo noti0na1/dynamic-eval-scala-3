@@ -17,7 +17,7 @@ import dotty.tools.dotc.reporting.{Diagnostic, StoreReporter}
  *  calls inside execute through [[StandaloneAdapter]] (no driver
  *  installs an [[Eval.Adapter]] in this path).
  *
- *  Mirrors the behaviour axes of [[DynamicEvalTests]] on the
+ *  Mirrors the behavior axes of [[DynamicEvalTests]] on the
  *  standalone envelope:
  *    - basic bodies and expected types
  *    - captures: locals, lambda params, method params, vars, givens
@@ -152,7 +152,7 @@ class StandaloneEvalTests:
   // Live module state (standalone analogue of REPL session imports)
   // ===========================================================================
 
-  @Test def readsSiblingModuleMember(): Unit =
+  @Test def readsModuleMember(): Unit =
     val r = compileAndRun(
       """import dotty.tools.eval.Eval.eval
         |object Main:
@@ -175,7 +175,7 @@ class StandaloneEvalTests:
         |""".stripMargin)
     assertEquals(7, r)
 
-  @Test def callsSiblingModuleMethodByRuntimeName(): Unit =
+  @Test def callsModuleMethodByRuntimeName(): Unit =
     val r = compileAndRun(
       """import dotty.tools.eval.Eval.eval
         |import scala.util.Random
@@ -327,8 +327,7 @@ class StandaloneEvalTests:
     // The rewriter wrapped the call in a `try/catch` keyed on the
     // per-execution `__evalReturnKey__` binding; the body's return
     // lowers to an `EvalNonLocalReturn` throw that the call-site catch
-    // turns back into an ordinary `return`. (Previously rejected with
-    // a deliberate diagnostic.)
+    // turns back into an ordinary `return`.
     val r = compileAndRun(
       """import dotty.tools.eval.Eval.eval
         |object Main:
@@ -369,16 +368,9 @@ class StandaloneEvalTests:
     assertEquals(11, r)
 
   // ===========================================================================
-  // Nested (non-top-level) objects: the eval call sits *inside* a
-  // method of an object that is itself a member of the top-level
-  // object. The wrapper compile used to re-elaborate the whole nested
-  // object, so body reads/writes landed on a fresh module and a
-  // nested case class minted a second JVM class. SpliceEvalBody's
-  // module lift now drops the declaration and hoists the
-  // marker-bearing def next to an `import <Obj>.{given, *}`, so the
-  // body links against the *live* module on the classpath; private
-  // members reroute through the reflective helpers with the object
-  // itself as receiver.
+  // Nested (non-top-level) objects are lifted so the body resolves against
+  // the live module. This preserves module state and class identity; private
+  // members are reached reflectively on the same instance.
   // ===========================================================================
 
   @Test def nestedObjectLiveState(): Unit =
@@ -395,8 +387,7 @@ class StandaloneEvalTests:
         |""".stripMargin)
     assertEquals(11, r)
 
-  @Test def nestedObjectSiblingObjectState(): Unit =
-    // The body touches a *sibling* nested object of the lifted one;
+  @Test def nestedObjectPeerState(): Unit =
     // `Counter` resolves through the injected `import Outer.{given, *}`
     // to the live `Main.Outer.Counter`.
     val r = compileAndRun(
@@ -434,9 +425,7 @@ class StandaloneEvalTests:
   @Test def caseClassInNestedObject(): Unit =
     // The body constructs an instance of a case class declared next
     // to the lifted def. `Pt` resolves to the live classpath class,
-    // so the instance pattern-matches outside against `Main.Outer.Pt`
-    // (previously: the wrapper minted a second `Pt` and the call
-    // failed to compile at the expected-type boundary).
+    // so the instance pattern-matches outside against `Main.Outer.Pt`.
     val r = compileAndRun(
       """import dotty.tools.eval.Eval.eval
         |object Main:
@@ -450,8 +439,8 @@ class StandaloneEvalTests:
     assertEquals(7, r)
 
   @Test def caseClassInNestedObjectPatternInBody(): Unit =
-    // Opposite direction: the instance is built outside, captured as
-    // a method param, and destructured *inside* the body through the
+    // The instance is built outside, captured as a method parameter,
+    // and destructured inside the body through the
     // live companion's unapply.
     val r = compileAndRun(
       """import dotty.tools.eval.Eval.eval
@@ -541,8 +530,7 @@ class StandaloneEvalTests:
     // inside a nested object. The class lift composes with the module
     // lift: the lifted def's `__this__` parameter is typed
     // `Outer.W` (a static path through the dropped object's import),
-    // and the body reaches the object's members through the sibling
-    // import.
+    // and the body reaches the object's members through that import.
     val r = compileAndRun(
       """import dotty.tools.eval.Eval.eval
         |object Main:
@@ -587,7 +575,7 @@ class StandaloneEvalTests:
     assertEquals(33, r)
 
   @Test def bodyDefinesCaseClass(): Unit =
-    // The case class (and its synthesised companion) is declared
+    // The case class (and its synthesized companion) is declared
     // inside the body string itself; its `this` references are
     // ordinary same-class reads, and the whole bundle moves into
     // `evaluate` with the body.

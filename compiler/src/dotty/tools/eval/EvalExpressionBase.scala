@@ -1,33 +1,17 @@
 package dotty.tools
 package eval
 
-// `experimental.captureChecking` is required for `@caps.assumeSafe`
-// to be admitted on this class. When safe-mode user sessions extend
-// this base, they don't re-check it — they reference the
-// pre-compiled, `@assumeSafe`-tagged form and inherit its members
-// without `@rejectSafe` propagation.
+// Required for the `@caps.assumeSafe` annotation below.
 import scala.language.experimental.captureChecking
 
-/** Pre-compiled base class for the synthesised `__EvalExpression_…`
- *  classes.
+/** Precompiled base for generated eval expression classes.
  *
- *  The eval driver compiles a synthesised `__EvalExpression_<uuid>`
- *  for each call site. That class's `evaluate()` method is filled
- *  in by `ExtractEvalBody` with the user's body, and references
- *  outside the body get rewritten to calls against the helpers
- *  defined here (`getValue`, `getField`, `setField`, `callMethod`,
- *  `getOuter`, `reflectEval`).
+ *  [[ExtractEvalBody]] fills `evaluate` and replaces outer references with calls
+ *  to the helpers defined here.
  *
- *  Why a pre-compiled base instead of inlining the helpers in the
- *  synthesised source: the helpers call into JVM reflection
- *  (`Class.getDeclaredFields`, `Method.invoke`, `getClassLoader`),
- *  which is `@rejectSafe` under safe mode. If the helpers were
- *  inlined into the synthesised class, a safe-mode REPL session
- *  would compile the helpers under safe mode and fail to compile
- *  even a trivial body. Having the helpers live on a `@assumeSafe`
- *  base, compiled at dotty-build time outside safe mode, lets a
- *  safe-mode synthesised subclass extend it and inherit the
- *  helpers without retripping the checks.
+ *  Reflection is rejected by safe mode, so these helpers cannot be emitted into
+ *  each generated source. The precompiled `@caps.assumeSafe` base exposes them
+ *  to subclasses while the submitted body is still checked under safe mode.
  */
 @caps.assumeSafe
 abstract class EvalExpressionBase(
@@ -37,22 +21,12 @@ abstract class EvalExpressionBase(
 
   protected final val classLoader: ClassLoader = getClass.getClassLoader
 
-  /** The synthesised `__EvalExpression_<uuid>` subclass implements
-   *  this with the user's body — left abstract here so that a
-   *  subclass missing `evaluate()` is a compile error rather than
-   *  silently inheriting a no-op.
-   *
-   *  Public because the runtime invokes it reflectively from
-   *  `EvalAdapter.invokeCached` — `protected` would force a
-   *  `setAccessible(true)` call there with no benefit.
+  /** Implemented by each generated subclass. It is public because the adapter
+   *  invokes it reflectively without changing accessibility.
    */
   def evaluate(): Any
 
-  /** All helpers below are `protected final`: they're only ever
-   *  called from inside the synthesised `evaluate()` body (or from
-   *  one another), and a subclass overriding any of them would
-   *  silently break the lowered eval contract.
-   */
+  /** Returns the enclosing instance captured at the call site. */
   protected final def getThisObject(): Object | Null = thisObject
 
   private final def __findBinding__(name: String): Eval.Binding =
@@ -62,39 +36,25 @@ abstract class EvalExpressionBase(
       i = i + 1
     throw new java.util.NoSuchElementException(name)
 
-  /** Force an `Eval.LazyBindingValue` wrapper to its value; anything
-   *  else passes through untouched. The rewriter wraps values whose
-   *  read must not happen while the bindings array is built (local
-   *  modules, captured `lazy val`s); the supplier runs at most once,
-   *  on the first read through here.
+  /** Forces lazily captured modules and `lazy val`s on their first read.
    */
   private final def __unwrapLazy__(v: Any): Any = v match
     case lzy: Eval.LazyBindingValue => lzy.value
     case _ => v
 
-  /** Look up a binding by name, unwrapping the `Eval.VarRef` facade of
-   *  a var binding so the body sees a `T` rather than the live facade.
-   *  The unwrap is keyed on `Binding.isVar`, not on the value's runtime
-   *  type: a *val* whose value happens to be a user-held `VarRef` must
-   *  come through untouched. Var-assignment codegen uses `getRaw` to
-   *  preserve the facade.
+  /** Reads a binding, dereferencing [[Eval.VarRef]] only for bindings marked as
+   *  mutable. An immutable value that happens to be a `VarRef` is returned as is.
    */
   protected final def getValue(name: String): Any =
     val b = __findBinding__(name)
     if b.isVar then b.value.asInstanceOf[Eval.VarRef[Any]].get()
     else __unwrapLazy__(b.value)
 
-  /** Return the binding's stored value with no `VarRef` unwrap
-   *  (lazy wrappers are still forced; they are an encoding detail of
-   *  the bindings array, never a value the body should see).
-   */
+  /** Reads a binding without dereferencing `VarRef`; lazy wrappers are forced. */
   protected final def getRaw(name: String): Any =
     __unwrapLazy__(__findBinding__(name).value)
 
-  /** Walk the `$outer` chain on `obj`. Used to lower the `Outer`
-   *  strategy so a body inside a nested class can reach an
-   *  outer-class instance.
-   */
+  /** Finds an enclosing instance by walking `$outer` fields. */
   protected final def getOuter(obj: Object | Null, outerTypeName: String): Object | Null =
     if obj == null then return null
     var clazz: Class[?] | Null = obj.getClass
@@ -110,12 +70,8 @@ abstract class EvalExpressionBase(
       clazz = clazz.getSuperclass
     throw new NoSuchFieldException("$outer (" + outerTypeName + ") on " + obj.getClass.getName)
 
-  /** Match a field whose name is either the literal `name` or any
-   *  Scala 3-mangled `<owner-chain>$<name>` form. An exact match wins
-   *  over a mangled one, so a subclass field `x` is not shadowed by an
-   *  unrelated `Trait$$x` that happens to come first in declaration
-   *  order. Returns null on miss so the caller can decide whether to
-   *  fall back to a getter / superclass walk.
+  /** Finds an exact or Scala-mangled field name. Exact names take precedence
+   *  over suffix matches, independent of reflection declaration order.
    */
   private final def __findField__(c: Class[?], name: String): java.lang.reflect.Field | Null =
     val fs = c.getDeclaredFields
@@ -130,14 +86,9 @@ abstract class EvalExpressionBase(
       i = i + 1
     mangled
 
-  /** Reflective field read on an instance of `className`. Walks
-   *  superclasses; falls back to a 0-arg getter method when no
-   *  direct field matches. `obj` may be null for static fields.
-   *
-   *  An empty `className` signals "use obj.getClass" — used for
-   *  members of a term-owned class, where the wrapper's symbol and
-   *  the runtime instance live in different JVM classes with the
-   *  same shape.
+  /** Reads a field, walking superclasses and then trying a parameterless getter.
+   *  An empty `className` selects the receiver's runtime class, which is needed
+   *  when a local class was re-elaborated in the wrapper.
    */
   protected final def getField(obj: Object | Null, className: String, fieldName: String): Any =
     var clazz: Class[?] | Null =
@@ -164,9 +115,8 @@ abstract class EvalExpressionBase(
       clazz = clazz.getSuperclass
     throw new NoSuchFieldException(fieldName)
 
-  /** Reflective field write. Walks superclasses; falls back to a
-   *  setter (`<name>_$eq`) when no direct field matches. An empty
-   *  `className` means "use obj.getClass" (see `getField`).
+  /** Writes a field, walking superclasses and then trying `<name>_$eq`. An empty
+   *  `className` selects the receiver's runtime class.
    */
   protected final def setField(obj: Object | Null, className: String, fieldName: String, value: Object | Null): Unit =
     var clazz: Class[?] | Null =
@@ -195,15 +145,10 @@ abstract class EvalExpressionBase(
       clazz = clazz.getSuperclass
     throw new NoSuchFieldException(fieldName)
 
-  /** Reflective method call matching by name + parameter type names
-   *  + return type name. `obj` may be null for static (module / Java)
-   *  methods. An empty `className` means "use obj.getClass" (see
-   *  `getField`); in that mode the return-type filter is skipped
-   *  too — the wrapper's symbol-derived return type won't match the
-   *  runtime instance's signature for a term-owned class. A `"*"` in
-   *  a parameter position (or as the return type) is a wildcard: the
-   *  wrapper-side encoding uses it for types naming a *linked* local
-   *  class, whose runtime JVM name differs from the wrapper symbol's.
+  /** Invokes a method selected by name, parameter types, and return type. An
+   *  empty `className` selects the receiver's runtime class and skips return-type
+   *  matching. `"*"` is a wildcard for linked local types whose wrapper and
+   *  runtime names differ.
    */
   protected final def callMethod(
       obj: Object | Null,
@@ -248,16 +193,8 @@ abstract class EvalExpressionBase(
         case e: java.lang.reflect.InvocationTargetException => throw e.getCause
     if returnTypeName == "void" then (() : Any) else res
 
-  /** Runtime `Class` of a *linked* local class: a class declared in
-   *  a method enclosing the eval call, whose `classOf` the rewriter
-   *  captured as the `__evalClass_<name>__` synthetic binding. The
-   *  wrapper compile re-elaborates the class declaration so the body
-   *  typechecks, but every runtime artifact must refer to the
-   *  *original* lifted class; this accessor is how the lowered code
-   *  reaches it. Protected (not private) because
-   *  [[ResolveEvalAccess]] also lowers `classOf[C]` constants of
-   *  linked classes to direct calls of this accessor from the
-   *  synthesised subclass.
+  /** Returns the original runtime class for a local class re-elaborated by the
+   *  wrapper. [[ResolveEvalAccess]] also uses this for `classOf[C]`.
    */
   protected final def linkedClass(sourceName: String): Class[?] =
     getRaw(EvalNames.classBinding(sourceName)) match
@@ -265,17 +202,12 @@ abstract class EvalExpressionBase(
       case other => throw new IllegalStateException(
         s"linked-class binding for `$sourceName` is not a Class: $other")
 
-  /** `x.isInstanceOf[C]` against the original runtime class of the
-   *  linked local class `C`. [[ResolveEvalAccess]] lowers type tests
-   *  whose target is a re-elaborated local class to this call.
-   */
+  /** Tests against the original runtime class of a linked local class. */
   protected final def isLinkedInstance(obj: Object | Null, sourceName: String): Boolean =
     obj != null && linkedClass(sourceName).isInstance(obj)
 
-  /** `x.asInstanceOf[C]` against the original runtime class of the
-   *  linked local class `C`. Throws `ClassCastException` on
-   *  mismatch, like the checkcast it replaces; `null` passes through
-   *  (matching JVM checkcast semantics).
+  /** Casts against the original runtime class. `null` passes through, matching
+   *  JVM `checkcast` semantics.
    */
   protected final def castLinked(obj: Object | Null, sourceName: String): Object | Null =
     if obj == null then null
@@ -286,11 +218,7 @@ abstract class EvalExpressionBase(
         s"${obj.getClass.getName} cannot be cast to linked local class " +
           s"$sourceName (${cls.getName})")
 
-  /** Runtime `Class` of the `dims`-dimensional array of the linked
-   *  local class `C` (`dims = 1` → `C[]`). Built by stacking
-   *  zero-length array creations; also replaces `classOf[Array[C']]`
-   *  constants (a multi-dimensional array literal's `ClassTag`), so
-   *  protected like [[linkedClass]].
+  /** Returns the `dims`-dimensional array class for a linked local class.
    */
   protected final def linkedArrayClass(sourceName: String, dims: Int): Class[?] =
     var cls = linkedClass(sourceName)
@@ -300,48 +228,34 @@ abstract class EvalExpressionBase(
       i += 1
     cls
 
-  /** `new Array[…[C]…](length)` where `C` is a linked local class
-   *  and the created array has `dims` dimensions (`dims = 1` →
-   *  `C[]`, `dims = 2` → `C[][]` with null rows, matching source
-   *  semantics): the runtime component class must name the
-   *  *original* lifted class, which only reflection can do.
+  /** Allocates an array whose ultimate component is the original linked class.
+   *  Only the outer dimension is initialized, matching `new Array` semantics.
    */
   protected final def newLinkedArray(sourceName: String, dims: Int, length: Int): Object =
     java.lang.reflect.Array.newInstance(linkedArrayClass(sourceName, dims - 1), length)
 
-  /** The `ArrayConstructors` intrinsic shape (`Array.ofDim`, generic
-   *  array news minted after extract): allocate a (possibly
-   *  rectangular multi-dimensional) array whose ultimate element
-   *  class is the original lifted class, `elemDims` array layers
-   *  deep below the allocated `dims.length` dimensions.
+  /** Implements `Array.ofDim` and post-extraction generic allocation for linked
+   *  elements. `elemDims` counts array layers already present in the element.
    */
   protected final def newLinkedArrayDims(sourceName: String, elemDims: Int, dims: Array[Int]): Object =
     java.lang.reflect.Array.newInstance(linkedArrayClass(sourceName, elemDims), dims*)
 
-  /** `Array(e1, …, en)` of a linked local class (or of arrays of
-   *  one, for the outer layers of a multi-dimensional literal):
-   *  re-house the elements (delivered as an `Object[]`) in an array
-   *  whose runtime component class is the original lifted class
-   *  (`dims - 1` array dimensions deep). `arraycopy` runs the
-   *  per-element store checks, so a wrong element class surfaces as
-   *  the same `ArrayStoreException` a direct `aastore` would raise.
+  /** Copies literal elements into an array whose runtime component is the
+   *  original linked class. `arraycopy` preserves normal array store checks.
    */
   protected final def arrayOfLinked(sourceName: String, dims: Int, elems: Array[Object | Null]): Object =
     val out = java.lang.reflect.Array.newInstance(linkedArrayClass(sourceName, dims - 1), elems.length)
     java.lang.System.arraycopy(elems, 0, out, 0, elems.length)
     out
 
-  /** `x.isInstanceOf[Array[…[C]…]]` (`dims` dimensions) against the
-   *  original runtime class of the linked local class `C`.
-   *  `Class.isInstance` applies JVM array covariance at every depth
-   *  (`D[][] instanceof C[][]` iff `D <: C`).
+  /** Tests an array against the original linked component class. JVM array
+   *  covariance applies at every dimension.
    */
   protected final def isLinkedArrayInstance(obj: Object | Null, sourceName: String, dims: Int): Boolean =
     obj != null && linkedArrayClass(sourceName, dims).isInstance(obj)
 
-  /** `x.asInstanceOf[Array[…[C]…]]` (`dims` dimensions) against the
-   *  original runtime class of the linked local class `C`; `null`
-   *  passes through like the checkcast it replaces.
+  /** Casts an array against the original linked component class. `null` passes
+   *  through as it does for `checkcast`.
    */
   protected final def castLinkedArray(obj: Object | Null, sourceName: String, dims: Int): Object | Null =
     if obj == null then null
@@ -350,27 +264,16 @@ abstract class EvalExpressionBase(
       s"${obj.getClass.getName} cannot be cast to " +
         s"${linkedArrayClass(sourceName, dims).getName} of linked local class $sourceName")
 
-  /** Placeholder consumed by `ResolveEvalAccess`, which rewrites
-   *  every `reflectEval(...)` Apply in `evaluate`'s body into the
-   *  matching concrete accessor (`getValue`, `getField`,
-   *  `callMethod`, …). `final` so a synthesised subclass can't
-   *  shadow it: any remaining call site (post-extract, post-resolve)
-   *  hitting this body means the lowering pipeline broke and the
-   *  exception surfaces the bug.
+  /** Placeholder replaced by [[ResolveEvalAccess]]. Reaching it at runtime means
+   *  lowering failed; `final` prevents a generated subclass from hiding that.
    */
   protected final def reflectEval(qualifier: Object | Null, strategyDesc: String, args: Array[Object | Null]): Any =
     throw new UnsupportedOperationException("reflectEval placeholder was not lowered")
 
-  /** Bare-name aliases used by the body's private-member rewrite in
-   *  `SpliceEvalBody.rewritePrivateAccessInBody`. The body emits
-   *  `__refl_get__/_set__/_call__(qual, name, …)` references that the
-   *  typer initially resolves against wrapper-local stubs; after
-   *  `ExtractEvalBody` retargets the symbols, they resolve here via
-   *  inheritance. `get`/`set` delegate to the corresponding accessors
-   *  with an empty `className` (which falls back to `obj.getClass`).
-   *  `__refl_call__` matches by name + arity (the body-rewrite path
-   *  doesn't carry param-type names), so it can't reuse `callMethod`'s
-   *  signature-based lookup directly.
+  /** Helpers targeted by the private-member rewrite in [[SpliceEvalBody]]. The
+   *  get and set forms use the receiver's runtime class. The call form selects
+   *  by name, arity, and runtime argument compatibility because the parser-stage
+   *  rewrite has no static parameter-type names.
    */
   protected final def __refl_get__(obj: Object, name: String): Any =
     getField(obj, "", name)
@@ -381,18 +284,83 @@ abstract class EvalExpressionBase(
   protected final def __refl_call__(obj: Object, name: String, args: Array[Object]): Any =
     val arity = args.length
     var clazz: Class[?] | Null = obj.getClass
+    val compatible = Array.newBuilder[java.lang.reflect.Method]
     while clazz != null do
       val ms = clazz.getDeclaredMethods
       var i = 0
       while i < ms.length do
         val m = ms(i)
-        if m.getName == name && m.getParameterCount == arity then
-          m.setAccessible(true)
-          try return m.invoke(obj, args*)
-          catch
-            case e: java.lang.reflect.InvocationTargetException => throw e.getCause
+        if m.getName == name && m.getParameterCount == arity
+            && __runtimeArgsCompatible__(m.getParameterTypes, args) then
+          compatible += m
         i = i + 1
       clazz = clazz.getSuperclass
-    throw new NoSuchMethodException(name)
+    val candidates = compatible.result()
+    if candidates.length == 1 then
+      val method = candidates(0)
+      method.setAccessible(true)
+      try method.invoke(obj, args*)
+      catch
+        case e: java.lang.reflect.InvocationTargetException => throw e.getCause
+    else if candidates.length > 1 then
+      val signatures = candidates.map(__methodSignature__).sorted.mkString(", ")
+      throw new IllegalArgumentException(
+        s"ambiguous reflective call `$name` for runtime arguments " +
+          s"${__runtimeArgTypes__(args)}; compatible declarations: $signatures")
+    else throw new NoSuchMethodException(name)
+
+  /** Whether reflection can pass the boxed runtime arguments to these parameter
+   *  types. Primitive parameters require explicit unboxing compatibility.
+   */
+  private final def __runtimeArgsCompatible__(
+      parameterTypes: Array[Class[?]],
+      args: Array[Object]
+  ): Boolean =
+    var i = 0
+    var compatible = true
+    while compatible && i < parameterTypes.length do
+      val parameterType = parameterTypes(i)
+      val arg = args(i)
+      compatible =
+        if arg == null then !parameterType.isPrimitive
+        else if parameterType.isPrimitive then
+          __primitiveArgCompatible__(parameterType, arg.getClass)
+        else parameterType.isInstance(arg)
+      i += 1
+    compatible
+
+  /** Whether reflection can unbox and widen `argumentClass` to the primitive
+   *  parameter type, for example `Integer` to `long`.
+   */
+  private final def __primitiveArgCompatible__(
+      parameterType: Class[?],
+      argumentClass: Class[?]
+  ): Boolean =
+    val isByte = argumentClass == classOf[java.lang.Byte]
+    val isShort = argumentClass == classOf[java.lang.Short]
+    val isChar = argumentClass == classOf[java.lang.Character]
+    val isInt = argumentClass == classOf[java.lang.Integer]
+    val isLong = argumentClass == classOf[java.lang.Long]
+    val isFloat = argumentClass == classOf[java.lang.Float]
+    val isDouble = argumentClass == classOf[java.lang.Double]
+    if parameterType == java.lang.Boolean.TYPE then
+      argumentClass == classOf[java.lang.Boolean]
+    else if parameterType == java.lang.Byte.TYPE then isByte
+    else if parameterType == java.lang.Short.TYPE then isByte || isShort
+    else if parameterType == java.lang.Character.TYPE then isChar
+    else if parameterType == java.lang.Integer.TYPE then isByte || isShort || isChar || isInt
+    else if parameterType == java.lang.Long.TYPE then isByte || isShort || isChar || isInt || isLong
+    else if parameterType == java.lang.Float.TYPE then
+      isByte || isShort || isChar || isInt || isLong || isFloat
+    else if parameterType == java.lang.Double.TYPE then
+      isByte || isShort || isChar || isInt || isLong || isFloat || isDouble
+    else false // `void` cannot occur in a method parameter list.
+
+  private final def __methodSignature__(method: java.lang.reflect.Method): String =
+    method.getDeclaringClass.getName + "." + method.getName +
+      method.getParameterTypes.map(_.getTypeName).mkString("(", ", ", ")")
+
+  private final def __runtimeArgTypes__(args: Array[Object]): String =
+    args.map(arg => if arg == null then "null" else arg.getClass.getTypeName).mkString("(", ", ", ")")
 
 end EvalExpressionBase

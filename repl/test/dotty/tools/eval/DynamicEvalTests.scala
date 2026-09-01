@@ -9,77 +9,47 @@ import dotty.tools.repl.ReplTest
 private object DynamicEvalAssertions:
   def assertContains(needle: String, haystack: String): Unit =
     assertTrue(s"expected to contain `$needle`, got:\n$haystack", haystack.contains(needle))
+
 import DynamicEvalAssertions.*
 
-/** Tests for dynamic `eval[T](code: String): T`.
- *
- *  Behaviour summary:
- *    1. At runtime, `eval` calls back into the REPL driver, which spins up a
- *       separate dotc Driver to compile and run `code` against the live REPL
- *       session's classpath.
- *    2. The argument can be any `String`: literal, `val`, `s"..."`, etc.
- *    3. The REPL compiler's `EvalRewriteTyped` phase injects
- *       `Eval.bind("z", z)` for every lambda parameter (and block-local
- *       `val`) in scope at the call site, so
- *       `xs.map(z => eval[Int]("z + 1"))` Just Works.
- *    4. REPL session state (vals, vars, defs, classes, givens) is imported
- *       into the body's scope.
- *    5. Return type is the polymorphic `T`; the user ascribes the expected
- *       type and a runtime cast bridges to it. A mismatch surfaces as
- *       `ClassCastException`.
- *
- *  Sections roughly track one axis at a time. Tests for documented
- *  shortcomings sit in the final "Known limitations" section.
+/** End-to-end tests for dynamic `eval` in a live REPL session. They cover
+ *  runtime-computed source, lexical captures, session definitions, expected
+ *  result types, nested eval calls, and the documented unsupported shapes.
  */
 class DynamicEvalTests extends ReplTest:
 
   // ===========================================================================
-  // 1. Basics: primitive return types via the polymorphic T parameter.
+  // 1. Basic return values across primitive and reference types.
   // ===========================================================================
 
-  @Test def returnsInt = initially {
-    run("""val r: Int = eval("1 + 2")""")
-    assertContains("val r: Int = 3", storedOutput())
+  @Test def returnsPrimitiveValues = initially {
+    run(
+      """|val intResult: Int = eval("1 + 2")
+         |val longResult: Long = eval("1000000000000L")
+         |val doubleResult: Double = eval("math.sqrt(16.0)")
+         |val booleanResult: Boolean = eval("1 < 2 && 3 != 4")
+         |val charResult: Char = eval("'a'.toUpper")
+         |""".stripMargin)
+    val out = storedOutput()
+    assertContains("val intResult: Int = 3", out)
+    assertContains("val longResult: Long = 1000000000000L", out)
+    assertContains("val doubleResult: Double = 4.0", out)
+    assertContains("val booleanResult: Boolean = true", out)
+    assertContains("val charResult: Char = 'A'", out)
   }
 
-  @Test def returnsLong = initially {
-    run("""val r: Long = eval("1000000000000L")""")
-    assertContains("val r: Long = 1000000000000L", storedOutput())
-  }
-
-  @Test def returnsDouble = initially {
-    run("""val r: Double = eval("math.sqrt(16.0)")""")
-    assertContains("val r: Double = 4.0", storedOutput())
-  }
-
-  @Test def returnsBoolean = initially {
-    run("""val r: Boolean = eval("1 < 2 && 3 != 4")""")
-    assertContains("val r: Boolean = true", storedOutput())
-  }
-
-  @Test def returnsChar = initially {
-    run("""val r: Char = eval("'a'.toUpper")""")
-    assertContains("val r: Char = 'A'", storedOutput())
-  }
-
-  @Test def returnsString = initially {
-    run("""val r: String = eval("\"hello\".reverse")""")
-    assertContains("""val r: String = "olleh"""", storedOutput())
-  }
-
-  @Test def returnsTuple = initially {
-    run("""val r: (Int, String) = eval("(42, \"answer\")")""")
-    assertContains("""val r: (Int, String) = (42, "answer")""", storedOutput())
-  }
-
-  @Test def returnsOption = initially {
-    run("""val r: Option[Int] = eval("Some(7)")""")
-    assertContains("val r: Option[Int] = Some(7)", storedOutput())
-  }
-
-  @Test def returnsList = initially {
-    run("""val r: List[Int] = eval("List(1, 2, 3)")""")
-    assertContains("val r: List[Int] = List(1, 2, 3)", storedOutput())
+  @Test def returnsReferenceValues = initially {
+    run(
+      """|val stringResult: String = eval("\"hello\".reverse")
+         |val tupleResult: (Int, String) = eval("(42, \"answer\")")
+         |val optionResult: Option[Int] = eval("Some(7)")
+         |val listResult: List[Int] = eval("List(1, 2, 3)")
+         |""".stripMargin)
+    val out = storedOutput()
+    assertContains("""val stringResult: String = "olleh"""", out)
+    assertContains("""val tupleResult: (Int, String) = (42, "answer")""", out)
+    assertContains("val optionResult: Option[Int] = Some(7)", out)
+    assertContains("val listResult: List[Int] = List(1, 2, 3)", out)
   }
 
   // ===========================================================================
@@ -123,30 +93,18 @@ class DynamicEvalTests extends ReplTest:
   // 3. Polymorphic return type T: eval composes at any expression position.
   // ===========================================================================
 
-  @Test def ascribesAtAssignmentPosition = initially {
-    run("""val r: Int = eval("21 * 2")""")
-    assertContains("val r: Int = 42", storedOutput())
-  }
-
   @Test def ascribesInsideExpression = initially {
     run("""val r: Int = eval[Int]("4") + eval[Int]("5")""")
     assertContains("val r: Int = 9", storedOutput())
   }
 
-  @Test def wrongAscriptionFailsAtRuntime = initially {
-    // V2 propagates the val ascription's `Int` through to the spliced
-    // body via the `__evalResult: Int = ...` annotation, so the
-    // mismatch is caught at compile time as a `Found: String /
-    // Required: Int` error rather than a runtime `ClassCastException`.
-    // Earlier-is-better: the user sees the type problem before the
-    // eval call runs at all. Either signal counts as the body
-    // failing the ascription.
+  @Test def inferredTypeFromAscriptionRejectsMismatch = initially {
+    // The val ascription supplies the body's expected type even though
+    // `eval` has no explicit type argument.
     run("""val r: Int = eval("\"not an int\"")""")
     val out = storedOutput()
-    assertTrue(s"expected an ascription failure, got:\n$out",
-      out.contains("ClassCastException") ||
-        out.contains("failed to compile") ||
-        out.contains("Required: Int"))
+    assertContains("eval failed to compile", out)
+    assertContains("Required: Int", out)
   }
 
   @Test def explicitTypeArgFailsAtCompile = initially {
@@ -157,13 +115,6 @@ class DynamicEvalTests extends ReplTest:
     val out = storedOutput()
     assertContains("eval failed to compile", out)
     assertContains("Boolean", out)
-    assertContains("Required: Int", out)
-  }
-
-  @Test def explicitTypeArgStringNotInt = initially {
-    run("""val r: Int = eval[Int]("\"hi\"")""")
-    val out = storedOutput()
-    assertContains("eval failed to compile", out)
     assertContains("Required: Int", out)
   }
 
@@ -191,18 +142,18 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def sideEffectsRunInOrder = initially {
-    run("""eval("println(\"a\"); println(\"b\"); println(\"c\")")""")
+    run("""eval("println(\"eval-order-a\"); println(\"eval-order-b\"); println(\"eval-order-c\")")""")
     val out = storedOutput()
-    val ai = out.indexOf("a")
-    val bi = out.indexOf("b")
-    val ci = out.indexOf("c")
-    assertTrue("a before b", ai >= 0 && ai < bi)
-    assertTrue("b before c", bi >= 0 && bi < ci)
+    val first = out.indexOf("eval-order-a")
+    val second = out.indexOf("eval-order-b")
+    val third = out.indexOf("eval-order-c")
+    assertTrue("first marker before second", first >= 0 && first < second)
+    assertTrue("second marker before third", second >= 0 && second < third)
   }
 
   // ===========================================================================
-  // 5. Lambda parameter capture (headline feature). The EvalRewriteTyped
-  //    rewriter injects bindings for every lambda param in scope.
+  // 5. Lambda parameter capture. EvalRewriteTyped injects bindings for
+  //    every lambda parameter in scope.
   // ===========================================================================
 
   @Test def lambdaParamCapturedInLiteralBody = initially {
@@ -262,10 +213,8 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def innerVarShadowsOuterVal = initially {
-    // The inner block-local `var x` shadows the outer `val x`. The
-    // rewriter must trigger the var-cell sync-back path for the
-    // inner (and *only* the inner) even though an outer immutable
-    // `x` is also in scope.
+    // The inner block-local `var x` shadows the outer `val x`; only the inner
+    // binding receives live VarRef access.
     run(
       """|def f(): Int =
          |  val x: Int = 7  // outer val, immutable; would normally bind by-value
@@ -280,9 +229,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def innerValShadowsOuterVar = initially {
-    // Outer `var x` shadowed by inner `val x`. The inner is what the
-    // body sees, and since the inner is a val no var-cell sync-back
-    // machinery fires.
+    // The inner immutable binding shadows the outer `var`.
     run(
       """|def f(): Int =
          |  var x: Int = 100  // outer mutable
@@ -309,11 +256,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def lambdaCapturingComplexType = initially {
-    // The post-typer `EvalRewriteTyped` phase records `xs2`'s typer-side
-    // type, so the synthesised wrapper parameter is `xs2: List[Int]`
-    // (with the Int element preserved). If that phase is disabled the
-    // runtime would walk the cons cell up the superclass chain and
-    // synthesise the weaker `xs2: List[?]` instead.
+    // The captured static type preserves the `Int` element of `List[Int]`.
     run("""|val xs = List(List(0, 1), List(1, 2))
            |val r: List[Int] = xs.flatMap(xs2 => xs2.map(x => eval[Int]("x + xs2.length")))""".stripMargin)
     assertContains("List(2, 3, 3, 4)", storedOutput())
@@ -524,10 +467,8 @@ class DynamicEvalTests extends ReplTest:
   }
 
   // ===========================================================================
-  // 9. Block-local def capture. The rewriter eta-expands a captured def into
-  //    a `FunctionN` lambda at the bind site; the typer infers the function
-  //    type, the type-annotation phase records it, and the eval body sees the
-  //    def as a precisely-typed function value.
+  // 9. Block-local def capture. The runtime binding uses eta expansion while
+  //    the recorded method signature preserves precise typing in the body.
   // ===========================================================================
 
   @Test def blockLocalDefCapturedUnary = initially {
@@ -671,19 +612,15 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def byNameParamDefCaptured = initially {
-    // `def g(x: => Int)` — by-name param. The lambda's expected type
-    // for the param is `=> Any` after the substitution, so the
-    // captured value is wrapped in a thunk consistent with g's
-    // signature.
-    run("""|def f(): Int =
+    // The argument to a captured by-name def remains lazy and is evaluated
+    // independently on each use.
+    run("""|def f(): (Int, Int) =
+           |  var forces = 0
            |  def g(x: => Int): Int = x + x
-           |  eval[Int]("g(7)")
-           |val r: Int = f()""".stripMargin)
-    val out = storedOutput()
-    assertTrue(s"expected r = 14 or capture failure, got:\n$out",
-      out.contains("val r: Int = 14") ||
-        out.contains("NoSuchElementException") ||
-        out.contains("failed to compile"))
+           |  val sum = eval[Int]("g({ forces += 1; forces })")
+           |  (sum, forces)
+           |val r = f()""".stripMargin)
+    assertContains("val r: (Int, Int) = (3, 2)", storedOutput())
   }
 
   @Test def varargsDefCaptured = initially {
@@ -787,34 +724,13 @@ class DynamicEvalTests extends ReplTest:
     assertContains("""val r: String = "7!"""", storedOutput())
   }
 
-  @Test def genericLocalGivenSilentlySkipped = initially {
-    // Generic local givens have an empty source-level name and are
-    // not yet captured. V1 silently fell back to a non-local
-    // Ordering and produced *some* sorted output. V2 surfaces the
-    // missing capture explicitly: the typer resolves `summon` against
-    // the local generic given, but the rewriter never bound it under
-    // a name, so the runtime `getValue` lookup fails with
-    // `NoSuchElementException`. Either signal is acceptable; the
-    // headline behaviour is "the local generic given doesn't take
-    // effect", which is true in both cases.
-    run("""|def f(): String =
-           |  given [T] => Ordering[List[T]] = (a, b) => a.length - b.length
-           |  eval[String]("List(List(1,2), List(3), List(4,5,6)).sorted.toString")
-           |val r: String = f()""".stripMargin)
-    val out = storedOutput()
-    assertTrue(s"expected either a result or a missing-given failure, got:\n$out",
-      out.contains("val r: String =") ||
-        out.contains("NoSuchElementException") ||
-        out.contains("failed to compile"))
-  }
-
   @Test def usingParamFromContextFunctionCaptured = initially {
     // The eval call sits inside a context-function lambda whose using
     // parameter (`contextual$1: Cap`) is what the body's implicit
     // lookup resolves against. Those params used to be filtered out
     // of the binding capture, so `getValue("contextual$1")` threw
     // `NoSuchElementException` at runtime. Captured now under the
-    // synthesised parameter name.
+    // synthesized parameter name.
     run("""|trait Cap
            |def use[T](body: Cap ?=> T): T = body(using new Cap {})
            |def needsCap(using Cap): String = "ok"
@@ -823,9 +739,8 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def usingParamReachableByImplicitSearch = initially {
-    // Same shape as above, but the body uses `summon[Cap]` rather
-    // than calling a method that takes `using Cap`. Both paths reach
-    // the captured using-param via the typer.
+    // Implicit search in the body reaches a captured context-function
+    // parameter directly.
     run("""|trait Cap:
            |  def label: String
            |def use[T](body: Cap ?=> T): T = body(using new Cap { def label = "tag" })
@@ -893,9 +808,7 @@ class DynamicEvalTests extends ReplTest:
   // ===========================================================================
 
   @Test def functionLocalVarReadByEval = initially {
-    // A function-local `var` declared in the enclosing block is captured
-    // by the rewriter (it's a `ValDef` in scope at the eval call site).
-    // The eval body reads it via the captured snapshot.
+    // A function-local `var` is read through its live VarRef binding.
     run("""|def f(): Int = {
            |  var x = 10
            |  eval[Int]("x + 5")
@@ -905,11 +818,8 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def functionLocalVarMutationFromBodyPropagates = initially {
-    // The rewriter binds captured `var`s through an `Eval.VarRef`
-    // facade whose getter/setter close over the outer var. The body's
-    // `x` reads and `x = v` writes are rewritten to `x__var.get()` /
-    // `x__var.set(v)`, so mutations land directly on the outer var
-    // (no snapshot, no write-back step).
+    // The VarRef getter and setter close over the outer variable, so writes are
+    // visible immediately after eval returns.
     run("""|def f(): Int = {
            |  var x = 10
            |  eval[Unit]("x = x + 5")
@@ -941,8 +851,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def lambdaLocalVarMutationPropagates = initially {
-    // Same mechanism inside a lambda: block-local vars in the lambda
-    // body get cell-wrapped and synced back.
+    // Lambda-local vars use the same live VarRef path.
     run("""val r: List[Int] = List(1, 2, 3).map(z => {
           |  var acc = 0
           |  eval[Unit]("acc = z * 100")
@@ -951,9 +860,8 @@ class DynamicEvalTests extends ReplTest:
     assertContains("List(100, 200, 300)", storedOutput())
   }
 
-  @Test def functionLocalVarMutationViaSyncBack = initially {
-    // Working pattern: have eval RETURN the new value, then assign it
-    // back to the outer `var` explicitly.
+  @Test def functionLocalVarUpdatedFromEvalResult = initially {
+    // A caller can also update a var explicitly from the eval result.
     run("""|def f(): Int = {
            |  var x = 10
            |  x = eval[Int]("x + 5")
@@ -964,9 +872,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def functionLocalVarMutationViaClassField = initially {
-    // Preferred pattern when the eval body needs to perform multiple
-    // writes: hold the mutable state in a class field. The instance
-    // reference is captured, and field writes through it propagate.
+    // Mutating a field on a captured instance updates the original instance.
     run("""|class Cell:
            |  var n: Int = 0
            |def f(): Int = {
@@ -995,10 +901,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def evalBodyWriteVisibleAfterReturn = initially {
-    // Companion to the previous test: a write the eval body performs
-    // must be visible to the outer scope immediately, with no need for
-    // an explicit `x = eval(...)` assign-back. The VarRef setter writes
-    // through to the boxed ref shared with the outer scope.
+    // A VarRef write is visible without assigning the eval result back to `x`.
     run("""|def f(): Int =
            |  var x = 0
            |  eval[Unit]("x = 42")
@@ -1010,16 +913,8 @@ class DynamicEvalTests extends ReplTest:
   // ===========================================================================
   // 12. Type parameters of an enclosing method.
   //
-  //     Term parameters arrive at the eval body as method parameters whose
-  //     declared type is recovered from the runtime class of the value. Type
-  //     parameters have no runtime representation, but the rewriter copies
-  //     each enclosing DefDef's type-param clause onto the wrapper's
-  //     `def __run__[T, U <: AnyRef, ...]` signature so the body's references
-  //     to `T` resolve. Bindings whose types mention these tparams (e.g.
-  //     `xs: List[T]`) are rendered as-is. Erasure flattens everything to
-  //     Object at the JVM, so no type argument flows through `Method.invoke`.
-  //     Anchor-aware shadowing detection keeps an outer DefDef's `T` from
-  //     silently binding to an inner same-named one in the wrapper.
+  //     The enclosing-source splice retains type-parameter declarations and
+  //     bounds while captured binding types refer to the same symbols.
   // ===========================================================================
 
   @Test def genericMethodEvalUsesParam = initially {
@@ -1032,7 +927,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def genericMethodEvalReturnsT = initially {
-    // T is erased, so `eval[T]("x")` is essentially `x` cast to T at runtime.
+    // The result retains the enclosing method's type parameter.
     run("""|def myId[T](x: T): T = eval[T]("x")
            |val a: Int = myId(42)
            |val b: String = myId("hi")""".stripMargin)
@@ -1043,21 +938,14 @@ class DynamicEvalTests extends ReplTest:
 
 
   @Test def typeParameterNameInScopeInsideEval = initially {
-    // The rewriter copies the enclosing DefDef's type-param clause
-    // onto the wrapper's `def __run__[T]` signature, so a body that
-    // refers to `T` literally (`val tag: T = x; tag`) type-checks and
-    // runs. Erasure means no type argument needs to be passed at the
-    // reflective invoke; the body's `T` is just the wrapper's own
-    // type parameter, with the same erasure as the caller's `T`.
+    // The spliced body can refer to the enclosing method's `T` by name.
     run("""|def f[T](x: T): T = eval[T]("val tag: T = x; tag")
            |f(42)""".stripMargin)
     assertContains("val res0: Int = 42", storedOutput())
   }
 
   @Test def typeParameterUsedInBindingTypeAndBody = initially {
-    // The motivating example: a binding whose type mentions T plus a
-    // body that uses T explicitly. Both the wrapper's signature and
-    // the body need T in scope.
+    // Both the binding type and the body refer explicitly to `T`.
     run("""|def id[A](x: A): A = x
            |def f[T](xs: List[T]): List[T] =
            |  eval[List[T]]("xs.map[T](x => id[T](x))")
@@ -1069,22 +957,15 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def boundedTypeParameterPreserved = initially {
-    // Bounded type params (`T <: AnyRef`) should round-trip through
-    // the wrapper signature with their bounds intact.
+    // The generated wrapper preserves bounds on enclosing type parameters.
     run("""|def f[T <: AnyRef](x: T): T = eval[T]("x")
            |f("hello")""".stripMargin)
     assertContains("val res0: String = \"hello\"", storedOutput())
   }
 
   @Test def shadowedTypeParameterPreservesPrecision = initially {
-    // When an inner `def g[T]` shadows an outer `def f[T]`, the
-    // rewriter alpha-renames the outer `T` to a fresh name (`T$0`)
-    // for the wrapper signature so both stay distinct identifiers.
-    // The post-typer phase renders binding types whose typer-side
-    // symbol is the outer `T` with the renamed name. Result: `xs`
-    // is captured as `List[T$0]` (precision preserved), `y` as `T`
-    // (the inner clause's name), and the body's `(xs, y)` typechecks
-    // as `(List[T$0], T)`.
+    // An inner `T` must not capture references to the outer method's distinct
+    // `T`; both binding types retain their original symbols.
     run("""|def f[T](x: T) =
            |  val xs: List[T] = List(x)
            |  def g[T](y: T) = eval[Any]("(xs, y)")
@@ -1094,15 +975,8 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def shadowedTypeParameterRejectsCrossClauseUse = initially {
-    // Companion to `shadowedTypeParameterPreservesPrecision`: with the
-    // outer `T` renamed to `T$0`, mixing `xs` (outer `T`) and `y`
-    // (inner `T`) in invariant position is a compile error inside the
-    // eval body, exactly what source-level scoping already says.
-    // `Box[T].set(v: T)` is invariant, so the mismatch can't be
-    // hidden by widening (unlike `xs :+ y` which would just produce
-    // `List[Any]`). Before the rewriter alpha-renamed shadowed
-    // tparams the wrapper would have captured `xs` as raw `Box`
-    // (precision lost) and the body would compile silently.
+    // Outer and inner type parameters with the same name remain distinct, so
+    // an invariant call mixing them is rejected.
     run("""|import dotty.tools.eval.EvalCompileException
            |trait Box[T]:
            |  def set(v: T): Unit
@@ -1119,14 +993,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def shadowedTypeParameterPermitsSameClauseUse = initially {
-    // Counterpoint to `shadowedTypeParameterRejectsCrossClauseUse`:
-    // `x` and `xs`'s elements share the *same* tparam (outer `T`,
-    // renamed to `T$0`), so `xs :+ x` typechecks inside the eval body
-    // even with the renaming. Erasure flattens both Ts to `Object` at
-    // the JVM level, so the resulting `List[T$0]` value flows back
-    // through the eval boundary fine; we assert the runtime list
-    // contents to confirm the body actually ran (rather than throwing
-    // an EvalCompileException).
+    // Bindings that share the outer `T` remain compatible.
     run("""|def f[T](x: T) =
            |  val xs: List[T] = List(x)
            |  def g[T](y: T): Any = eval[Any]("xs :+ x")
@@ -1136,12 +1003,8 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def pathDependentTypeParamBoundOnCapturedTerm = initially {
-    // Type-parameter bound that mentions a captured term (`a`) of an
-    // outer scope. With clause interleaving, the wrapper signature is
-    //   def __run__(`a`: A)[T <: a.T](`b`: T): T
-    // where `a` precedes the `[T <: a.T]` clause so the path-dependent
-    // bound resolves; `b: T` follows the clause so its type resolves
-    // to that `T`. The body captures `a` and `b` and `T` faithfully.
+    // A captured term remains available to the path-dependent bound of a later
+    // type parameter.
     run("""|class A:
            |  type T = Int
            |val outerA = new A
@@ -1224,25 +1087,14 @@ class DynamicEvalTests extends ReplTest:
   // ===========================================================================
   // 15. Class-scope capture: eval inside a class method.
   //
-  //     The rewriter handles a Template (class body) by pushing the class's
-  //     type parameters and val/var members onto the scope/typeParam stacks.
-  //     Each member is captured under both its bare name (read-only val) and
-  //     a `<name>__field` shadow-safe binding (cell-backed for var members).
-  //     A synthetic `__this__` binding holds the outer instance; the runtime
-  //     body rewrite step rewrites `this.<x>` to `<x>__field` (or to
-  //     `__this__.<x>` for non-member selections like method calls).
+  //     The call-site rewrite captures the enclosing instance. After the
+  //     class method is lifted, private and protected member accesses are
+  //     lowered to reflective operations on that live instance.
   // ===========================================================================
 
   @Test def classScopeGetterAndSetter = initially {
-    // The motivating example: an `eval` inside a class method that
-    // reads/writes a private var member, parameterised by a class
-    // type-param `T`. The rewriter:
-    //   - copies `[T]` from the class onto the wrapper signature,
-    //   - captures `v` as both a bare-name binding and a
-    //     `v__field` cell-backed binding pointing at `this.v`,
-    //   - captures `__this__` for non-member `this.x` accesses,
-    //   - rewrites `this.v` in the body to `v__field` so writes
-    //     flow through the var-cell sync-back back to `this.v`.
+    // Reads and writes of a private generic field operate on the live
+    // enclosing instance, including an explicit `this.v` selection.
     run(
       """|class C[T](private var v: T):
          |  def get: T = eval[T]("v")
@@ -1270,11 +1122,8 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def classScopePrivateMethodCalledByBareName = initially {
-    // Body calls a `private def` of the enclosing class by its
-    // bare name. The lift drops the class declaration, so the
-    // typer can't resolve `secret` directly. V2 routes the call
-    // through the synthesised `__refl_call__` reflective helper
-    // (mirroring how it handles private fields).
+    // Lifting drops the enclosing class declaration, so a bare call to
+    // its private method must be lowered to reflective access.
     run(
       """|class C:
          |  private def secret: Int = 42
@@ -1301,10 +1150,8 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def classScopePrivateMethodViaThisQualifier = initially {
-    // Body uses the explicit `this.<method>` form. After
-    // `rewriteThisInBody` rewrites `this` to `__this__`, the body
-    // rewriter routes `__this__.label(...)` to the same reflective
-    // helper.
+    // An explicit `this.<method>` call follows the same reflective path
+    // as a bare private method call.
     run(
       """|class C:
          |  private def label(s: String): String = s + "!"
@@ -1317,10 +1164,8 @@ class DynamicEvalTests extends ReplTest:
 
   @Test def nestedClassReadsOuterPrivateMembers = initially {
     // Eval inside a nested class accesses *outer* class private
-    // members via the qualified `OuterName.this.x` syntax.
-    // `rewriteThisInBody` rewrites that to `__this__OuterName.x`,
-    // and the per-qualifier privateFieldsByThis / privateMethodsByThis
-    // maps drive reflection on the right captured `this`.
+    // members through `OuterName.this`; reflection must target the
+    // corresponding captured enclosing instance.
     run(
       """|class A:
          |  private val x: Int = 100
@@ -1409,26 +1254,12 @@ class DynamicEvalTests extends ReplTest:
   // ===========================================================================
   // 16. Multi-line eval bodies.
   //
-  //     The body is spliced inside the wrapper's `def __run__ = { ... }`
-  //     braces, so Scala 3 parses it under the brace-based syntax (semicolons
-  //     and newlines separate statements; indentation isn't structurally
-  //     significant at the top level). The body can still use
-  //     indentation-sensitive constructs (`if then ... else`, function
-  //     literals) inside, as long as they're self-consistent. When the body
-  //     goes through `rewriteThisInBody` (class scope) it round-trips through
-  //     the parser and pretty-printer; the tests sidestep `s"..."`
-  //     interpolations inside such bodies (see EVAL.md "Pretty-printer
-  //     round-trip in nested eval").
+  //     The body is parsed as source and tree-spliced into the enclosing
+  //     expression. Newlines separate statements, and indentation-sensitive
+  //     constructs retain their ordinary Scala syntax.
   // ===========================================================================
 
   @Test def multiLineBodyTripleQuoted = initially {
-    // The body is a triple-quoted multi-line string. The wrapper
-    // splices it inside `def __run__ = { ... }` braces, so Scala 3
-    // parses it under the brace-based syntax (semicolons / newlines
-    // separate statements, indentation isn't structurally
-    // significant). The body can still use indentation-sensitive
-    // constructs (`if then ... else`) inside, as long as they're
-    // self-consistent.
     val body =
       "\n  val sum = a + b" +
       "\n  val prod = a * b" +
@@ -1474,10 +1305,8 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def multiLineBodyInClassMethod = initially {
-    // Multi-line body inside a class method exercises the
-    // `rewriteThisInBody` parse / pretty-print round-trip in
-    // addition to the wrapper splice. Two reads + one write to
-    // `this.x` interleaved with intermediate vals.
+    // Two reads and one write of a class field are interleaved with
+    // body-local vals in a multi-line splice.
     val body =
       "\n  val before = this.x" +
       "\n  val delta = step * 2" +
@@ -1590,7 +1419,7 @@ class DynamicEvalTests extends ReplTest:
   //     Stress test combining most of the capture machinery exercised
   //     piecemeal above. The eval call is buried five frames deep (outer
   //     class, nested class, generic method, lambda, block), with bindings
-  //     of every common flavour live at the call site:
+  //     of every common flavor live at the call site:
   //       * outer-class val + var (via `Outer.this.<x>`),
   //       * inner-class val + var (via `this.<x>`),
   //       * method type param + term param,
@@ -1856,8 +1685,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def bodyForLoopSideEffects = initially {
-    // `for` without `yield` runs for side effects. Mutating an outer
-    // var (captured) propagates back via the var-cell sync-back.
+    // `for` without `yield` mutates the outer var through its live VarRef.
     run(
       """|var sum: Int = 0
          |eval[Unit]("for x <- 1 to 5 do sum = sum + x")
@@ -1869,80 +1697,46 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def nestedEvalAfterTypeAnnotatedVal = initially {
-    // Regression: when the outer eval body contained any
-    // `AppliedTypeTree` (`List[T]`, `Array[T]`, type-annotated val,
-    // etc.), the runtime nested-eval rewrite path went through
-    // dotty's pretty-printer, which references `defn.orType` while
-    // rendering applied-type trees. Without a fully-initialised
-    // `ContextBase` (and a real classpath), that lookup NPEs and the
-    // catch-NonFatal in `rewriteUserCode` silently dropped the
-    // rewrite, so the inner eval received `enclosingSource = ""` and
-    // no bindings. The visible symptom in agent traces was an inner
-    // agent referencing an outer-body local that then failed the
-    // wrapper compile because the binding wasn't injected.
+    // An inner eval must capture a local whose declaration contains an
+    // applied type tree. Nested calls are rewritten directly on the parsed
+    // body tree, without converting the body back to source text.
     val body =
       "val xs: List[Int] = List(1, 2, 3); " +
       "val n: Int = xs.sum; " +
       "eval[Int](\\\"n + 100\\\")"
     run(s"""val r: Int = eval[Int]("$body")""")
     val out = storedOutput()
-    assertTrue(s"no compile failure expected, got:\n$out",
-      !out.contains("eval failed to compile"))
     assertContains("val r: Int = 106", out)
   }
 
   @Test def nestedEvalInsideNestedBlocksAndTryCatch = initially {
-    // Regression for the agent-trace symptom "the start of this line
-    // does not match any of the previous indentation widths". The
-    // outer eval body had nested if/else/blocks/try-catch and a def
-    // body; the dotty pretty-printer emitted brace-balanced output
-    // whose leading-whitespace widths fell *between* the parser's
-    // indentation stack entries (e.g. a 17-space line where only 16
-    // and 18 were established). Under the indent-significant default
-    // the round-trip parse rejected the output and `rewriteUserCode`
-    // silently fell back. Forcing `-no-indent` for the round-trip
-    // parse makes braces authoritative and the rewrite survives.
+    // Nested control-flow constructs and a local def must not prevent the
+    // inner eval from capturing `n`.
     val body =
-      "val baseDir = new java.io.File(\\\".\\\"); " +
-      "def listOne(d: java.io.File): List[java.io.File] = { " +
-      "  val es = d.listFiles; " +
-      "  if (es == null) Nil " +
-      "  else es.toList.filter(_.getName.endsWith(\\\".txt\\\")) " +
+      "def total(xs: List[Int]): Int = { " +
+      "  if (xs.isEmpty) 0 " +
+      "  else { val values = xs.map(_ + 1); try values.sum catch { case _: Exception => -1 } } " +
       "}; " +
-      "val files = listOne(baseDir); " +
-      "val n = try { files.length } catch { case _: Exception => -1 }; " +
+      "val n = total(List(0, 1, 2)); " +
       "eval[Int](\\\"n + 1000\\\")"
     run(s"""val r: Int = eval[Int]("$body")""")
-    val out = storedOutput()
-    assertTrue(s"no compile failure expected, got:\n$out",
-      !out.contains("eval failed to compile"))
-    assertTrue(s"no rewrite-fallback warning expected, got:\n$out",
-      !out.contains("[eval-rewrite] WARNING"))
+    assertContains("val r: Int = 1006", storedOutput())
   }
 
   @Test def nestedEvalInsideTryFinallyNoCatch = initially {
-    // Regression: an outer eval body containing `try { ... eval(...) }
-    // finally { ... }` (no catch clause) used to round-trip through
-    // the pretty-printer as `try { ... } catch {<empty>} finally
-    // { ... }`, which fails to re-parse and silently rolls the rewrite
-    // back. The agent-trace symptom is that the inner eval's
-    // enclosingSource and bindings are dropped: captured outer-body
-    // locals (`x` here) become unresolved at the inner wrapper compile.
+    // A nested eval in `try`/`finally` without a catch must retain its
+    // capture of the outer body's `x`.
     val body =
       "val x = 7; " +
       "val src = scala.io.Source.fromString(\\\"dummy\\\"); " +
       "try eval[Int](\\\"x + 100\\\") finally src.close()"
     run(s"""val r: Int = eval[Int]("$body")""")
     val out = storedOutput()
-    assertTrue(s"no compile failure expected, got:\n$out",
-      !out.contains("eval failed to compile"))
     assertContains("val r: Int = 107", out)
   }
 
   @Test def bodyTryCatchFinally = initially {
-    // try/catch with multiple cases plus a finally that mutates an
-    // outer var. Tests both exception-handling path selection AND
-    // var-cell sync-back from a finally block.
+    // A finally block can mutate an outer var through its live VarRef.
     val body =
       "try { throw new IllegalArgumentException(\\\"bad\\\") } " +
       "catch { case _: NullPointerException => \\\"npe\\\"; " +
@@ -2174,16 +1968,8 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def returnsCurriedClosureBuiltDynamically = initially {
-    // The motivating example: a method takes a string operator name
-    // and returns a curried `Int => Int => Int` built at call time
-    // by an `eval` body that interpolates the operator into the
-    // function literal. This exercises:
-    //   - dynamic body construction via `s"..."`,
-    //   - the wrapper returning a closure value,
-    //   - the closure crossing the eval / REPL classloader boundary
-    //     as `scala.Function1` (visible as the same Class on both
-    //     sides because the AbstractFileClassLoader delegates
-    //     `scala.*` to the parent loader).
+    // A dynamically constructed curried Function1 crosses the eval/REPL
+    // classloader boundary and remains callable by the session.
     run(
       """|def mkOp(op: String): Int => Int => Int =
          |  eval[Int => Int => Int](s"i => j => i $op j")
@@ -2277,14 +2063,15 @@ class DynamicEvalTests extends ReplTest:
   @Test def compileErrorParseFailure = initially {
     run("""val r: Int = eval("(1 + ")""")
     val out = storedOutput()
-    assertTrue(s"expected an error, got:\n$out", out.contains("failed to compile") || out.contains("Error"))
+    assertContains("eval failed to compile", out)
+    assertContains("expression expected", out)
   }
 
   @Test def compileErrorTypeMismatch = initially {
     run("""val r: Int = eval("\"a string\" + 1: Int")""")
     val out = storedOutput()
-    assertTrue(s"expected an error, got:\n$out",
-      out.contains("failed to compile") || out.contains("Error") || out.contains("ClassCastException"))
+    assertContains("eval failed to compile", out)
+    assertContains("Required: Int", out)
   }
 
   @Test def compileErrorIsEvalCompileException = initially {
@@ -2292,13 +2079,8 @@ class DynamicEvalTests extends ReplTest:
     // generic `RuntimeException`. The exception type is shared across
     // the eval / REPL classloader boundary so the user can catch it
     // by name and inspect its structured `errors` field.
-    //
-    // V2 may surface follow-on errors when the spliced body's type
-    // doesn't match the expected return type (the type mismatch on
-    // `__evalResult: Int = false` cascades into "couldn't infer T"
-    // and similar refinements). The exact count is implementation-
-    // defined; what matters is that *at least one* error makes it
-    // through and the EvalCompileException is catchable by name.
+    // The exact number of follow-on diagnostics is implementation-defined;
+    // this test only requires a structured error to cross the boundary.
     run(
       """|import dotty.tools.eval.EvalCompileException
          |val r: String =
@@ -2430,7 +2212,7 @@ class DynamicEvalTests extends ReplTest:
     assertContains("val res0: Int = 17", out)
     // f'(2) = 6x at x=2
     assertContains("val res1: Int = 12", out)
-    // diffAt(f, 0, 2)  = f(2): a fresh eval roundtrip, no recursion
+    // diffAt(f, 0, 2)  = f(2): a fresh evaluation, no recursion
     assertContains("val res2: Int = 17", out)
     // diffAt(f, 1, 2)  = f'(2): one level of recursive eval
     assertContains("val res3: Int = 12", out)
@@ -2444,7 +2226,7 @@ class DynamicEvalTests extends ReplTest:
   //     (so all see the same enclosing bindings) and run in source order.
   // ===========================================================================
 
-  @Test def twoSiblingEvalsShareEnclosingVal = initially {
+  @Test def twoEvalsShareEnclosingVal = initially {
     // Same `n` captured by two separate eval calls in the same line.
     // The rewriter visits each call independently and emits its own
     // bindings array; both arrays carry `n`.
@@ -2453,13 +2235,13 @@ class DynamicEvalTests extends ReplTest:
     assertContains("val r: Int = 21", storedOutput())
   }
 
-  @Test def twoSiblingEvalsInTuple = initially {
+  @Test def twoEvalsInTuple = initially {
     run("""|val n: Int = 3
            |val r: (Int, Int) = (eval[Int]("n * n"), eval[Int]("n + n"))""".stripMargin)
     assertContains("val r: (Int, Int) = (9, 6)", storedOutput())
   }
 
-  @Test def threeSiblingEvalsAccumulating = initially {
+  @Test def threeEvalsAccumulate = initially {
     // Side-effect ordering: two `eval[Unit]` writes followed by an
     // `eval[Int]` read. The driver must run each call in source order.
     run("""|var sum = 0
@@ -2471,8 +2253,7 @@ class DynamicEvalTests extends ReplTest:
 
   @Test def evalResultFedAsBindingToLaterEval = initially {
     // First eval produces a value; that value is captured into the
-    // second eval's bindings via a normal val. Plain dataflow, no
-    // "result threading" magic.
+    // second eval's bindings through an ordinary val.
     run("""|val first: Int = eval[Int]("2 + 3")
            |val r: Int = eval[Int]("first * first")""".stripMargin)
     assertContains("val r: Int = 25", storedOutput())
@@ -2496,7 +2277,7 @@ class DynamicEvalTests extends ReplTest:
     assertContains("val r: Int = 12", storedOutput())
   }
 
-  @Test def siblingEvalsWithDifferentReturnTypes = initially {
+  @Test def evalsWithDifferentReturnTypes = initially {
     // Each eval call is independent at the wrapper level: one returns
     // Int, the other String. The wrapper compile picks each return
     // type from the call's own `[T]` annotation.
@@ -2529,7 +2310,7 @@ class DynamicEvalTests extends ReplTest:
     assertContains("val r: Int = 12", storedOutput())
   }
 
-  @Test def siblingEvalsCapturingSameVar = initially {
+  @Test def evalsCaptureSameVar = initially {
     // Both eval calls capture the same `var k`. Both go through
     // VarRef so writes from one are visible to the next.
     run("""|var k: Int = 1
@@ -2538,7 +2319,7 @@ class DynamicEvalTests extends ReplTest:
     assertContains("val r: Int = 300", storedOutput())
   }
 
-  @Test def siblingEvalsRecoverableFailureDoesNotBlockNext = initially {
+  @Test def failedEvalDoesNotBlockFollowingEval = initially {
     // The first eval throws at runtime; we catch it. The second eval
     // sits in the same line and runs cleanly: its compile and wrapper
     // synthesis is independent of the first, and a thrown body
@@ -2654,8 +2435,8 @@ class DynamicEvalTests extends ReplTest:
   //
   //     When a REPL line fails to type-check, its `rs$line$N` wrapper has no
   //     classfile. The runtime filters such indexes out before generating the
-  //     synthetic `import rs$line$N.*` so a later `eval(...)` doesn't trip on
-  //     the missing wrapper.
+  //     synthetic `import rs$line$N.*`, preventing an unrelated missing-wrapper
+  //     error in a later `eval(...)`.
   // ===========================================================================
 
   @Test def evalAfterFailedReplLine = initially {
@@ -2750,8 +2531,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def evalCallsLocalRecursiveDefWithSideEffect = initially {
-    // The user's headline example: a Unit-returning local def whose body
-    // is an eval that prints and recurses.
+    // A Unit-returning local def prints and recurses through eval.
     run(
       """|def g() =
          |  def f2(i: Int): Unit =
@@ -2799,11 +2579,8 @@ class DynamicEvalTests extends ReplTest:
   }
 
   // ===========================================================================
-  // 34. Migrated debug-pipeline fixtures. The dotty `tests/debug` suite pins
-  //     the ExpressionCompiler that V2's pipeline is modelled after, exercising
-  //     scenarios (overload resolution, by-name params, local pattern
-  //     destructuring, REPL-session enums) that the REPL eval should also
-  //     handle.
+  // 34. Expression-compiler regression shapes: overload resolution, by-name
+  //     parameters, local pattern destructuring, and REPL-session enums.
   // ===========================================================================
 
   @Test def overloadResolutionInsideBody = initially {
@@ -3023,10 +2800,8 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def inlineDefMixedInlineAndRegularParams = initially {
-    // Mixed inline + regular value params. The non-inline `b` is
-    // evaluated normally; the inline `a` is substituted at compile
-    // time. Either way the result is the same; this is a smoke test
-    // confirming the wrapper compile handles mixed-mode signatures.
+    // The wrapper compile handles a signature mixing inline and regular
+    // parameters.
     run(
       """|inline def addBoth(inline a: Int, b: Int): Int = a + b
          |val k = 10
@@ -3165,11 +2940,8 @@ class DynamicEvalTests extends ReplTest:
 
   @Test def defaultArgExpressionAsBody = initially {
     // Mirrors `tests/debug/eval-at-default-arg.scala`: the body is
-    // an expression that *would* serve as a default argument for a
-    // captured parameter. There's nothing special about this in V2
-    // (the body is just an expression mentioning the captured `x`),
-    // but it pinned a real bug in the debug pipeline so we keep
-    // a regression test for the same shape.
+    // an expression that could serve as a default argument for a
+    // captured parameter.
     run(
       """|def foo(x: Int): Int =
          |  eval[Int]("x + 1")
@@ -3179,14 +2951,14 @@ class DynamicEvalTests extends ReplTest:
   }
 
   // ===========================================================================
-  // 35. Case classes: synthesised methods (apply, copy, unapply, equals,
+  // 35. Case classes: synthesized methods (apply, copy, unapply, equals,
   //     toString), generics, defaults, eval-body-defined hierarchies. These
   //     all ride on `import rs$line$N.{*}` so the synthetic companion is
   //     visible inside the eval body.
   // ===========================================================================
 
   @Test def caseClassCopyOnCapturedValue = initially {
-    // Synthesised `copy` is reachable on a captured case-class value.
+    // Synthesized `copy` is reachable on a captured case-class value.
     run(
       """|case class Pt(x: Int, y: Int)
          |val p: Pt = Pt(3, 4)
@@ -3217,7 +2989,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def caseClassDestructuringValDef = initially {
-    // `val Pt(x, y) = pt` desugars through the synthesised `unapply`.
+    // `val Pt(x, y) = pt` desugars through the synthesized `unapply`.
     run(
       """|case class Pt(x: Int, y: Int)
          |def f(pt: Pt): Int =
@@ -3246,7 +3018,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def caseClassWithDefaultArgsConstructed = initially {
-    // `Pt()` triggers the synthesised `Pt.apply$default$N` accessors.
+    // `Pt()` triggers the synthesized `Pt.apply$default$N` accessors.
     run(
       """|case class Pt(x: Int = 1, y: Int = 2)
          |val r: Int = eval[Int]("val p = Pt(); p.x + p.y")""".stripMargin
@@ -3296,12 +3068,9 @@ class DynamicEvalTests extends ReplTest:
          |val mismatch: outer2.Inner = eval[outer2.Inner]("new outer1.Inner(7)")""".stripMargin
     )
     val out = storedOutput()
-    assertTrue(
-      s"expected the eval call to fail (path-dependent type mismatch), got:\n$out",
-      out.contains("EvalCompileException")
-        || out.contains("Found:")
-        || out.contains("type mismatch")
-    )
+    assertContains("eval failed to compile", out)
+    assertContains("Found:", out)
+    assertContains("Required:", out)
   }
 
   @Test def caseClassMatchDispatchOverList = initially {
@@ -3332,9 +3101,8 @@ class DynamicEvalTests extends ReplTest:
   }
 
   // ===========================================================================
-  // 36. Value classes (`extends AnyVal`). The JVM erases them to their single
-  //     underlying field, so a body that constructs, reads, or passes a
-  //     value-class instance has to round-trip through that erasure.
+  // 36. Value classes (`extends AnyVal`). Bodies must preserve their erased
+  //     representation when values cross the eval boundary.
   // ===========================================================================
 
   @Test def anyValClassConstructedAndAccessedInBody = initially {
@@ -3378,8 +3146,7 @@ class DynamicEvalTests extends ReplTest:
     // The eval call captures a *block-local* AnyVal val. At runtime
     // the body reaches through `getValue("w")` (returns Object), then
     // `asInstanceOf[Wei]` rewraps it; `.grams` unboxes back to Int.
-    // This is the path the value class actually has to round-trip
-    // through the bindings array.
+    // This path carries the erased value through the bindings array.
     run(
       """|class Wei(val grams: Int) extends AnyVal
          |def f(): Int =
@@ -3413,11 +3180,10 @@ class DynamicEvalTests extends ReplTest:
     assertContains("val r: Int = 3", storedOutput())
   }
 
-  @Test def patchSpanAssignmentRoundtrip = initially {
+  @Test def patchSpanReflectiveReadWrite = initially {
     // Mirrors `tests/debug/eval-i425.scala`: a body that reads a
-    // case-class field, then writes it via the synthesised `_=`
-    // setter, then reads again. Exercises the V2 reflective field
-    // path for both directions.
+    // case-class field, then writes it via the synthesized `_=`
+    // setter, then reads again through the reflective field path.
     run(
       """|case class Span(value: Int)
          |class Patch(var span: Span)
@@ -3437,7 +3203,7 @@ class DynamicEvalTests extends ReplTest:
   //     Anyone can declare an eval-like generator by annotating a function
   //     with `@evalLike` (throwing variant, returns T) or `@evalSafeLike`
   //     (non-throwing, returns EvalResult[T]). The post-PostTyper rewriter
-  //     recognises these annotations and fills the synthetic `_bindings`,
+  //     recognizes these annotations and fills the synthetic `_bindings`,
   //     `_expectedType`, and `_enclosingSource` slots *by name*, so the
   //     user's signature can declare these parameters in any order with
   //     arbitrary additional parameters around them. `agent`'s trailing
@@ -3445,10 +3211,8 @@ class DynamicEvalTests extends ReplTest:
   // ===========================================================================
 
   @Test def customEvalLikeFillsBindingsAndType = initially {
-    // Smoke test: a thin wrapper around `Eval.eval` annotated with
-    // `@evalLike`. The rewriter must fill `bindings` (so `x` is
-    // captured and resolves in the body) and `expectedType` (so the
-    // body type-checks against `Int`).
+    // A thin `@evalLike` wrapper must receive both the captured `x` and
+    // the expected `Int` result type.
     run(
       """|import dotty.tools.eval.Eval
          |@dotty.tools.eval.evalLike
@@ -3812,8 +3576,7 @@ class DynamicEvalTests extends ReplTest:
   @Test def localCaseClassApplyAndUnapplyInBody = initially {
     // `Pt(3, 4)` routes through the live companion captured as
     // `__evalModule_Pt__` (apply), and `case Pt(a, b)` destructures via
-    // the case-class accessor path on the original class. Previously a
-    // known limitation ("Could not find proxy for lazy var Pt$lzy1").
+    // the case-class accessor path on the original class.
     run(
       """|def f: Int =
          |  case class Pt(x: Int, y: Int)
@@ -3982,7 +3745,7 @@ class DynamicEvalTests extends ReplTest:
     assertContains("val res0: Int = 42", storedOutput())
   }
 
-  @Test def localCaseClassArrayRoundTrip = initially {
+  @Test def localCaseClassArrayCrossesBoundary = initially {
     // Case-class variant: `Array(Pt(1, 2), Pt(3, 4))` in the body
     // composes the companion-apply link with the array literal path.
     run("""|def f(): Int =
@@ -4054,8 +3817,8 @@ class DynamicEvalTests extends ReplTest:
     // the linked class and the array layer needs no widening at all.
     // `C` resurfaces only through the generic read `box.value`,
     // whose erasure-inserted `asInstanceOf[Array[C']]` lowers in the
-    // sweep. Reads, an element write from the body, and a round trip
-    // out all link to the original class.
+    // sweep. Reads, a body-side element write, and the returned array all
+    // link to the original class.
     run("""|case class Box[T](value: T)
            |def f(): Int =
            |  class C(val x: Int)
@@ -4341,7 +4104,7 @@ class DynamicEvalTests extends ReplTest:
 
   @Test def evalInsideExtensionGroupMember = initially {
     // The widened slice carries the whole group, so the body's
-    // simple-name call to the sibling extension method resolves.
+    // simple-name call to another extension method resolves.
     run("""|extension (n: Int)
            |  def double: Int = n * 2
            |  def quad: Int = eval[Int]("double * 2")
@@ -4358,7 +4121,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def evalInsideGenericExtensionMethod = initially {
-    // A type-parameterised extension: the widened slice re-declares
+    // A type-parameterized extension: the widened slice re-declares
     // `T`, so the body and the expected-type slot resolve it.
     run("""|extension [T](xs: List[T]) def second: T = eval[T]("xs.tail.head")
            |List(1, 2, 3).second""".stripMargin)
@@ -4376,7 +4139,7 @@ class DynamicEvalTests extends ReplTest:
 
   @Test def evalInsideLocalClassMethod = initially {
     // Bare `k` in the body is an Ident with an implicit `L.this`
-    // prefix; the qualifier is synthesised from the captured `this`
+    // prefix; the qualifier is synthesized from the captured `this`
     // chain and the read goes through receiver-class reflection on
     // the live instance.
     run(
@@ -4389,8 +4152,8 @@ class DynamicEvalTests extends ReplTest:
     assertContains("val res0: Int = 33", storedOutput())
   }
 
-  @Test def evalInsideLocalClassMethodCallsSibling = initially {
-    // A parameterless sibling method named bare in the body takes
+  @Test def evalInsideLocalClassMethodCallsOtherMethod = initially {
+    // A parameterless method named bare in the body takes
     // the same implicit-`this` route as a field read.
     run(
       """|def make(): Int =
@@ -4405,7 +4168,7 @@ class DynamicEvalTests extends ReplTest:
 
   @Test def evalInsideLocalClassMethodPrivateMember = initially {
     // Private members of the local class reroute through the
-    // inaccessible-member reflective path with the synthesised
+    // inaccessible-member reflective path with the synthesized
     // `this` qualifier.
     run(
       """|def make(): Int =
@@ -4512,8 +4275,8 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def insideClassBodyCallsDefaultArgMethod = initially {
-    // The *body* calls a sibling method relying on its default
-    // argument; the synthesised `add$default$1` resolves on the live
+    // The body calls another method relying on its default
+    // argument; the synthesized `add$default$1` resolves on the live
     // class.
     run(
       """|class B(val base: Int):
@@ -4730,8 +4493,8 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def insideClassSecondaryCtorFromBody = initially {
-    // The body constructs a sibling instance through the secondary
-    // constructor of the enclosing (session) class.
+    // The body constructs another instance through the secondary
+    // constructor of the enclosing session class.
     run(
       """|class S(val x: Int):
          |  def this() = this(7)
@@ -4759,8 +4522,6 @@ class DynamicEvalTests extends ReplTest:
            |  eval[Int]("val d = new C(10); eval[Int](\"c.x + d.x + new C(100).x\")")
            |f()""".stripMargin)
     val out = storedOutput()
-    assertTrue(s"no compile failure expected, got:\n$out",
-      !out.contains("eval failed to compile"))
     assertContains("val res0: Int = 111", out)
   }
 
@@ -4775,8 +4536,6 @@ class DynamicEvalTests extends ReplTest:
            |  c.x * 2
            |f()""".stripMargin)
     val out = storedOutput()
-    assertTrue(s"no compile failure expected, got:\n$out",
-      !out.contains("eval failed to compile"))
     assertContains("val res0: Int = 42", out)
   }
 
@@ -4791,8 +4550,6 @@ class DynamicEvalTests extends ReplTest:
            |  eval[Int]("val q = Pt(p.y, 30); eval[Int](\"q match { case Pt(a, b) => a + b + p.x }\")")
            |f()""".stripMargin)
     val out = storedOutput()
-    assertTrue(s"no compile failure expected, got:\n$out",
-      !out.contains("eval failed to compile"))
     assertContains("val res0: Int = 33", out)
   }
 
@@ -4808,8 +4565,6 @@ class DynamicEvalTests extends ReplTest:
            |  Counter.n
            |f()""".stripMargin)
     val out = storedOutput()
-    assertTrue(s"no compile failure expected, got:\n$out",
-      !out.contains("eval failed to compile"))
     assertContains("val res0: Int = 111", out)
   }
 
@@ -4838,7 +4593,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def bodyDefinesCaseClassAndUsesIt = initially {
-    // A *case* class declared in the body: the synthesised members
+    // A *case* class declared in the body: the synthesized members
     // (companion `apply`, accessors, `copy$default$n`) carry
     // `Local.this` references that previously tripped the
     // outer-`this` check. The whole bundle (class + companion) is
@@ -4859,7 +4614,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   @Test def bodyDefinesCaseClassCopy = initially {
-    // `copy` with a defaulted parameter exercises the synthesised
+    // `copy` with a defaulted parameter exercises the synthesized
     // `copy$default$1` (a `P.this.a` read on the body-local class).
     run("""val r: Int = eval[Int]("case class P(a: Int, b: Int); val q = P(1, 2).copy(b = 40); q.a + q.b")""")
     assertContains("val r: Int = 41", storedOutput())
@@ -4923,8 +4678,6 @@ class DynamicEvalTests extends ReplTest:
     // both must be instances of the outer wrapper's one D.
     run("""val r: Int = eval[Int]("class D(val x: Int); val d = new D(1); eval[Int](\"d.x + new D(10).x\")")""")
     val out = storedOutput()
-    assertTrue(s"no compile failure expected, got:\n$out",
-      !out.contains("eval failed to compile"))
     assertContains("val r: Int = 11", out)
   }
 
@@ -4934,8 +4687,6 @@ class DynamicEvalTests extends ReplTest:
     // class on both sides.
     run("""val r: Int = eval[Int]("class D(val x: Int); val d: D = eval[D](\"new D(21)\"); d.x * 2")""")
     val out = storedOutput()
-    assertTrue(s"no compile failure expected, got:\n$out",
-      !out.contains("eval failed to compile"))
     assertContains("val r: Int = 42", out)
   }
 
@@ -4949,8 +4700,6 @@ class DynamicEvalTests extends ReplTest:
            |  eval[Int]("class D(val y: Int); val d = new D(10); eval[Int](\"c.x + d.y\")")
            |f()""".stripMargin)
     val out = storedOutput()
-    assertTrue(s"no compile failure expected, got:\n$out",
-      !out.contains("eval failed to compile"))
     assertContains("val res0: Int = 11", out)
   }
 
@@ -4966,7 +4715,6 @@ class DynamicEvalTests extends ReplTest:
   // ===========================================================================
 
   @Test def returnFromEnclosingMethodInBody = initially {
-    // Previously a known limitation rejected with a diagnostic.
     run("""|def f(): Int = eval[Int]("return 42")
            |f()""".stripMargin)
     assertContains("val res0: Int = 42", storedOutput())
@@ -4997,55 +4745,10 @@ class DynamicEvalTests extends ReplTest:
   // ===========================================================================
   // KNOWN LIMITATIONS
   //
-  // Each test below pins a documented shape that the V2 pipeline cannot
-  // currently handle. We assert on the failure mode (specific diagnostic or
-  // exception type) so that a future fix flips the test rather than letting
-  // the limitation regress silently. When a limitation is lifted, flip the
-  // test to assert the success result and move it into the relevant section
-  // above.
-  //
-  // Open limitations, pinned below: a body-local class extending a
-  // *linked* local class (named or anonymous; rejected with a
-  // diagnostic, see `bodyLocalClassExtendingLinkedClassRejected`).
-  // Documented but not pinnable: the inliner's def-shaped by-name
-  // argument proxies are not captured, but no reachable source shape
-  // is known to hit them (lambdas cannot declare by-name params;
-  // context function arguments beta-reduce their parameter to a
-  // val-shaped binding); and an eval call written inside an
-  // `inline def` warns that expansion sites see the unrewritten call
-  // (`evalInsideInlineDefWarns`).
-  //
-  // Lifted (now covered by success tests above):
-  //   - *Local* case-class apply/unapply from the body: section 38
-  //     (linked local classes).
-  //   - `return` targeting the method enclosing the eval call: section 39
-  //     (non-local return via `__evalReturnKey__`). A `return` at the REPL
-  //     top level is still rejected with the standard typer diagnostic
-  //     (`returnOutsideMethodInBodyRejected` below).
-  //   - Private members of a session-level (or nested) object accessed from
-  //     a body inside that object's methods: the module lift in
-  //     SpliceEvalBody drops the re-declared object and reroutes privates
-  //     reflectively against the live module
-  //     (`sessionObjectPrivateVarMutatedFromInsideEval` above;
-  //     `StandaloneEvalTests.privateValOfNestedObject`).
-  //   - Body that defines a fresh case class: `this` of a body-local class
-  //     is an ordinary same-class reference, not an outer-`this`
-  //     (`bodyDefinesCaseClassAndUsesIt` and friends above).
-  //   - Eval inside a method of a *local* class: bare member Idents lower
-  //     through the synthesised `this` qualifier with receiver-class
-  //     reflection (`evalInsideLocalClassMethod` and friends above).
-  //   - By-name constructor params of linked classes: full by-name
-  //     semantics across the boundary (`localClassByNameCtorParamStaysLazy`).
-  //   - User-defined `unapply` / `unapplySeq` on a local module
-  //     (`localModuleUserDefinedUnapply` and friends, section 38).
-  //   - Arrays of a linked local class (any dimension count), both
-  //     directions (`localClassArrayCapturedReadAndWrite`,
-  //     `localClassNestedArrayCreatedInBody`, and friends, section 38).
-  //   - Eval inside an object nested in a *class* (instance-dependent
-  //     module) and inside a `private object`: live-instance captures
-  //     (`evalInsideObjectNestedInClass`, `evalInsidePrivateObject`).
-  //   - Eval inside extension methods: the slice is widened to the
-  //     `extension` clause (`evalInsideExtensionMethod` and friends).
+  // These tests pin unsupported shapes with a stable diagnostic. When a
+  // limitation is lifted, convert its test to assert the successful result.
+  // Currently, a body-local class cannot extend a linked local class, and an
+  // eval call inside an inline def cannot be rewritten at expansion sites.
   // ===========================================================================
 
   @Test def returnOutsideMethodInBodyRejected = initially {
@@ -5353,7 +5056,7 @@ class DynamicEvalTests extends ReplTest:
   }
 
   // ===========================================================================
-  // 41. Behavioural edges pinned by review: pattern binders, scoping of
+  // 41. Behavioral edges pinned by review: pattern binders, scoping of
   //     body-local names, laziness of captures, and runtime identity.
   // ===========================================================================
 
@@ -5424,7 +5127,7 @@ class DynamicEvalTests extends ReplTest:
 
   @Test def givenBeforeMidBlockEvalStatement = initially {
     // The marker sits mid-block (not as the trailing expression); the
-    // given is both hoisted into the body and kept for the sibling
+    // given is both hoisted into the body and kept for the following
     // `summon` after the eval call.
     run("""def f(): Int = { given Int = 99; eval[Unit]("assert(summon[Int] == 99)"); summon[Int] }""")
   } andThen {
@@ -5815,27 +5518,19 @@ end DynamicEvalTests
 class DynamicEvalExplicitNullsTests extends ReplTest(
   ReplTest.defaultOptions ++ Array("-Yexplicit-nulls")
 ):
-  // -- Flag forwarding: the eval driver inherits the live REPL's
-  //    `-Yexplicit-nulls`, so the body is type-checked under the
-  //    same nullability discipline as the surrounding session.
-  //    Tests below pin the round-trip; anything stricter (flow
-  //    typing through bindings, narrowing across the eval boundary)
-  //    is intentionally out of scope: a captured nullable that
-  //    flows into a body string crosses the eval boundary, and the
-  //    body shouldn't depend on the typer remembering it was a
-  //    stable val on the outside.
+  // The eval compile inherits the live REPL's nullability rules. Flow
+  // narrowing from the outer compile is not preserved across the boundary.
 
   @Test def explicitNullsRejectsNullForString =
-    // The classic case: `val s: String = null` is unsound under
-    // explicit-nulls. The eval driver compiles the body with the
-    // flag on and rejects the assignment.
+    // `val s: String = null` is unsound under explicit nulls. The eval
+    // driver compiles the body with the flag on and rejects the assignment.
     initially {
       run("""val r: String = eval("val s: String = null; s")""")
       val out = storedOutput()
-      assertTrue(
-        s"expected an explicit-nulls compile error, got:\n$out",
-        out.contains("Null") || out.contains("Found:") || out.contains("failed to compile")
-      )
+      assertContains("eval failed to compile", out)
+      assertContains("Found:", out)
+      assertContains("Null", out)
+      assertContains("Required: String", out)
     }
 
   @Test def explicitNullsAcceptsStringOrNull =
@@ -5861,16 +5556,13 @@ class DynamicEvalExplicitNullsTests extends ReplTest(
            |val r: Int = eval[Int]("s.length")""".stripMargin
       )
       val out = storedOutput()
-      assertTrue(
-        s"expected an explicit-nulls compile error, got:\n$out",
-        out.contains("failed to compile") || out.contains("Null") || out.contains("does not")
-      )
+      assertContains("eval failed to compile", out)
+      assertContains("String | Null", out)
+      assertContains("length", out)
     }
 
   @Test def explicitNullsAcceptsCapturedNonNullableString =
-    // Sanity check: a non-nullable `val s: String` capture continues
-    // to work. The flag doesn't introduce spurious nullability for
-    // values that weren't declared nullable.
+    // A non-nullable capture remains non-nullable in the body.
     initially {
       run(
         """|val s: String = "world"
@@ -5975,10 +5667,6 @@ class DynamicEvalCaptureCheckingTests extends ReplTest(
       // `x => i` only captures the pure `Int` parameter `i`. The
       // verification compile and the wrapper compile both accept it.
       assertContains("g succeeded", out)
-      assertTrue(
-        s"expected no eval failure, got:\n$out",
-        !out.contains("failed to compile")
-      )
     }
 
   @Test def captureViolationInNestedEvalOnly =
@@ -6063,14 +5751,14 @@ class DynamicEvalCaptureCheckingTests extends ReplTest(
     // captured local at the eval call site, including ones whose type
     // carries a non-empty capture set (here `f: AnyRef^{io}` via the
     // contextual IOCap). Without suppression, the use of `f` inside the
-    // synthesised `Eval.bind` propagates `io` into the enclosing
+    // synthesized `Eval.bind` propagates `io` into the enclosing
     // function literal's capture set; the surrounding `Classified.map`
     // expects `String ->{any.rd} Int`, so `io` (not in `{any.rd}`) is
     // reported as a capture violation.
     //
     // The fix: each binding's value is wrapped in a `Predef.identity[T](v)`
     // Apply stamped with `CheckCaptures.DiscardUses`. The capture
-    // checker recognises the attachment and rechecks the inner
+    // checker recognizes the attachment and rechecks the inner
     // expression with `withDiscardedUses`, so the propagation is
     // suppressed. The eval body itself is still typechecked under its
     // original lexical context by the verification compile, where `f`'s
@@ -6149,7 +5837,7 @@ end DynamicEvalCaptureCheckingTests
 class DynamicEvalSafeModeTests extends ReplTest(
   ReplTest.defaultOptions ++ Array("-language:experimental.safe")
 ):
-  // -- Sanity: bodies that respect the safe subset still work. --------------
+  // -- Bodies within the safe subset. ---------------------------------------
 
   @Test def basicEvalInSafeMode =
     initially {
@@ -6178,19 +5866,15 @@ class DynamicEvalSafeModeTests extends ReplTest(
   // -- Mutable var + pure function: the verification pass catches it. -------
 
   @Test def mutableVarCapturedByPureFunctionInBodyRejected =
-    // The headline safe-mode test for eval. The body declares a pure
-    // function `() -> Int` whose closure captures the enclosing method's
-    // `var r`. The eval rewriter synthesises a `bindVar` argument
+    // The body declares a pure function `() -> Int` whose closure captures
+    // the enclosing method's
+    // `var r`. The eval rewriter synthesizes a `bindVar` argument
     // backed by a `varRef(() => r, v => r = v)` pair of `Supplier` /
     // `Consumer` JDK lambdas. Under safe mode + CC + mutation tracking,
     // those JDK lambdas have no capture set in their type, so the
     // `r.rd` (read effect on the mutable var) cannot flow into the
     // expected capture set `{}`. The whole `def f` is rejected at the
     // REPL compile, before the eval driver ever runs.
-    //
-    // This is the right behaviour: in safe mode you cannot capture a
-    // mutable var into eval at all unless eval offers a non-pure
-    // binding shape, which today it doesn't.
     initially {
       run(
         """|def f(): Int =
@@ -6207,10 +5891,10 @@ class DynamicEvalSafeModeTests extends ReplTest(
     }
 
   @Test def mutableVarCapturedByPureLambdaInsideEvalRejected =
-    // Same shape, but the violation is inside a `map` whose function
-    // argument is typed `Int -> Int` (pure). The eval body itself is
-    // `c.map(x => x + r)`, innocuous on its own, but at the call site
-    // `r` is a `var`, so the rewriter synthesises a `varRef(() => r, ...)`
+    // Here the violation is inside a `map` whose function argument is
+    // typed `Int -> Int` (pure). The body expression is valid in isolation,
+    // but the call-site `r` is a `var`, so the rewriter synthesizes a
+    // `varRef(() => r, ...)`
     // for the binding and the same Supplier/Consumer-without-capture-set
     // rejection fires.
     initially {
@@ -6233,25 +5917,22 @@ class DynamicEvalSafeModeTests extends ReplTest(
     }
 
   @Test def mutableVarCapturedByImpureLambdaInsideEvalAccepted =
-    // Sibling of the previous test: the same `var r` capture, but now
-    // the function position is the impure `=>` (which can carry the
-    // var's read effect in its inferred capture set). CC accepts.
+    // The same `var r` capture is accepted in an impure `=>` function
+    // position, which can carry the var's read effect in its inferred
+    // capture set.
     initially {
       run(
         """|trait C[T]:
            |  def map[U](op: T => U): C[U] = ???
-           |class CImpl extends C[Int]:
-           |  override def map[U](op: Int => U): C[U] = new CImpl().asInstanceOf[C[U]]
+           |class CImpl[T](values: List[T]) extends C[T]:
+           |  override def map[U](op: T => U): C[U] = CImpl(values.map(op))
            |def g(c: C[Int]): Any =
            |  var r: Int = 1
            |  eval[Any]("c.map(x => x + r)")
-           |val out = g(new CImpl)""".stripMargin
+           |val out = g(CImpl(List(1)))""".stripMargin
       )
       val out = storedOutput()
-      assertTrue(
-        s"expected the impure-lambda body to be accepted, got:\n$out",
-        !out.contains("failed to compile")
-      )
+      assertContains("val out: Any =", out)
     }
 
   // -- Unsafe escape hatches inside the body are rejected. ------------------
@@ -6327,10 +6008,9 @@ class DynamicEvalSafeModeTests extends ReplTest(
   // -- Mutating an outer var through a pure / read-only function. -----------
 
   @Test def mutableVarWriteInPureLambdaInBodyRejected =
-    // Companion of `mutableVarCapturedByPureFunctionInBodyRejected`:
-    // here the pure (`->`) lambda *writes* to the captured var
+    // Here the pure (`->`) lambda writes to the captured var
     // instead of reading it. The Supplier/Consumer pair the rewriter
-    // synthesises for `bindVar` carries no capture set, so neither
+    // synthesizes for `bindVar` carries no capture set, so neither
     // the read nor the write effect can flow into a `() -> Unit`.
     // The whole `def f` is rejected at the REPL compile.
     initially {
@@ -6406,7 +6086,7 @@ class DynamicEvalSafeModeTests extends ReplTest(
     // Same scenario as `evalBindingDoesNotPropagateCaptures...` in
     // `DynamicEvalCaptureCheckingTests`, but under safe mode. This
     // additionally exercises the safe-mode constraint: the rewriter
-    // cannot synthesise a direct call to `caps.unsafe.unsafeDiscardUses`
+    // cannot synthesize a direct call to `caps.unsafe.unsafeDiscardUses`
     // because `caps.unsafe` is `@rejectSafe` and would fail
     // `SafeRefs.checkSafe`. The fix routes through `Predef.identity`
     // (which is `@assumeSafe`) carrying a `CheckCaptures.DiscardUses`
@@ -6439,7 +6119,7 @@ class DynamicEvalSafeModeTests extends ReplTest(
           && !out.contains("not included in the allowed capture set")
       )
       assertTrue(
-        s"expected no safe-mode rejection from a synthesised carrier, got:\n$out",
+        s"expected no safe-mode rejection from a synthesized carrier, got:\n$out",
         !out.contains("Cannot refer to") && !out.contains("@rejectSafe")
       )
       assertContains("val r: Classified[Int]", out)
@@ -6600,7 +6280,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
            |    "Q(7)"
            |  }
            |  val q2: Q = eval { (ctx: EvalContext) =>
-           |    // Without an explicit `[Q]` the typer minimises the
+           |    // Without an explicit `[Q]` the typer minimizes the
            |    // call's `T` to `Nothing` (the val's expected type
            |    // only bounds it from above); the rewriter recovers
            |    // the val's declared `Q` as the expected type, so
@@ -6618,7 +6298,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
 
   @Test def closureFormSeesPathDependentTypeOnOuterVal =
     // Path-dependent type whose path is a session-level val rather
-    // than a sibling binding: the rendered string keeps the
+    // than another local binding: the rendered string keeps the
     // user-visible path (`h.T`), with the REPL wrapper prefix
     // omitted by the printer.
     initially {
@@ -6680,10 +6360,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
     }
 
   @Test def evalSafeAgentRetryLoop =
-    // The motivating use case: an agent generates code, the eval
-    // fails to compile, the agent inspects the error and generates
-    // again. Modeled here with two attempts, the first deliberately
-    // bad and the second corrected.
+    // A caller can inspect a failed attempt and submit corrected code.
     initially {
       run(
         """|import dotty.tools.eval.EvalContext
@@ -6696,7 +6373,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
            |val r2 =
            |  if r.isSuccess then r
            |  else
-           |    // "agent" retries, having seen the error.
+           |    // Retry after inspecting the first error.
            |    val errMsg = r.error.nn.errors.mkString("|")
            |    println(s"retrying after: ${errMsg.split('\n').head}")
            |    evalSafe[Int] { (ctx: EvalContext) =>
@@ -6737,9 +6414,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
     // failure surfaces as a thrown EvalCompileException at runtime
     // (that's the body's runtime exception, not the outer's compile
     // state). evalSafe must propagate it, not wrap it as
-    // `EvalResult.failure` (which would tell the agent "your outer
-    // code didn't compile" when in fact the outer did and the body
-    // crashed).
+    // `EvalResult.failure`, because the outer source compiled successfully.
     initially {
       run(
         """|val outcome =
@@ -6755,10 +6430,7 @@ class DynamicEvalAgentApiTests extends ReplTest:
     }
 
   @Test def evalSafeCapturesOwnCompileFailure =
-    // Sanity check on the other side: a real outer-compile error
-    // (here, a body that references an undefined symbol with no
-    // nesting involved) IS captured by evalSafe, since it is the
-    // outer call's own compile state.
+    // An error in this call's own body is represented by EvalResult.Failure.
     initially {
       run(
         """|val r = evalSafe[Int]("undefinedTopLevel + 1")
@@ -6768,16 +6440,8 @@ class DynamicEvalAgentApiTests extends ReplTest:
     }
 
   @Test def closureFormInNestedEvalSeesChainedContext =
-    // Inside an outer eval's body, a nested eval can also use the
-    // closure form. The runtime nested-eval rewriter (rewriteCode in
-    // Eval.scala) composes the inner enclosingSource so it includes
-    // the outer's enclosing-source plus the outer body wrapper. The
-    // inner closure should see the full chain (containing the outer
-    // def signature and the outer `({ ... })` wrapper) plus all the
-    // bindings the outer captured. The test avoids `s"..."`
-    // interpolation inside the inner body string because the
-    // rewriter's pretty-printer does not always round-trip those
-    // (see EVAL.md "Pretty-printer round-trip in nested eval").
+    // The inner closure sees the enclosing def, the outer body, and all
+    // bindings captured along that chain.
     initially {
       val q3 = "\"\"\""
       val innerBody =
@@ -6844,21 +6508,8 @@ class DynamicEvalAgentApiTests extends ReplTest:
     }
 
   @Test def closureFormInNestedEvalSeesOuterBodyValAndChainedSource =
-    // Models the user's nested-agent retry scenario:
-    //   def f(i: Int) = eval(...)
-    // where the outer eval's generated body itself declares `val x`
-    // and then contains a nested eval. The runtime nested-eval
-    // rewriter must:
-    //   * inject BOTH `i` (outer) and `x` (outer-body local) as
-    //     bindings on the inner call.
-    //   * splice the outer body (with the inner call's location
-    //     replaced by a marker) into the outer enclosingSource's
-    //     marker slot, so the inner closure sees the full chain
-    //     `def f(i: Int) = ({ val x = ...; __placeholder__ })`.
-    //   * let the inner body reference both `x` and `i` so the
-    //     wrapper signature has both as parameters.
-    // String-interpolation in the inner body is avoided per the
-    // existing test's comment about the pretty-printer round-trip.
+    // The inner call captures both the original method parameter and a val
+    // introduced by the outer body, and its source contains the full chain.
     initially {
       val q3 = "\"\"\""
       val innerBody =
@@ -6898,14 +6549,13 @@ end DynamicEvalAgentApiTests
  *      location replaced by a placeholder.
  *    - `eval_<timestamp>_code.scala`: the body string the user
  *      submitted to `eval(...)`.
- *    - `eval_<timestamp>_wrapper.scala`: a pretty-printed snapshot of
- *      the unit *after* the V2 pipeline finishes (splice + extract +
- *      resolve), so the user can see what actually runs: the
- *      synthesised `__EvalSafeExpression` class with the body lowered
+ *    - `eval_<timestamp>_wrapper.scala`: a printed snapshot after body
+ *      splicing, extraction, and access resolution. It contains the
+ *      synthesized expression class with the body lowered
  *      to reflective accessor calls (`getValue("i")`, `__refl_get__`,
  *      etc.) inside `evaluate()`.
  *    - `eval_<timestamp>_error.scala`: only on a compile failure;
- *      carries the diagnostic text and the synthesised source the
+ *      carries the diagnostic text and the synthesized source the
  *      eval driver was trying to compile.
  */
 class DynamicEvalLogTests extends ReplTest(
@@ -6917,7 +6567,6 @@ class DynamicEvalLogTests extends ReplTest(
 
   @Test def writesEnclosingSourceCodeAndWrapperOnSuccess =
     initially {
-      // Clean slate before this test.
       clearLogDir()
       run("""|def f(i: Int, j: Int): Int = eval[Int]("i + j")
              |f(10, 32)""".stripMargin)
@@ -6940,7 +6589,7 @@ class DynamicEvalLogTests extends ReplTest(
         encContent.contains("__evalBodyPlaceholder"))
       assertTrue(s"code should be the body string: $codeContent",
         codeContent.trim == "i + j")
-      // The synthesised wrapper module is dropped by `ExtractEvalBody`
+      // The synthesized wrapper module is dropped by `ExtractEvalBody`
       // when its body has no nested classes, so the post-resolve
       // snapshot only carries the `__EvalExpression` class. (When the
       // user's enclosing source contains a `class`/`object`, the
@@ -6949,7 +6598,7 @@ class DynamicEvalLogTests extends ReplTest(
       // trigger that path.)
       assertTrue(s"wrapper log should NOT contain the dropped __EvalWrapper module: $wrapperContent",
         !wrapperContent.contains("__EvalWrapper"))
-      assertTrue(s"wrapper should contain the synthesised __Expression class: $wrapperContent",
+      assertTrue(s"wrapper should contain the synthesized __Expression class: $wrapperContent",
         wrapperContent.contains("__EvalExpression"))
       assertTrue(s"wrapper should contain `evaluate` with the lowered body: $wrapperContent",
         wrapperContent.contains("def evaluate"))
@@ -6995,4 +6644,4 @@ object DynamicEvalLogTests:
 
   def readLog(name: String): String =
     val path = new java.io.File(tempDir, name).toPath
-    new String(java.nio.file.Files.readAllBytes(path))
+    java.nio.file.Files.readString(path, java.nio.charset.StandardCharsets.UTF_8)

@@ -111,6 +111,7 @@ scaladoc/output/
 
 __pycache__/
 
+# Local dynamic-eval artifacts
 log/
 session.repl
 runs/

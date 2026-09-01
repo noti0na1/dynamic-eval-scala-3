@@ -8,14 +8,8 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import scala.util.control.NonFatal
 
-/** Pretty-prints the post-[[ResolveEvalAccess]] tree to
- *  `eval_<timestamp>_wrapper.scala` under `-Xrepl-eval-log-dir`. The
- *  snapshot captures the executed shape — `__Expression.evaluate`
- *  with every `reflectEval` placeholder lowered to `getValue` /
- *  `callMethod` / `getField` / etc.
- *
- *  [[EvalCompiler]] only inserts this phase when the log dir and
- *  timestamp are both set.
+/** Writes the tree after [[ResolveEvalAccess]] to the configured wrapper log.
+ *  [[EvalCompiler]] inserts this phase only when logging is enabled.
  */
 private[eval] class LogExecutedTree(config: EvalCompilerConfig) extends Phase:
 
@@ -32,8 +26,7 @@ private[eval] class LogExecutedTree(config: EvalCompilerConfig) extends Phase:
       if parent != null then parent.mkdirs()
       Files.write(target.toPath, rendered.getBytes(StandardCharsets.UTF_8))
     catch case NonFatal(e) =>
-      // The user explicitly opted into logging; mirror the runtime
-      // log writer and say why the wrapper file is missing.
+      // Logging is optional, so report the failure without failing evaluation.
       System.err.println(
         s"[eval] WARNING: failed to write $target: " +
         s"${e.getClass.getSimpleName}: ${e.getMessage}")

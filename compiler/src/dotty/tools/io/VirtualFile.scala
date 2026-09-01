@@ -6,7 +6,7 @@
 package dotty.tools.io
 
 import java.io.{ByteArrayInputStream, ByteArrayOutputStream, InputStream, OutputStream}
-import java.net.{URI, URL}
+import java.net.URL
 
 /** This class implements an in-memory file.
  *
@@ -28,9 +28,9 @@ class VirtualFile(
   private var content = initialContents
 
   override val name: String =
-    // VirtualDirectory always joins a child with `/`. Peel that leaf before
-    // handling standalone fake names such as `<example>`, whose parent path
-    // might not be accepted by the host platform's Path implementation.
+    // VirtualDirectory uses `/` even when its name is a virtual path such as
+    // `<output>`, which the host Path implementation may reject. Extract the
+    // leaf without asking the host file system to parse that parent path.
     val lastSlash = path.lastIndexOf('/')
     if lastSlash >= 0 && lastSlash < path.length - 1 then
       path.substring(lastSlash + 1)

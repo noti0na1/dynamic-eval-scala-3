@@ -4,47 +4,29 @@ package eval
 import dotty.tools.dotc.core.Symbols.*
 import dotty.tools.dotc.util.Property.StickyKey
 
-/** Strategy attached to each `reflectEval(...)` placeholder by
- *  [[ExtractEvalBody]] and consumed by [[ResolveEvalAccess]], which
- *  lowers the placeholder into the matching reflective accessor call
- *  on `__Expression`. Mirrors `dotty.tools.debug.ReflectEvalStrategy`,
- *  minus that enum's by-name flags: extract runs after `ElimByName`,
- *  so by-name values are already ordinary function values there and
- *  an `ExprType` can no longer occur.
+/** Describes how [[ResolveEvalAccess]] should lower a `reflectEval` placeholder
+ *  inserted by [[ExtractEvalBody]]. By-name flags from the debugger equivalent
+ *  are unnecessary because extraction runs after `ElimByName`.
  */
 private[eval] enum ReflectEvalStrategy:
   case This(cls: ClassSymbol)
   case LocalValue(variable: TermSymbol)
   case LocalValueAssign(variable: TermSymbol)
   case MethodCapture(method: TermSymbol)
-  /** `useReceiverClass`: lower className to "" so the runtime helper
-   *  walks `obj.getClass` instead of the wrapper's encoded enclosing
-   *  class. Set when the field's class was term-owned at extract time;
-   *  by the time ResolveEvalAccess runs, LambdaLift has flattened the
-   *  owner to the package, so we can no longer detect this from the
-   *  symbol; the flag must be precomputed here.
+  /** `useReceiverClass` selects the receiver's runtime class instead of the
+   *  encoded owner. Extraction records it before LambdaLift flattens owners.
    */
   case Field(field: TermSymbol, useReceiverClass: Boolean = false)
   case FieldAssign(field: TermSymbol, useReceiverClass: Boolean = false)
   case MethodCall(method: TermSymbol, useReceiverClass: Boolean = false)
-  /** Construct an instance of a *linked* local class by applying the
-   *  call-site factory closure stored under `bindingName`
-   *  (`__evalNew_<C>__$<i>`). The factory closes over the class's
-   *  captured environment, so the instance belongs to the *original*
-   *  lifted class rather than the wrapper's re-elaborated copy.
+  /** Constructs a linked local class through its captured factory, producing
+   *  an instance of the original class rather than the wrapper's copy.
    */
   case ConstructLocal(bindingName: String)
-  /** `new Array[…[C]…](n)` (`dims` dimensions) where `C` is a linked
-   *  local class: lower to the reflective `newLinkedArray` helper,
-   *  so the array's runtime component class is the *original* lifted
-   *  class rather than the wrapper's re-elaborated copy.
+  /** Allocates an array whose ultimate component is the original linked class.
    */
   case NewLinkedArray(sourceName: String, dims: Int)
-  /** Read a synthetic binding by its exact name: a linked module
-   *  instance (`__evalModule_<M>__`), an enclosing instance
-   *  (`__this__<C>`), or the non-local-return key
-   *  (`__evalReturnKey__`).
-   */
+  /** Reads a compiler-generated binding by its exact name. */
   case BindingValue(bindingName: String)
 
 private[eval] object ReflectEvalStrategy extends StickyKey[ReflectEvalStrategy]

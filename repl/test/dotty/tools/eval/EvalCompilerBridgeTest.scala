@@ -7,20 +7,8 @@ import org.junit.Assert.*
 import java.net.URLClassLoader
 import java.nio.file.{Files, Path}
 
-/** Tests for the eval pipeline.
- *
- *  Phase 1 covers splice mechanics: the wrapped enclosing source
- *  compiles successfully when the marker is replaced by the spliced
- *  body block, and both the enclosing class and the synthesised
- *  `__Expression` class produce `.class` files.
- *
- *  Phase 2 covers extract mechanics: the spliced body's typed rhs is
- *  drained from `val __evalResult` and installed as the rhs of
- *  `__Expression.evaluate`. End-to-end tests load the synthesised
- *  class and invoke `evaluate()` to verify the body runs and returns
- *  the expected value. Phase 2 only handles bodies whose references
- *  are body-local or globally-static — outer captures fail-fast as
- *  compile errors.
+/** Direct tests for body splicing, extraction into `__Expression.evaluate`,
+ *  and lowering of captured access through the eval compiler bridge.
  */
 class EvalCompilerBridgeTest:
 
@@ -40,7 +28,7 @@ class EvalCompilerBridgeTest:
   )
 
   /** `declaredBindings` mirrors the production contract: the adapter
-   *  always fills `initialScope` with the names of the bindings the
+   *  always fills `initialBindingNames` with the names of the bindings the
    *  call site captured, and the extract phase gates synthetic-name
    *  reads (`__this__<C>`, `__evalNew_<C>__$i`, ...) on those names
    *  being present. Tests that pass such bindings to `invoke` must
@@ -49,7 +37,7 @@ class EvalCompilerBridgeTest:
   private def runSplice(
       body: String,
       enclosing: String,
-      declaredBindings: Array[(String, Boolean)] = Array.empty
+      declaredBindings: Array[String] = Array.empty
   ): SpliceResult =
     val outputDir = Files.createTempDirectory("eval-test-")
     val sourceFile = Files.createTempFile("eval-enclosing-", ".scala")
@@ -61,7 +49,7 @@ class EvalCompilerBridgeTest:
       body = body,
       testMode = true,
       errorReporter = s => errors.append(s).append('\n'),
-      initialScope = declaredBindings
+      initialBindingNames = declaredBindings
     )
     val ok = EvalCompilerBridge().run(outputDir, testClassPath, Array.empty, sourceFile, config)
     SpliceResult(outputDir, sourceFile, outputClassName, ok, errors.toString)
@@ -71,11 +59,8 @@ class EvalCompilerBridgeTest:
    *  (`Eval.Binding`, `Eval.VarRef`) resolve to the same `Class`
    *  objects on both sides of the loader boundary.
    *
-   *  Returning the loader (rather than a one-shot class lookup) lets
-   *  callers load multiple classes from the same loader so they
-   *  share `Class` objects — critical when a Phase 5 test wants to
-   *  pass a `Holder`-style instance as `thisObject` and have
-   *  `asInstanceOf[Holder]` succeed inside `__Expression.evaluate`.
+   *  Returning the loader lets callers load the expression and its
+   *  enclosing classes with shared JVM identity.
    */
   private def newLoader(outputDir: Path): URLClassLoader =
     val parent = classOf[EvalCompilerBridgeTest].getClassLoader
@@ -83,7 +68,7 @@ class EvalCompilerBridgeTest:
 
   /** Result of running splice + extract + resolve: a freshly loaded
    *  `__Expression` class plus the loader that produced it, so a test
-   *  can load sibling classes (a captured `this`'s enclosing class)
+   *  can load related classes (such as a captured `this`'s class)
    *  through the *same* loader.
    */
   private case class Loaded(loader: URLClassLoader, exprClass: Class[?])
@@ -92,10 +77,7 @@ class EvalCompilerBridgeTest:
     val cl = newLoader(outputDir)
     Loaded(cl, cl.loadClass(outputClassName))
 
-  /** Instantiate `__Expression` and call its `evaluate()`. The
-   *  optional `thisObject` is passed through to the synthesised
-   *  constructor (Phase 5 onwards uses it for `getThisObject`).
-   */
+  /** Instantiate `__Expression` and call its `evaluate()`. */
   private def invoke(
       loaded: Loaded,
       bindings: Array[Eval.Binding],
@@ -106,9 +88,7 @@ class EvalCompilerBridgeTest:
     val evaluate = loaded.exprClass.getMethod("evaluate")
     evaluate.invoke(instance)
 
-  /** Convenience for the common path: load + invoke with a default
-   *  null thisObject. Phase 1 - 4 tests use this form.
-   */
+  /** Convenience for loading and invoking with a default null `thisObject`. */
   private def loadAndInvoke(
       outputDir: Path,
       outputClassName: String,
@@ -118,7 +98,7 @@ class EvalCompilerBridgeTest:
     invoke(loadExpression(outputDir, outputClassName), bindings, thisObject)
 
   // ===========================================================================
-  // Phase 1: splice mechanics
+  // Splice mechanics
   // ===========================================================================
 
   @Test def splicesIntoExpressionContext(): Unit =
@@ -167,7 +147,7 @@ class EvalCompilerBridgeTest:
     assertTrue(s"expected marker error, got:\n${r.errors}", r.errors.contains("not found"))
 
   // ===========================================================================
-  // Phase 2: extract mechanics — load __Expression and invoke evaluate()
+  // Extraction: load __Expression and invoke evaluate()
   // ===========================================================================
 
   /** Convenience: splice + assert compile success + return loadable result. */
@@ -262,11 +242,6 @@ class EvalCompilerBridgeTest:
     val result = evalNoCaptures(body = "42.toString", enclosing = enclosing)
     assertEquals("42", result)
 
-  // Originally deferred (task #8). The body chains a static-module
-  // call (`List(1,2,3)`), a member access (`.sum`), and an implicit
-  // Numeric witness expansion. All pieces should be globally
-  // accessible — re-enabled now to verify the Select handling does
-  // the right thing through the implicit-witness layers.
   @Test def evaluatesGloballyAccessibleCalls(): Unit =
     val enclosing =
       s"""object PhaseTwoGlobal {
@@ -277,8 +252,7 @@ class EvalCompilerBridgeTest:
     assertEquals(java.lang.Integer.valueOf(6), result)
 
   // ===========================================================================
-  // Phase 3: LocalValue strategy — outer method params and method-locals
-  //          captured via getValue("name") + asInstanceOf cast.
+  // LocalValue: outer method parameters and locals
   // ===========================================================================
 
   /** Run the splice + load + invoke flow with a single Int binding. */
@@ -360,9 +334,7 @@ class EvalCompilerBridgeTest:
     assertEquals(java.lang.Integer.valueOf(11), result)
 
   // ===========================================================================
-  // Phase 5: This strategy — captured outer `this` for class-member access.
-  //          (Outer-chain navigation, Field/MethodCall for inaccessible
-  //          members, ClassCapture, etc. arrive in a follow-up phase.)
+  // Captured `this` for class-member access
   // ===========================================================================
 
   /** Run splice + extract + resolve, load both the enclosing class
@@ -431,7 +403,7 @@ class EvalCompilerBridgeTest:
     assertEquals(java.lang.Integer.valueOf(42), result)
 
   // ===========================================================================
-  // Phase 5b: Outer-instance access for nested-class eval bodies. The
+  // Outer-instance access for nested-class eval bodies. The
   // immediate `this` arrives as the constructor's thisObject; an
   // *outer* enclosing instance is read from the `__this__<ClassName>`
   // binding the rewriter captures at the call site (a `$outer` field
@@ -459,7 +431,7 @@ class EvalCompilerBridgeTest:
          |}
          |""".stripMargin
     val r = runSplice(body = "outerVal + 1", enclosing = enclosing,
-      declaredBindings = Array(("__this__PhaseFiveBOuter", false)))
+      declaredBindings = Array("__this__PhaseFiveBOuter"))
     assertTrue(s"compile failed:\n${r.errors}", r.ok)
     val loaded = loadExpression(r.outputDir, r.outputClassName)
     val (outer, inner) = newOuterAndInner(loaded.loader, "PhaseFiveBOuter", "PhaseFiveBOuter$Inner")
@@ -475,7 +447,7 @@ class EvalCompilerBridgeTest:
          |}
          |""".stripMargin
     val r = runSplice(body = "factor * 7", enclosing = enclosing,
-      declaredBindings = Array(("__this__PhaseFiveBOuterMethod", false)))
+      declaredBindings = Array("__this__PhaseFiveBOuterMethod"))
     assertTrue(s"compile failed:\n${r.errors}", r.ok)
     val loaded = loadExpression(r.outputDir, r.outputClassName)
     val (outer, inner) = newOuterAndInner(loaded.loader, "PhaseFiveBOuterMethod", "PhaseFiveBOuterMethod$Inner")
@@ -497,7 +469,7 @@ class EvalCompilerBridgeTest:
          |}
          |""".stripMargin
     val r = runSplice(body = "outerVal + innerVal", enclosing = enclosing,
-      declaredBindings = Array(("__this__PhaseFiveBMix", false)))
+      declaredBindings = Array("__this__PhaseFiveBMix"))
     assertTrue(s"compile failed:\n${r.errors}", r.ok)
     val loaded = loadExpression(r.outputDir, r.outputClassName)
     val (outer, inner) = newOuterAndInner(loaded.loader, "PhaseFiveBMix", "PhaseFiveBMix$Inner")
@@ -506,16 +478,14 @@ class EvalCompilerBridgeTest:
     assertEquals(java.lang.Integer.valueOf(42), result)
 
   // ===========================================================================
-  // Phase 5c: Field/FieldAssign/MethodCall for inaccessible (private)
-  //           members. Reflectively access private fields/methods that
-  //           a direct getfield/invokevirtual would reject at JVM link.
+  // Reflective access to private fields and methods
   // ===========================================================================
 
   @Test def evaluatesPrivateValRead(): Unit =
     // Read a private val. The val is referenced by a public `peek`
     // method too — without that, ExtractEvalBody drains the eval
     // body's reference to `secret`, leaving the val apparently-unused
-    // from the typed-tree perspective, and Scala 3's optimiser
+    // from the typed-tree perspective, and Scala 3's optimizer
     // elides the backing field entirely. With the extra accessor, the
     // field stays around for our reflective lookup.
     val enclosing =
@@ -535,7 +505,7 @@ class EvalCompilerBridgeTest:
 
   @Test def evaluatesPrivateVarWrite(): Unit =
     // `private var` always emits a field (vars are mutable so the
-    // optimiser can't fold them away), and `get` keeps reads alive.
+    // optimizer can't fold them away), and `get` keeps reads alive.
     val enclosing =
       s"""class PhaseFiveCPrivVar {
          |  private var counter: Int = 0
@@ -580,7 +550,7 @@ class EvalCompilerBridgeTest:
     assertEquals(java.lang.Integer.valueOf(42), result)
 
   // ===========================================================================
-  // Phase 4: LocalValueAssign + var captures via VarRef
+  // LocalValueAssign and var captures through VarRef
   // ===========================================================================
 
   /** Mutable Int cell wrapped in an [[Eval.VarRef]] so the captured
@@ -676,15 +646,10 @@ class EvalCompilerBridgeTest:
     assertEquals(35, totalRef.current)
 
   // ===========================================================================
-  // Phase 6: Captured local-class instance access via reflective dispatch.
-  //          A class declared inside a method has a term-owned symbol; the
-  //          wrapper compile re-elaborates it as a fresh JVM class, so a
-  //          binding whose runtime class is the *original* (different JVM
-  //          class with same shape) cannot be reached via direct getfield/
-  //          invokevirtual. ExtractEvalBody routes such accesses through
-  //          the reflective `getField` / `callMethod` helpers, which use
-  //          `obj.getClass` rather than the wrapper's symbol-derived JVM
-  //          name.
+  // Captured local-class instance access via reflective dispatch.
+  // A class declared inside a method is re-elaborated as a fresh JVM class in
+  // the wrapper. Access to an instance of the original class is therefore
+  // routed through reflection on `obj.getClass`.
   // ===========================================================================
 
   @Test def evaluatesCapturedLocalClassFieldRead(): Unit =
@@ -715,8 +680,8 @@ class EvalCompilerBridgeTest:
     assertEquals(java.lang.Integer.valueOf(43), result)
 
   @Test def evaluatesCapturedLocalClassMethodCall(): Unit =
-    // Same shape but the body calls a method (`describe`) rather
-    // than a val. Method calls go through the same reflective
+    // The body calls a method (`describe`) rather than reading a val.
+    // Method calls go through the same reflective
     // dispatch path with `useReceiverClass = true`.
     val enclosing =
       s"""object PhaseSixLocalClassMethod {
@@ -810,7 +775,7 @@ class EvalCompilerBridgeTest:
   @Test def evaluatesCapturedLocalClassWithCapturedFreeVar(): Unit =
     // The local class `Counter` closes over `n` from its enclosing
     // method. The runtime instance carries `n` in its own field
-    // (via the synthesised `$outer` chain or a captured-var box),
+    // (via the synthesized `$outer` chain or a captured-var box),
     // so reflective dispatch on `obj.getClass` reaches the right
     // captured state — the wrapper's `Counter` symbol is irrelevant.
     val enclosing =
@@ -874,10 +839,7 @@ class EvalCompilerBridgeTest:
 
   @Test def evaluatesBodyLocalNewExpressionOfLocalClass(): Unit =
     // Construct via `new C(...)` instead of `C(...)`. The `new` form
-    // bypasses the companion's lazy-ref (no `apply` call through
-    // `C$lzy1.get.apply(...)`), so LambdaLift's proxy-chain issue
-    // doesn't bite. The plain-`C(8)` apply form still fails — see
-    // the TODO below.
+    // exercises the constructor path without involving a companion.
     val enclosing =
       s"""object PhaseSixBodyLocalNew {
          |  def f(): Int = {
@@ -892,25 +854,9 @@ class EvalCompilerBridgeTest:
     val result = loadAndInvoke(r.outputDir, r.outputClassName)
     assertEquals(java.lang.Integer.valueOf(9), result)
 
-  /* TODO: body-local construction via the case-class apply form —
-   *   `case class C(i: Int); eval[Int]("C(8).i + 1")` — currently
-   *   fails at LambdaLift with "Could not find proxy for lazy var
-   *   C$lzy1". The body's `Ident(C)` references the companion's
-   *   lazy-ref, which is owned by `f`; once ExtractEvalBody moves
-   *   the body into `__Expression.evaluate`, LambdaLift's proxy
-   *   chain for the lazy ref breaks because `evaluate` isn't
-   *   reachable along `f`'s call chain. The `new C(...)` form works
-   *   today (see `evaluatesBodyLocalNewExpressionOfLocalClass`); the
-   *   apply form would need either (a) reflective companion-module
-   *   lookup at runtime, or (b) eagerly hoisting the local class
-   *   in the wrapper compile so the companion is top-level. Captured-
-   *   instance access (the `evaluatesCapturedLocalClass*` tests) is
-   *   the primary use case and already works.
-   */
-
   // ===========================================================================
-  // Phase 7: behavioural tests for tuples, named tuples, type aliases,
-  //          type members, self types, and path-dependent inner classes.
+  // Tuples, named tuples, type aliases, type members, self types, and
+  // path-dependent inner classes.
   // ===========================================================================
 
   @Test def evaluatesTupleConstructionAndDestructuring(): Unit =
@@ -945,7 +891,7 @@ class EvalCompilerBridgeTest:
 
   @Test def evaluatesGlobalTypeAliasNoEffect(): Unit =
     // A top-level type alias `type IntPair = (Int, Int)` shouldn't
-    // change behaviour — the alias dealiases to the underlying tuple
+    // change behavior — the alias dealiases to the underlying tuple
     // type and reflective access stays on the tuple's JVM class.
     val enclosing =
       s"""object PhaseSevenAliasGlobal {
@@ -1048,16 +994,14 @@ class EvalCompilerBridgeTest:
     assertEquals("Hi, World!", result)
 
   // ===========================================================================
-  // Phase 8: behavioural tests for inline def, match types, and other
-  //          type-level features. None of these should affect the
-  //          reflective-dispatch / capture pipeline; the tests document
-  //          that the eval driver is transparent to them.
+  // Inline defs, match types, and other type-level features. The eval driver
+  // should be transparent to them.
   // ===========================================================================
 
   @Test def evaluatesInlineDefDeclaredInBody(): Unit =
     // `inline def` declared inside the eval body itself. The inline
     // expansion happens during the wrapper compile (the body is
-    // typed there), so the call is materialised before the body
+    // typed there), so the call is materialized before the body
     // becomes `__Expression.evaluate`'s rhs.
     val enclosing =
       s"""object PhaseEightInlineBody {
@@ -1110,4 +1054,3 @@ class EvalCompilerBridgeTest:
     assertTrue(s"compile failed:\n${r.errors}", r.ok)
     val result = loadAndInvoke(r.outputDir, r.outputClassName)
     assertEquals(java.lang.Character.valueOf('h'), result)
-

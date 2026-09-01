@@ -1,7 +1,7 @@
 # Dynamic `eval` in Scala 3
 
-`eval[T](code: String): T` compiles and runs an arbitrary string of
-Scala source at runtime against the live program, returning a value
+`eval[T](code: String): T` compiles and runs a string of Scala source
+at runtime against the live program, returning a value
 typed as `T`. It works in the REPL out of the box, and in any Scala
 program compiled with `-Xdynamic-eval`.
 
@@ -20,8 +20,13 @@ computable at runtime. Identifiers in scope at the call site
 definitions, class members) are visible inside the body by their
 source name.
 
+The string must contain Scala source, not an interactive REPL
+meta-command. Command-shaped input such as `:reset`, `:jar`, `:dep`,
+or `:load` is rejected before it reaches the eval adapter; use the
+REPL prompt itself when an interactive command is intended.
+
 A companion primitive, `topLevel(defs)`, compiles *definitions*
-once at the top level of the current package and returns a handle
+once against the call site's global context and returns a handle
 whose `eval` runs expressions against them at any later call
 site's local context, with state shared across calls (see
 "Top-level definitions" below).
@@ -32,7 +37,7 @@ From a checkout of this repo, the fastest loop is the quick build
 plus the in-tree launcher scripts:
 
 ```
-sbt buildQuick     # compile the compiler + REPL, write bin/.cp
+sbt --client buildQuick  # compile the compiler + REPL, write bin/.cp
 bin/replQ          # start the REPL; eval is built in, no flag needed
 
 scala> eval[Int]("6 * 7")
@@ -47,6 +52,32 @@ be on the runtime classpath for the inner compiles):
 bin/scalacQ -Xdynamic-eval -d out Square.scala
 java -cp "$(cat bin/.cp):out" Main
 ```
+
+### Scala CLI
+
+To use this compiler from a Scala CLI REPL, first publish the bootstrapped
+snapshot to the local repository:
+
+```bash
+sbt --client scala3-bootstrapped/publishLocalBin
+```
+
+Create a source file such as `eval-repl.scala` that selects the published
+version:
+
+```scala
+//> using scala 3.10.0-RC1-bin-SNAPSHOT
+```
+
+Then start Scala CLI without the compilation server, passing that file so the
+directive is applied when the REPL starts:
+
+```bash
+scala-cli repl --server=false eval-repl.scala
+```
+
+The resulting REPL includes the built-in `eval`, `evalSafe`, `topLevel`, and
+`topLevelSafe` entry points.
 
 A full distribution (`sbt dist/Universal/packageBin`, output under
 `dist/target/`) works the same way through its `bin/scala` and
@@ -82,20 +113,20 @@ Two pieces make this work:
    call site's package, and an `import <Obj>.{given, *}` for an
    enclosing top-level object. That last import is the standalone
    analogue of the REPL's `import rs$line$N.{given, *}` session
-   imports: sibling members resolve against the *runtime* module on
+   imports: other members resolve against the *runtime* module on
    the classpath, so reads and writes hit live state.
 
 2. **Run time.** With no REPL driver installed, `Eval` falls back to
-   a self-initialising standalone adapter. It compiles the body with
-   a classpath synthesised from the calling frame's classloader plus
+   a self-initializing standalone adapter. It compiles the body with
+   a classpath synthesized from the calling frame's classloader plus
    `java.class.path`, and loads the result next to the program's own
    classes. Optional system properties tune it:
 
    | Property                    | Meaning                                                            |
    |-----------------------------|--------------------------------------------------------------------|
    | `dotty.tools.eval.settings` | whitespace-separated compiler options for the body compile (pass the language options the program was compiled with, e.g. `-Yexplicit-nulls`) |
-   | `dotty.tools.eval.classpath`| explicit classpath for the body compile (overrides the synthesised one) |
-   | `dotty.tools.eval.logDir`   | per-invocation log directory (same files as `-Xrepl-eval-log-dir`) |
+   | `dotty.tools.eval.classpath`| explicit classpath for the body compile (overrides the synthesized one) |
+   | `dotty.tools.eval.logDir`   | per-compilation log directory (same files as `-Xrepl-eval-log-dir`; cache hits write nothing) |
 
 Without `-Xdynamic-eval` the call still compiles (it is an ordinary
 method call), but the rewriter never runs: the body is compiled in
@@ -123,7 +154,7 @@ wraps every eval call that sits directly inside a method in a
 binding, and the body's `return` compiles to an `EvalNonLocalReturn`
 control throw that the call-site catch turns back into a real
 `return`. A `return` at a position where source code couldn't return
-either (top level, inside a lambda) is still rejected with the
+either (at the top level or inside a lambda) is still rejected with the
 standard diagnostic. One visible seam remains: because the return
 travels as a control exception, a body's own catch-all handler
 (`catch case _: Throwable`) intercepts it, where source code at
@@ -149,20 +180,29 @@ context parameter. A body reference that still cannot link (for
 example a by-name argument proxy of an inline call) is rejected with
 a diagnostic at body-compile time rather than failing at runtime.
 
-Other diagnosed limitations: a class declared in the body cannot
-*extend* a method-local class of the call site (rejected with a
-diagnostic;
-the subclass's `super.<init>` cannot be routed through the
-call-site factory closure), and an eval call written inside an
-`inline def` warns that expansion sites will see the unrewritten
-call (the inline body is recorded before the rewriter runs). In the
-REPL, an eval body that names a session val *redefined* on a later
-line fails with an ambiguity error: the wrapper compile sees the
-session lines as same-scope wildcard imports, which do not shadow
-each other the way the REPL's own nested line contexts do. The one
-remaining narrow edge around linked local classes (two same-named
-local classes resolving innermost-wins) is listed at the end of
-`EVAL-BINDINGS-DESIGN.md`.
+Known limitations:
+
+* A class declared in the body cannot extend a method-local class from the call
+  site. The subclass's `super.<init>` cannot be routed through the captured
+  constructor factory, so the body is rejected with a diagnostic.
+* An eval call written inside an `inline def` is not rewritten at expansion
+  sites because the inline body is recorded before the eval rewriter runs.
+* Overloaded private or protected methods are rejected because reflective
+  invocation cannot preserve the typer's static overload choice. Protected
+  members inherited from a superclass are not currently rerouted after the
+  enclosing method is lifted.
+* After `:settings -d <new-output>` changes the REPL output directory, ordinary
+  REPL code retains earlier definitions through the classloader chain, but
+  dynamic eval and `topLevel` cannot compile against wrappers in the previous
+  output directory.
+* A session val redefined on a later REPL line is ambiguous inside eval because
+  the wrapper sees session lines as same-scope wildcard imports rather than the
+  REPL's nested import contexts.
+* If nested scopes declare same-named local classes and a body refers to the
+  outer class, the innermost class still wins in the bindings array.
+* `__evalBodyPlaceholder__` is reserved within an enclosing statement. Nested
+  eval composition also rejects additional occurrences of that marker text
+  when it cannot identify a unique splice location.
 
 ## The idea
 
@@ -236,7 +276,7 @@ val res1: List[Int] = List(4, 6, 6)
 `x` from the inner lambda, `xs` from the outer lambda, and `i`
 from a previous REPL line all resolve inside the body string. The
 eval driver does *not* compile the body in isolation. It compiles
-the body *spliced back into the source of the enclosing top level
+the body *spliced back into the source of the enclosing top-level
 statement*, with the eval call's location replaced by the body.
 The compiler sees the original method's signature, its parameters,
 the enclosing class, the nearby imports. The body resolves
@@ -246,8 +286,8 @@ exactly as if the user had written the expression in place.
 ## Top-level definitions: `topLevel`
 
 `eval` fills a hole at an *expression* position. Its companion
-primitive fills the other kind of hole a program has: definitions
-at the top level of the current package.
+primitive supplies reusable definitions compiled against the call
+site's global context.
 
 ```scala
 scala> val h = topLevel("def f[T](x: List[T]): T = x.head")
@@ -274,6 +314,13 @@ by construction rather than by a checker:
   functions. In the example above, `f`'s type parameter
   instantiates from the lambda parameter `z`, a value the defs
   compile could never name.
+
+In standalone programs, the global context is reconstructed with
+imports rather than by placing the generated object in the caller's
+physical package. Package members are visible, but package-qualified
+privacy is not reproduced. Leading imports in `defs` must currently
+occupy complete lines; split a multiline import into single-line
+imports before calling `topLevel`.
 
 "Like a global function" pins the name-resolution order. A
 call-site local shadows a same-named handle def; a handle def
@@ -356,8 +403,9 @@ to downstream tasks.
 Both forms work in ordinary programs under `-Xdynamic-eval` too.
 There the rewriter supplies the `topLevel` call site's file-level
 import header (top-level imports, the package import, the
-enclosing-object import), so the defs see the package exactly the
-way top-level code in that file would.
+enclosing-object import), so ordinary package and file-level names
+remain available. This does not reproduce physical package placement
+or package-qualified privacy, as noted above.
 
 ### Mechanism in brief
 
@@ -366,7 +414,7 @@ top-level object and compiles it through the standard pipeline
 (one time, no splice marker). Each subsequent `handle.eval` rides
 the normal eval pipeline with three additions: the handle's output
 directory joins the wrapper compile's classpath, an
-`import <obj>.{given, *}` lands at the top of the synthesised
+`import <obj>.{given, *}` lands at the top of the synthesized
 wrapper object, and the compiled `__Expression` loads through a
 loader that routes the defs' classes to the handle's classloader.
 The import's position is what fixes the resolution order: it sits
@@ -451,7 +499,7 @@ scala> val s = "hello"
 val s: String = "hello"
 
 scala> fs.map(fun => eval[Int](s"$fun(s)"))
-java.lang.RuntimeException: eval failed to compile:
+dotty.tools.eval.EvalCompileException: eval failed to compile:
 Found:    (s : String)
 Required: Int
 
@@ -459,10 +507,8 @@ Generated source:
 import rs$line$1.{given, *}
 import rs$line$2.{given, *}
 ...
-object __EvalWrapper_... {
-  def __run__(`fun`: String): Any = {
-    f(s)
-  }
+object rs$line$...$__EvalWrapper {
+  val result = fs.map(fun => f(s))
 }
 ```
 
@@ -470,7 +516,7 @@ The body composed at runtime, `f(s)`, is not a Scala expression
 the user could have written either: `f` expects an `Int`, `s` is a
 `String`. The wrapper compile sees this and produces the standard
 "Found: String, Required: Int" diagnostic, with the offending
-synthesised source attached so the developer can see what was
+synthesized source attached so the developer can see what was
 actually compiled.
 
 The same applies when the call site pins a stricter `[T]` than the
@@ -478,7 +524,7 @@ body produces:
 
 ```scala
 scala> eval[Int]("\"abc\"")
-java.lang.RuntimeException: eval failed to compile:
+dotty.tools.eval.EvalCompileException: eval failed to compile:
 Found:    ("abc" : String)
 Required: Int
 ```
@@ -501,7 +547,7 @@ def withIO[T](op: IO^ => T): T
 scala> withIO { io =>
      |   eval[() => Unit]("() => println(io)")
      | }
-java.lang.RuntimeException: eval failed to compile:
+dotty.tools.eval.EvalCompileException: eval failed to compile:
 Found:    () ->{io} Unit
 Required: () => Unit
 ```
@@ -540,7 +586,7 @@ ordinary Scala. The wrapper compile sees:
 ```scala
 import rs$line$1.{given, *}
 import rs$line$2.{given, *}
-import dotty.tools.eval.Eval.{eval, evalSafe}
+import dotty.tools.eval.Eval.{eval, evalSafe, topLevel, topLevelSafe}
 
 object __EvalWrapper_<uuid>:
   // exact text of the user's enclosing method, with
@@ -562,9 +608,9 @@ and the user's `eval[T]` call site dictates the expected type.
 
 ### Failures are typed; runtime and compile time stay distinct
 
-Two flavours of failure surface, and they are kept apart deliberately:
+Two flavors of failure surface, and they are kept apart deliberately:
 
-| Flavour                                | Throwing form                           | Non throwing form                |
+| Flavor                                | Throwing form                           | Non throwing form                |
 |----------------------------------------|-----------------------------------------|----------------------------------|
 | *This* call's compile error            | `EvalCompileException(errors, source)`  | `EvalResult.Failure(failure)`    |
 | The body's runtime exception           | propagates as the original exception    | propagates as the same exception |
@@ -576,7 +622,7 @@ EvalCompileException => failure(e)` inside `evalSafe` would
 silently swallow a nested eval failure as if it were the
 surrounding call's. The compile failure is carried as a
 `Left(CompileFailure)` *value* through the `Adapter` boundary so
-the runtime can decide which flavour to surface.
+the runtime can decide which flavor to surface.
 
 ### Iterating with `evalSafe` when the body might be wrong
 
@@ -621,10 +667,8 @@ def adaptiveAgent[T](task: String, maxAttempts: Int = 3): EvalResult[T] =
   EvalResult.Failure(new Eval.CompileFailure(lastErrors, ""))
 ```
 
-This converges in practice because the diagnostics the agent sees
-are the *same* `dotc` diagnostics a developer would see, in the
-*same* lexical context, with the same expected `T`. The error text
-already tells the next attempt what to fix.
+Each retry receives the same `dotc` diagnostics a developer would see in the
+same lexical context and with the same expected `T`.
 
 ### Implementation invariants
 
@@ -648,7 +692,7 @@ says
 > this call alone. If you intended a custom eval generator,
 > annotate the function with `@evalLike` (or `@evalSafeLike`).
 
-The rewriter cannot mis fire on unrelated code that happens to use
+The rewriter cannot misfire on unrelated code that happens to use
 the name `eval`. In the REPL the built-in names (`eval`,
 `evalSafe`, `topLevel`, `topLevelSafe`) come in at root-import
 precedence (like `Predef` members), so a user definition of any of
@@ -661,7 +705,7 @@ arguments are *synthetic*: `bindings`, `expectedType`, and
 If a caller already supplied any of them, the rewriter must not
 silently overwrite it. The rule is:
 
-| State of the three slots                | Rewriter behaviour |
+| State of the three slots                | Rewriter behavior |
 |-----------------------------------------|--------------------|
 | All three are typer supplied defaults   | Fill them          |
 | All three are explicitly supplied       | Leave them alone   |
@@ -674,7 +718,7 @@ forwards them to `Eval.eval`, and the rewriter fills the wrapper's
 call site once without rewriting the inner forward.
 
 **`evalSafe` and `@evalSafeLike` must return `EvalResult[T]`.** The
-non throwing flavour relies on a different verify shape: the inner
+non-throwing flavor relies on a different verify shape: the inner
 verification compile wraps the placeholder in
 `Eval.handleCompileError(...)` so the spliced body's `T` is lifted
 to `EvalResult[T]`. That makes sense only when the surrounding
@@ -682,14 +726,13 @@ call *returns* `EvalResult[T]`. The rewriter checks this on every
 `@evalSafeLike` annotated method and rejects misuse early, with a
 diagnostic that names the actual return type.
 
-**`@caps.assumeSafe` does *not* relax checks on the body.** `object
-Eval` is annotated `@caps.assumeSafe` so safe mode user code can
-call `eval` and `evalSafe`. The annotation only exempts the eval
-driver's *own* surface API from safe mode rejection. The eval
-driver recompiles the body string under the live REPL's flags, so
-a safe mode session still applies safe mode checks to the body
-itself. The annotation does not punch a hole in safe mode; it only
-permits the call to the driver to typecheck.
+**`@caps.assumeSafe` does *not* relax checks on the generated body.**
+`object Eval` is annotated `@caps.assumeSafe` so safe-mode code can
+call `eval` and `evalSafe`. The body is still compiled under the live
+REPL's safe-mode flags. The generator callback itself is ordinary
+host code, however: it runs before the body compile and may inspect
+the runtime values exposed by `EvalContext.bindings`. This API is a
+code-generation boundary, not a sandbox for the generator.
 
 ### Two compile passes, one source of truth
 
@@ -723,7 +766,7 @@ context.
 Most dynamic languages ship `eval` as a built in or near built in.
 Python's `eval` and `exec`, JavaScript's `eval` and `new Function`,
 Ruby's `eval` and `instance_eval`, Lisp's `(eval ...)`. They all
-take a string and run it in some flavour of the surrounding scope.
+take a string and run it in some flavor of the surrounding scope.
 Implementing eval in those languages is comparatively easy: the
 language is already interpreted (or JIT compiled) from a parsed
 AST; the runtime is already prepared for symbols, scopes, and
@@ -832,7 +875,7 @@ scala> eval[Int]("summon[Int] * 6")
 val res3: Int = 42
 ```
 
-`evalSafe` for non throwing use:
+`evalSafe` for non-throwing use:
 
 ```scala
 scala> Eval.evalSafe[Int]("not real code") match
@@ -854,7 +897,7 @@ val res5: Int = 42
 ```
 
 The class method is hoisted out of `Box` for the inner compile so
-the wrapper does not mint a duplicate `Class` for `Box`. References
+the wrapper does not define a duplicate `Class` for `Box`. References
 to `v` are routed through reflection so a `private var` remains
 reachable.
 
@@ -876,7 +919,7 @@ inside `SpliceEvalBody`, so the inner eval's bindings list
 includes both the names already captured by the outer call and any
 new in scope names introduced inside the body.
 
-### An agent that decomposes a task into sub agent calls
+### An agent that decomposes a task into sub-agent calls
 
 `agent[T]` is a user defined `@evalLike` wrapper that asks an LLM
 to fill the placeholder. The same recursive shape lets a single
@@ -969,7 +1012,7 @@ typed tree carries resolved symbols. For every call classified as
 1. Expands a single argument closure form
    (`eval[T]({ ctx => ... })`) to the four argument overload.
 2. Builds an `Array[Eval.Binding]` from the typed scope. The
-   walker maintains a stack of in scope frames as it descends
+   walker maintains a stack of in-scope frames as it descends
    through `Block`, `DefDef`, and `Template` nodes. Bindings come
    in two kinds. *Visible* bindings are user nameable values:
    * block local vals, vars, defs, and givens
@@ -1013,10 +1056,10 @@ typed tree carries resolved symbols. For every call classified as
    passed to a generic method records the method's type variable,
    which resolves to whatever inference settled on. Prototypes
    that don't fully resolve degrade to the empty string; for safe
-   flavour calls the `EvalResult[...]` wrapper is unwrapped first.
-4. Slices the source of the enclosing top level statement,
+   flavor calls the `EvalResult[...]` wrapper is unwrapped first.
+4. Slices the source of the enclosing top-level statement,
    replaces the eval call's span with the placeholder, and stores
-   the result as `enclosingSource`. For safe flavour calls
+   the result as `enclosingSource`. For safe flavor calls
    (`evalSafe` and `@evalSafeLike`) the placeholder is wrapped in
    `Eval.handleCompileError(...)` so the inner verification lifts
    `T` to `EvalResult[T]`.
@@ -1046,11 +1089,11 @@ specific phases on top of the standard chain.
 #### `SpliceEvalBody` (after parser)
 
 Parses the body string, replaces the marker, appends the
-synthesised `__Expression` class to the package, and lifts
+synthesized `__Expression` class to the package, and lifts
 marker-bearing methods out of their enclosing declarations:
 
 * a *class* method is hoisted with a `__this__` parameter and the
-  class declaration dropped, so the wrapper does not mint a
+  class declaration dropped, so the wrapper does not define a
   duplicate `Class` for the class the live program has already
   compiled;
 * a *nested (non-top-level) `object`*'s method is hoisted next to
@@ -1076,7 +1119,7 @@ is shared.
 
 After the lift, `this` references in the body are rewritten to
 `__this__` (or to the object's own name for a lifted singleton),
-and private field/method accesses are rerouted through synthesised
+and private field/method accesses are rerouted through synthesized
 `__refl_get__`, `__refl_set__`, and `__refl_call__` helpers.
 
 #### `EvalRewriteTyped` (after PostTyper, on the wrapper)
@@ -1152,18 +1195,18 @@ reflective helpers operate on.
 
 #### `LogExecutedTree` (conditional, last)
 
-When `Xrepl-eval-log-dir` is set, snapshots the post resolve tree
-into `eval_<timestamp>_wrapper.scala`. The same flag also
+On a cache miss with `-Xrepl-eval-log-dir` set, this phase snapshots the
+post-resolve tree into `eval_<timestamp>_wrapper.scala`. The compilation also
 produces:
 
 | File                                        | Content                                                                |
 |---------------------------------------------|------------------------------------------------------------------------|
-| `eval_<timestamp>_enclosingSource.scala`    | The enclosing top level source with the placeholder.                   |
+| `eval_<timestamp>_enclosingSource.scala`    | The enclosing top-level source with the placeholder.                   |
 | `eval_<timestamp>_code.scala`               | The body string the user submitted.                                    |
-| `eval_<timestamp>_wrapper.scala`            | Post pipeline tree (`__Expression.evaluate` with reflective lowerings).|
+| `eval_<timestamp>_wrapper.scala`            | Post-pipeline tree when compilation reaches this phase.                |
 | `eval_<timestamp>_error.scala`              | Diagnostics + the offending source on compile failure.                 |
 
-`Xrepl-history-file <path>` writes a transcript of the live
+`-Xrepl-history-file <path>` writes a transcript of the live
 session to `<path>` in append mode, ANSI codes stripped.
 
 ### Runtime evaluator
@@ -1173,21 +1216,19 @@ session to `<path>` in append mode, ANSI codes stripped.
 of every user line evaluation. When the body reaches `eval(...)`
 at runtime, the adapter:
 
-1. Writes per invocation log files if `Xrepl-eval-log-dir` is
-   set.
-2. Looks the call up in a per session LRU cache keyed on
+1. Looks the call up in a JVM-wide LRU cache keyed on
    `(code, enclosingSource, expectedType, bindingNames, imports,
-   settings, classpath, sessionLoader, standalone)`. A cache hit
-   reuses the loaded `__Expression` class and reflected handles
-   (and writes no log files: the per-invocation logs are written
-   per compile).
-3. On a cache miss, builds an `EvalCompilerConfig`, drives an
+   settings, classpath, sessionLoader, standalone)`. The session-loader
+   component partitions entries by REPL session. A cache hit reuses the loaded
+   `__Expression` class and reflected handles and writes no log files.
+2. On a cache miss, starts the requested logs, builds an
+   `EvalCompilerConfig`, and drives an
    `EvalCompilerBridge.compile` (the inner compile through
    `EvalCompiler`), loads `__Expression` via a dedicated
    `WrapperLoader` (child-first for the wrapper class, with the
    session's `AbstractFileClassLoader` as parent for everything
    else), and snapshots its constructor and `evaluate` method.
-4. Instantiates `__Expression` with the captured `__this__` (or
+3. Instantiates `__Expression` with the captured `__this__` (or
    `null`) and the bindings array, invokes `evaluate()`, and
    returns the result.
 
@@ -1200,8 +1241,8 @@ cause so callers see the original exception.
 A naive eval would pay a full `dotc` compile on every call. That
 is prohibitively expensive when eval sits inside a loop or a
 combinator (`xs.map(x => eval[Int]("..."))`). `EvalAdapter` keeps
-a per session LRU of compiled `__Expression` classes so identical
-call sites recompile zero times after the first.
+a JVM-wide, 128-entry LRU of compiled `__Expression` classes. The cache key
+includes the session classloader, so entries cannot cross REPL sessions.
 
 The cache key is a `WrapperKey(code, enclosingSource, expectedType,
 bindingsKey, importsKey, settingsKey, classpathKey, sessionLoader,
@@ -1227,9 +1268,9 @@ to be safe.
 so parallel calls are safe. The bound is `cacheCapacity = 128`
 entries, each of which pins a classloader and one `__Expression`
 class, so this also bounds metaspace growth from caching.
-`EvalAdapter.clearCache()` flushes everything; it is JVM-wide, not
-per session, which is what `:reset` wants (the old session's
-entries pin its classloader) and what tests want.
+`EvalAdapter.clearCache()` is JVM-wide rather than session-scoped. `:reset`
+uses it to release entries that retain the old session classloader; this also
+drops cached entries belonging to other sessions in the same JVM.
 
 ### Classloader bridging
 
@@ -1246,11 +1287,12 @@ keep `Class` objects shared across the REPL / eval boundary:
   the classloader that loaded `AbstractFileClassLoader` itself.
 * `scala.*`, `dotty.*`. Values produced by `eval` cross the
   boundary (a lambda `Int => Int` returned from eval is a
-  `scala.Function1` the REPL also recognises). Loaded by the
+  `scala.Function1` the REPL also recognizes). Loaded by the
   parent.
-* `rs$line$N.*`. REPL session line wrappers. Already compiled
-  and loaded by the parent; loading via `findClass` would mint a
-  duplicate `Class` and break `checkcast`.
+* `rs$line$N.*`. A new output-loader epoch delegates classes that existed when
+  it was created to the preceding epoch, preserving their identity. Wrappers
+  compiled during the current epoch are defined by the current loader so they
+  can link against its expanded classpath.
 
 This is why the public API uses JDK functional interfaces
 (`Supplier`, `Consumer`, `Function`) instead of Scala's
@@ -1294,7 +1336,7 @@ feature is for:
 | Hygiene                     | Hygienic by construction                            | Hygienic by lexical splice                               |
 | Where the source comes from | Has to be statically expressible in `'{ }`          | Anything computable at runtime, including LLM output     |
 | Cross stage references      | Lift via `Expr.apply` / `Liftable`                  | Captured automatically via the bindings array            |
-| Use case                    | Specialisation, partial evaluation, DSLs            | REPL exploration, agents, runtime synthesis from text    |
+| Use case                    | Specialization, partial evaluation, DSLs            | REPL exploration, agents, runtime synthesis from text    |
 
 The two systems answer different questions. Staging asks: how can
 a program *describe* a future stage of itself, so that the
@@ -1315,7 +1357,7 @@ guarantees as soon as the body is in hand.
 
 A natural composition: an `@evalLike` agent that *generates*
 `scala.quoted` code, hands it to `staging.run`, and returns the
-specialised function. The agent supplies the source that staging
+specialized function. The agent supplies the source that staging
 needs but cannot write itself.
 
 ### The debugger expression compiler
@@ -1324,11 +1366,11 @@ The Scala 3 debug adapter (`scalacenter/scala-debug-adapter`) has
 an "expression compiler" module. Its job: when the developer
 pauses a JVM under the debugger and types an expression into the
 "evaluate" UI, compile that expression against the *current stack
-frame* and return its value. The shape is recognisable from this
+frame* and return its value. The shape is recognizable from this
 document:
 
 * The user's expression is parsed as Scala source.
-* It is spliced into a synthesised method whose lexical context
+* It is spliced into a synthesized method whose lexical context
   mirrors the frame at the breakpoint: the same enclosing class,
   the same locals, the same `this`.
 * Local variables are forwarded as parameters to the method,
@@ -1353,7 +1395,7 @@ Where the two diverge:
 
 | Aspect                  | Debugger expression compiler                         | Dynamic `eval`                                                                                                       |
 |-------------------------|------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------|
-| Trigger                 | A breakpoint plus a developer typing into the IDE    | A source level `eval(...)` call                                                                                      |
+| Trigger                 | A breakpoint plus a developer typing into the IDE    | A source-level `eval(...)` call                                                                                      |
 | Frame model             | Frozen JVM frame snapshot from JDI                   | Live REPL session, mutable through `VarRef`                                                                          |
 | Lifetime                | One off; result returned to the debugger             | Bytecode cached and reused; `eval` results flow back into the running program                                        |
 | Driver                  | An external service over the Debug Adapter Protocol  | An adapter installed in process via `Eval.withAdapter`                                                               |
@@ -1380,9 +1422,8 @@ ordinary JUnit `@Test` methods run through `junit-interface`, so the
 usual dotty `testOnly <fully.qualified.Class> -- *methodGlob` form
 applies.
 
-Open an sbt shell (`sbt`) and run the commands below at the
-`sbt:scala3>` prompt, or pass them as a single quoted argument
-(`sbt "scala3-repl/testOnly ..."`).
+Run the commands through the sbt thin client, for example
+`sbt --client "scala3-repl/testOnly ..."`.
 
 All eval tests live under the `dotty.tools.eval` package (in
 `repl/test/dotty/tools/eval/`), so a single package glob runs every
@@ -1391,16 +1432,16 @@ pipeline unit tests alike:
 
 ```
 # Every eval test (all suites in both tables below)
-scala3-repl/testOnly dotty.tools.eval.*
+sbt --client --batch "scala3-repl/testOnly dotty.tools.eval.*"
 
 # One suite
-scala3-repl/testOnly dotty.tools.eval.DynamicEvalTests
+sbt --client --batch "scala3-repl/testOnly dotty.tools.eval.DynamicEvalTests"
 
 # One test method (junit-interface glob on the method name)
-scala3-repl/testOnly dotty.tools.eval.DynamicEvalTests -- *returnsInt
+sbt --client --batch "scala3-repl/testOnly dotty.tools.eval.DynamicEvalTests -- *returnsInt"
 
 # The whole REPL test suite (eval tests plus everything else)
-scala3-repl/test
+sbt --client --batch scala3-repl/test
 ```
 
 The eval tests are split into suites by axis. The end-to-end
@@ -1411,12 +1452,14 @@ output:
 
 | Suite                            | What it covers                                                                 | REPL flags exercised                          |
 |----------------------------------|--------------------------------------------------------------------------------|-----------------------------------------------|
-| `DynamicEvalTests`               | Core behaviour: return types, capturing previous lines / locals / `var`s / `given`s, class members, nested eval, compile-error reporting, stdlib values crossing the boundary (shared mutable collections, iterators, exception classes). | (defaults)                                    |
+| `DynamicEvalTests`               | Core behavior: return types, capturing previous lines / locals / `var`s / `given`s, class members, nested eval, compile-error reporting, stdlib values crossing the boundary (shared mutable collections, iterators, exception classes). | (defaults)                                    |
 | `DynamicEvalExplicitNullsTests`  | Flag forwarding into the body compile: `null` no longer conforms to `String`.  | `-Yexplicit-nulls`                            |
 | `DynamicEvalCaptureCheckingTests`| Capture checking on the spliced body (the `cc` examples above).                | `-language:experimental.captureChecking`      |
 | `DynamicEvalSafeModeTests`       | Safe-mode checks applied to the body, including the verify-compile pass.        | `-language:experimental.safe`                 |
 | `DynamicEvalAgentApiTests`       | The `@evalLike` / `@evalSafeLike` wrapper API, the `eval { ctx => ... }` closure form, and `EvalContext`. | (defaults)                                    |
-| `DynamicEvalLogTests`            | The per-invocation log files written by `-Xrepl-eval-log-dir`.                 | `-Xrepl-eval-log-dir:<dir>`                   |
+| `DynamicEvalLogTests`            | The per-compilation log files written by `-Xrepl-eval-log-dir` on cache misses. | `-Xrepl-eval-log-dir:<dir>`                  |
+| `DynamicEvalLiveSettingsTests`   | Live `:settings` and `:reset` changes forwarded to eval and top-level compiles. | settings changed during the session           |
+| `DynamicEvalDisabledInstrumentationTests`, `DynamicEvalLocalInstrumentationTests` | Session class identity under alternate interrupt-instrumentation modes. | `-Xrepl-interrupt-instrumentation:<mode>` |
 | `TopLevelEvalTests`              | The `topLevel` primitive: defs applied to call-site locals and local type arguments, shared module state and stable class identity across call sites, local-first name resolution, `using`/`given` in every direction, isolation and eager errors. | (defaults)                                    |
 
 `StandaloneEvalTests` (in
@@ -1438,10 +1481,15 @@ The lower-level unit tests (in
 `repl/test/dotty/tools/eval/`) exercise the pipeline without
 the full REPL:
 
-| Suite                      | What it covers                                                                                  |
-|----------------------------|-------------------------------------------------------------------------------------------------|
-| `EvalCompilerBridgeTest`   | Splice + extract mechanics: spliced enclosing source compiles, `__Expression` is emitted, `evaluate()` returns the body's value. |
-| `EvalAdapterTest`          | The `EvalAdapter.evalIsolated` entry point on the basic shapes (no captures, simple captures, `expectedType` cast). |
+| Suite                         | What it covers |
+|-------------------------------|----------------|
+| `EvalCompilerBridgeTest`      | Splicing, extraction, generated expression classes, and reflective access lowering. |
+| `EvalCompilerHardeningTests`  | Carrier hygiene, sequential inline captures, placeholder conflicts, by-name givens, and private-overload diagnostics. |
+| `EvalAdapterTest`             | Adapter evaluation, failure caching, setup diagnostics, classloader context, and binding visibility. |
+| `EvalInputPolicyTest`         | Rejection of REPL command-shaped input without invoking the installed adapter. |
+| `EvalCaptureTypeTests`        | Source-level type rendering for captured bindings. |
+| `EvalContextSafeModeTests`    | Generator access to runtime binding values from safe-mode call sites. |
+| `DynamicEvalClassLoaderIdentityTests` | StopRepl and infrastructure class identity across classloader modes and chains. |
 
 `ReplHistoryTests` (in the parent `dotty.tools.repl` package, so
 not matched by the `eval.*` glob above) covers the related

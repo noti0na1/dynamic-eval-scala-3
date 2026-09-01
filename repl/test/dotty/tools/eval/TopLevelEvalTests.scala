@@ -9,7 +9,7 @@ import dotty.tools.repl.{ReplTest, State}
 /** End-to-end tests for the `Eval.topLevel` primitive (root-imported in
  *  the REPL as `topLevel` / `topLevelSafe`, next to `eval`).
  *
- *  `topLevel(defs)` compiles definitions ONCE, in the *global* context
+ *  `topLevel(defs)` compiles definitions once, in the global context
  *  of its call site (package members, file-level imports, previous REPL
  *  lines; never method locals), into a persistent output dir with a
  *  dedicated classloader. `handle.eval(expr)` then runs an expression
@@ -17,7 +17,7 @@ import dotty.tools.repl.{ReplTest, State}
  *  in scope, like calls to global functions. Every eval call through
  *  one handle links against the same loaded classes.
  *
- *  Behaviour axes pinned here:
+ *  Behavior axes pinned here:
  *    - defs applied to call-site locals and local type arguments
  *    - compile-once identity: module state in the defs is shared across
  *      *different* `.eval` call sites, and instances of a defs-defined
@@ -105,6 +105,15 @@ class TopLevelEvalTests extends ReplTest:
       "val r: Int = 8")
   }
 
+  @Test def evalBodyCanCreateTopLevelHandle = initially {
+    // The inner wrapper receives the same four eval primitives as the REPL
+    // root context, including topLevel/topLevelSafe rather than only eval.
+    expectSteps(
+      """val h = eval[dotty.tools.eval.Eval.TopLevel]("topLevel(\"def answer: Int = 42\")")""",
+      """val r = h.eval[Int]("answer")""")(
+      "val r: Int = 42")
+  }
+
   // ===========================================================================
   // 2. Compile-once identity: shared state and stable classes per handle.
   // ===========================================================================
@@ -148,6 +157,13 @@ class TopLevelEvalTests extends ReplTest:
       """val b = h.eval[Any]("new Box(41)")""",
       """val r = h.eval[Int]("b.asInstanceOf[Box].v + 1")""")(
       "val r: Int = 42")
+  }
+
+  @Test def topLevelClassesResolveThroughEvaluationContextClassLoader = initially {
+    expectSteps(
+      """val h = topLevel("class VisibleFromContextLoader")""",
+      """val r = h.eval[Boolean]("val instance = new VisibleFromContextLoader; Thread.currentThread().getContextClassLoader.loadClass(instance.getClass.getName) eq instance.getClass")""")(
+      "val r: Boolean = true")
   }
 
   @Test def independentHandlesHaveIndependentState = initially {
@@ -323,9 +339,8 @@ class TopLevelEvalTests extends ReplTest:
     // the defs-object import in front), and — at runtime, through the
     // registry — the handle of the defs object it was compiled
     // inside. Splicing a later eval against the captured slice runs
-    // inside `probe`'s body: the parameter and the defs' classes both
-    // resolve. This is what makes an agent-style `getState()` written
-    // inside a topLevel function work.
+    // inside `probe`'s body, where both the parameter and the defs'
+    // classes resolve.
     // `probe` declares `Any`, so a later body of any type conforms in
     // the captured slice's result position — the same shape an
     // embedder's chain wrapper uses.
@@ -346,7 +361,7 @@ class TopLevelEvalTests extends ReplTest:
 
   @Test def defsImportsReachACapturedSlice = initially {
     // Leading import lines of the defs sit at FILE level of the
-    // synthesised unit, so the rewriter records them into slices: a
+    // synthesized unit, so the rewriter records them into slices: a
     // capture inside the defs re-resolves `ListBuffer` when a later
     // eval splices against it.
     expectSteps(

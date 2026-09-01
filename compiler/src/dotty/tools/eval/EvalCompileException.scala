@@ -1,23 +1,14 @@
 package dotty.tools
 package eval
 
-/** Thrown by the throwing-form `eval[T]` when the inner compile of
- *  the synthesised wrapper module fails. Common causes: an unknown
- *  identifier in the body, a type mismatch when `eval[T]` pins the
- *  return type, a parse error.
+/** Thrown by `eval[T]` when the generated wrapper does not compile. Typical
+ *  causes include syntax errors, unresolved names, and a result that does not
+ *  conform to the requested type.
  *
- *  Carries diagnostics and generated source as structured fields so
- *  callers can inspect them programmatically.
- *
- *  `errors` is `Array[String]` rather than `Seq[String]` to keep the
- *  API surface on JVM-intrinsic types — Scala-collection types
- *  resolve to two distinct `Class` objects across the eval / REPL
- *  classloader boundary and produce `LinkageError` when a user
- *  `catch` touches the field.
- *
- *  Body runtime exceptions (e.g. `eval("1 / 0")` raising
- *  `ArithmeticException`) propagate as the body's own exception,
- *  not as `EvalCompileException`.
+ *  The diagnostics and generated source remain available for programmatic
+ *  inspection. `errors` uses an array because Scala collection classes cannot
+ *  safely cross the REPL/eval classloader boundary. Exceptions raised while
+ *  running a successfully compiled body propagate unchanged.
  */
 final class EvalCompileException(
     val errors: Array[String],

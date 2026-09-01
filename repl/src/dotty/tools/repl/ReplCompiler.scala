@@ -25,9 +25,9 @@ import dotc.util.Spans.*
 import dotc.util.{ParsedComment, Property, SourceFile}
 import dotc.{CompilationUnit, Compiler, Run}
 import dotc.util.chaining.*
+import dotty.tools.eval.{EvalCaptureInlined, EvalRewriteTyped}
 
 import scala.collection.mutable
-import eval.*
 
 /** This subclass of `Compiler` is adapted for use in the REPL.
  *
@@ -46,22 +46,14 @@ class ReplCompiler extends Compiler:
     List(WInferUnion(), CheckUnused.PostTyper(), CheckShadowing()),
     List(CollectTopLevelImports()),
     List(PostTyper()),
-    // Fill bindings, expectedType, and enclosingSource on each
-    // already-shape-rewritten eval call. Runs *after* PostTyper so
-    // we have resolved symbols (verifies `eval` / `evalSafe` against
-    // `Eval.moduleClass`), inline / macro expansion is still
-    // pending, and class-member references are in their
-    // `This(cls).select(name)` form. Always enabled in the REPL;
-    // `-Xdynamic-eval` is only needed for regular compilation.
+    // Enrich dynamic evaluation calls after their symbols and member selections have
+    // been resolved, but before inline and macro expansion. Dynamic evaluation
+    // is always enabled in the REPL, independently of `-Xdynamic-eval`.
     List(new EvalRewriteTyped(alwaysEnabled = true)),
     List(UnrollDefinitions()),
   )
 
-  /** The inherited plan carries the main pipeline's flag-gated
-   *  [[EvalCaptureInlined]]; eval is always on in the REPL, so swap
-   *  in an always-enabled instance (mirroring `EvalRewriteTyped`
-   *  above).
-   */
+  /** Replace the inherited, flag-gated [[EvalCaptureInlined]] with an always-enabled instance. */
   override protected def transformPhases: List[List[Phase]] =
     super.transformPhases.map(_.map {
       case p if p.phaseName == EvalCaptureInlined.name =>
@@ -93,9 +85,8 @@ class ReplCompiler extends Compiler:
         val rootCtx = super.rootContext.fresh
           .withRootImports
           .fresh.setOwner(defn.EmptyPackageClass): Context
-        // `import dotty.tools.eval.Eval.{eval, evalSafe}` sits below the
-        // per-line imports, so a user definition of either name (on any
-        // line) shadows it the same way it shadows a Predef member.
+        // Add the dynamic evaluation entry points before imports from previous
+        // lines, allowing user definitions to shadow them like Predef members.
         val evalCtx: Context = rootCtx.fresh.setImportInfo(ReplCompiler.evalRootImport)
         (state.validObjectIndexes).foldLeft(evalCtx)((ctx, id) =>
           importPreviousRun(id)(using ctx))
@@ -315,21 +306,13 @@ object ReplCompiler:
   val ReplState: Property.StickyKey[State] = Property.StickyKey()
   val objectNames = mutable.Map.empty[Int, TermName]
 
-  /** An `import dotty.tools.eval.Eval.{eval, evalSafe, topLevel,
-   *  topLevelSafe}` at root-import precedence (like `scala.*` and
-   *  `Predef.*`), so the bare names resolve in every REPL line while
-   *  remaining shadowable by user definitions. Built like
-   *  [[ImportInfo.rootImport]] but with named selectors: a wildcard
-   *  would leak the whole `Eval` surface (`bind`, `varRef`,
-   *  `withAdapter`, ...) into the root namespace.
+  /** Makes the dynamic evaluation entry points available at standard root-import
+   *  precedence. Named selectors avoid exposing the rest of `Eval`, while
+   *  imports from previous REPL lines can still shadow these names.
    */
   private def evalRootImport(using Context): ImportInfo =
-    val selectors =
-      untpd.ImportSelector(untpd.Ident("eval".toTermName))
-      :: untpd.ImportSelector(untpd.Ident("evalSafe".toTermName))
-      :: untpd.ImportSelector(untpd.Ident("topLevel".toTermName))
-      :: untpd.ImportSelector(untpd.Ident("topLevelSafe".toTermName))
-      :: Nil
+    val selectors = List("eval", "evalSafe", "topLevel", "topLevelSafe").map: name =>
+      untpd.ImportSelector(untpd.Ident(name.toTermName))
     def sym(using Context) =
       val expr = tpd.Ident(requiredModuleRef("dotty.tools.eval.Eval"))
       tpd.Import(expr, selectors).symbol

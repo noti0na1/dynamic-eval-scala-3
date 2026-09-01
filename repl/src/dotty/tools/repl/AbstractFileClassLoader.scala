@@ -17,11 +17,7 @@ import dotty.tools.dotc.config.ScalaSettings
 
 import io.AbstractFile
 
-import java.net.{URL, URLConnection, URLStreamHandler}
-import java.util.Collections
-
 import AbstractFileClassLoader.InterruptInstrumentation
-
 
 object AbstractFileClassLoader:
   enum InterruptInstrumentation(val stringValue: String):
@@ -40,10 +36,65 @@ object AbstractFileClassLoader:
       case _ => throw new IllegalArgumentException(s"Invalid interrupt instrumentation value: $string")
     }
 
-class AbstractFileClassLoader(root: AbstractFile, parent: ClassLoader, interruptInstrumentation: InterruptInstrumentation)
+class AbstractFileClassLoader(
+    root: AbstractFile,
+    parent: ClassLoader,
+    interruptInstrumentation: InterruptInstrumentation,
+    previousSessionLoaderHint: AbstractFileClassLoader | Null
+)
   extends io.AbstractFileClassLoader(root, parent):
 
-  def this(root: AbstractFile, parent: ClassLoader) = this(root, parent, InterruptInstrumentation.fromString(ScalaSettings.XreplInterruptInstrumentation.default))
+  /** Retains the original three-argument constructor. A direct output loader
+   *  parent is recognized automatically as the preceding REPL loader.
+   */
+  def this(
+      root: AbstractFile,
+      parent: ClassLoader,
+      interruptInstrumentation: InterruptInstrumentation
+  ) = this(root, parent, interruptInstrumentation, null)
+
+  private val knownPreviousSessionLoader: AbstractFileClassLoader | Null =
+    if previousSessionLoaderHint != null then previousSessionLoaderHint
+    else parent match
+      case previous: AbstractFileClassLoader => previous
+      case _ => null
+
+  /** The previous output loader in this REPL session. Classpath additions can
+   *  insert URL class loaders between two output loaders.
+   */
+  private lazy val previousSessionLoader: AbstractFileClassLoader | Null =
+    if knownPreviousSessionLoader != null then knownPreviousSessionLoader
+    else
+      var loader = getParent
+      var previous: AbstractFileClassLoader | Null = null
+      while loader != null && previous == null do
+        loader match
+          case outputLoader: AbstractFileClassLoader => previous = outputLoader
+          case _ => loader = loader.getParent
+      previous
+
+  private def classNamesUnder(dir: AbstractFile, packagePrefix: String): Iterator[String] =
+    dir.iterator.flatMap: file =>
+      if file.isDirectory then classNamesUnder(file, packagePrefix + file.name + ".")
+      else if file.name.endsWith(".class") then
+        Iterator.single(packagePrefix + file.name.stripSuffix(".class"))
+      else Iterator.empty
+
+  /** Classes already present when this loader was created.
+   *
+   *  `:jar` and `:dep` keep the output directory but replace its loader. The
+   *  snapshot routes existing classes through the previous loader to preserve
+   *  their identity; classes compiled later remain in this loader and can link
+   *  against the expanded classpath.
+   */
+  private val inheritedClasses: Set[String] =
+    knownPreviousSessionLoader match
+      case previous: AbstractFileClassLoader if previous.root == root =>
+        classNamesUnder(root, "").toSet
+      case _ => Set.empty
+
+  def this(root: AbstractFile, parent: ClassLoader) =
+    this(root, parent, InterruptInstrumentation.fromString(ScalaSettings.XreplInterruptInstrumentation.default), null)
 
   override protected def defineClass(name: String, bytes: Array[Byte]): Class[?] =
     if interruptInstrumentation.is(InterruptInstrumentation.Enabled) then defineClassInstrumented(name, bytes)
@@ -55,13 +106,37 @@ class AbstractFileClassLoader(root: AbstractFile, parent: ClassLoader, interrupt
   }
 
   override def loadClass(name: String): Class[?] =
-    if interruptInstrumentation.isOneOf(InterruptInstrumentation.Disabled, InterruptInstrumentation.Local) then
-      return super.loadClass(name)
+    getClassLoadingLock(name).synchronized:
+      val loaded = findLoadedClass(name) // Check if already loaded
+      if loaded != null then return loaded
 
-    val loaded = findLoadedClass(name) // Check if already loaded
-    if loaded != null then return loaded
+      // Route every class from an earlier epoch through its original loader.
+      // This includes line wrappers and user classes nested within them.
+      if inheritedClasses.contains(name) then
+        previousSessionLoader match
+          case previous: AbstractFileClassLoader => return previous.loadClass(name)
+          case null => ()
 
-    name match {
+      name match {
+      // Keep compiler and runtime interfaces in their parent loaders so values
+      // crossing the dynamic evaluation boundary retain the same class identities.
+      case "dotty.tools.repl.StopRepl"
+          if !interruptInstrumentation.is(InterruptInstrumentation.Enabled) =>
+        super.loadClass(name)
+      case s"dotty.tools.repl.$_" if name != "dotty.tools.repl.StopRepl" =>
+        classOf[AbstractFileClassLoader].getClassLoader.loadClass(name)
+      case s"dotty.tools.eval.$_" =>
+        classOf[AbstractFileClassLoader].getClassLoader.loadClass(name)
+      case s"scala.$_" => super.loadClass(name)
+      case s"dotty.$_" if name != "dotty.tools.repl.StopRepl" => super.loadClass(name)
+      case s"rs$$line$$$_" =>
+        // New wrappers must link against this epoch's classpath.
+        try findClass(name)
+        catch case _: ClassNotFoundException => super.loadClass(name)
+
+      case _ if interruptInstrumentation.isOneOf(InterruptInstrumentation.Disabled, InterruptInstrumentation.Local) =>
+        super.loadClass(name)
+
       // Don't instrument JDK classes. These are often restricted to load from a single classloader
       // due to the JDK module system, and so instrumenting them and loading the modified copy of the class
       // results in runtime exceptions
@@ -72,78 +147,46 @@ class AbstractFileClassLoader(root: AbstractFile, parent: ClassLoader, interrupt
       case s"org.xml.sax.$_" => super.loadClass(name) // XML SAX API (part of java.xml module)
       case s"org.w3c.dom.$_" => super.loadClass(name) // W3C DOM API (part of java.xml module)
       case s"com.sun.org.apache.$_" => super.loadClass(name) // Internal Xerces implementation
-      // Don't instrument StopRepl, which would otherwise cause infinite recursion.
-      // Each classloader gets its own StopRepl Class so the @static `stop`
-      // flag is isolated per session: one driver's interrupt doesn't trip
-      // another's. (Must match before the broader `dotty.tools.repl.*`
-      // rule below, which would otherwise share a single StopRepl Class.)
+      // Instrumented bytecode calls StopRepl, so instrumenting StopRepl would
+      // recurse. Independent sessions define separate copies, while output
+      // loaders from the same session share one stop flag.
       case "dotty.tools.repl.StopRepl" =>
-        val classFileName = name.replace('.', '/') + ".class"
-        val is = Option(getParent.getResourceAsStream(classFileName))
-          // Can't get as resource, use the classloader that loaded this AbstractFileClassLoader
-          // class itself, which must have access to StopRepl
-          .getOrElse(classOf[AbstractFileClassLoader].getClassLoader.getResourceAsStream(classFileName))
+        previousSessionLoader match
+          case previous: AbstractFileClassLoader => previous.loadClass(name)
+          case null =>
+            val classFileName = name.replace('.', '/') + ".class"
+            val is = Option(getParent.getResourceAsStream(classFileName))
+              // The loader that defined this class also has access to StopRepl.
+              .getOrElse(classOf[AbstractFileClassLoader].getClassLoader.getResourceAsStream(classFileName))
 
-        try
-          val bytes = is.readAllBytes()
-          defineClass(name, bytes, 0, bytes.length)
-        finally is.close()
-      // Don't instrument REPL infrastructure classes. User wrappers
-      // reference them (e.g. `dotty.tools.eval.Eval` for the runtime
-      // `eval` callback) and need the *same* Class instance the driver
-      // itself uses; otherwise object-level mutable state like
-      // `Eval.active` (a ThreadLocal) splits into independent copies.
-      // Loading via this loader's parent isn't sufficient because the
-      // compiler-classpath URLClassLoader can carry its own copy of the
-      // REPL jar. Routing through the classloader that loaded
-      // `AbstractFileClassLoader` itself is necessarily the same one
-      // the running ReplDriver uses.
-      case s"dotty.tools.repl.$_" =>
-        classOf[AbstractFileClassLoader].getClassLoader.loadClass(name)
-      // Same routing for the eval infrastructure (`dotty.tools.eval.*`,
-      // which lives in the compiler jar): `Eval.active`, `Eval.Binding`,
-      // `EvalResult`, etc. must resolve to the single Class instances
-      // the driver uses, not to a copy redefined from the
-      // compiler-classpath URLClassLoader.
-      case s"dotty.tools.eval.$_" =>
-        classOf[AbstractFileClassLoader].getClassLoader.loadClass(name)
-      // Don't instrument the Scala or Dotty standard libraries. Values
-      // produced by `eval` are passed back across classloader boundaries
-      // (e.g. a lambda returned from eval as `Int => Int` must be a
-      // `scala.Function1` that the REPL also recognises), so these types
-      // need to be loaded by a single shared classloader. Instrumenting
-      // each AbstractFileClassLoader instance would mint its own copy and
-      // break the cross-loader exchange with `LinkageError` or
-      // `ClassCastException`. The trade-off: a CPU-bound loop running
-      // entirely inside library code is no longer interruptible through
-      // the `StopRepl` flag (only user-defined classes carry the check);
-      // the `-Xrepl-interrupt-instrumentation` help text documents this.
-      case s"scala.$_" => super.loadClass(name)
-      case s"dotty.$_" => super.loadClass(name)
-
-      // REPL session-line wrappers (`rs$line$N` and their nested
-      // classes/objects) are already compiled and loaded by the
-      // parent. Routing through `findClass` would look in `root`
-      // first; if the eval pipeline staged a copy there, the JVM
-      // mints a second Class under the same fully-qualified name,
-      // and instances flowing across the boundary fail `checkcast`
-      // with "X cannot be cast to X (different loaders)".
-      case s"rs$$line$$$_" => super.loadClass(name)
-
+            try
+              val bytes = is.readAllBytes()
+              defineClass(name, bytes, 0, bytes.length)
+            finally is.close()
       case _ =>
         try findClass(name)
         catch case _: ClassNotFoundException =>
-          // Not in REPL output, try to load from parent and instrument it
-          try
-            val resourceName = name.replace('.', '/') + ".class"
-            getParent.getResourceAsStream(resourceName) match {
-              case null => super.loadClass(name)
-              case is =>
-                try defineClassInstrumented(name, is.readAllBytes())
-                finally is.close()
-            }
-          catch
-            case ex: Exception => super.loadClass(name)
-    }
+          // Classes loaded from an earlier `:jar` or `:dep` have no class file
+          // under `root`. Consult the previous output loader before defining
+          // another instrumented copy from a parent resource.
+          val inherited = previousSessionLoader match
+            case previous: AbstractFileClassLoader =>
+              try previous.loadClass(name)
+              catch case _: ClassNotFoundException => null
+            case null => null
+          if inherited != null then inherited
+          else
+            // Instrument a newly visible classpath entry in the current epoch.
+            try
+              val resourceName = name.replace('.', '/') + ".class"
+              getParent.getResourceAsStream(resourceName) match {
+                case null => super.loadClass(name)
+                case is =>
+                  try defineClassInstrumented(name, is.readAllBytes())
+                  finally is.close()
+              }
+            catch
+              case _: Exception => super.loadClass(name)
+      }
 
 end AbstractFileClassLoader

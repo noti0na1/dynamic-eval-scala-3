@@ -3,7 +3,7 @@ package eval
 
 import scala.collection.mutable
 
-import dotc.ast.tpd
+import dotc.ast.{tpd, untpd}
 import dotc.ast.tpd.*
 import dotc.cc.{CaptureAnnotation, CheckCaptures}
 import dotc.core.Annotations.Annotation
@@ -21,18 +21,16 @@ import dotc.transform.MacroTransform
 import dotc.util.{Property, SourceFile}
 import dotc.util.Spans.Span
 
-/** Post-PostTyper phase that fills the `bindings`, `expectedType`,
- *  and `enclosingSource` arguments of every `eval[T]` /
- *  `evalSafe[T]` / `agent[T]` / `agentSafe[T]` call. This phase is
- *  *the* eval rewriter — there is no parser-stage counterpart.
+/** Post-PostTyper phase that fills the `bindings`, `expectedType`, and
+ *  `enclosingSource` arguments of `eval`, `evalSafe`, and methods annotated
+ *  with `@evalLike` or `@evalSafeLike`. There is no parser-stage counterpart.
  *
  *  Runs after PostTyper because the typed tree carries:
  *    - resolved symbols, so `eval` / `evalSafe` are matched by
  *      `sym.owner == Eval.moduleClass` rather than by name. A
  *      user-defined `eval` shadowing the import is *not* rewritten.
- *    - inline / macro expansion still pending (those run later in
- *      `transformPhases`), so any captured local we collect here is
- *      something the user wrote and that survives to runtime.
+ *    - the later `Inlining` phase still pending, so any captured local
+ *      collected here comes from typed source rather than inline expansion.
  *    - class-member references shaped as `This(cls).select(name)`
  *      (PostTyper rewrites bare `Ident` whose `tpe` is `ThisType`
  *      into `This(cls)`).
@@ -56,7 +54,7 @@ import dotc.util.Spans.Span
  *      final instantiations.
  *    - enclosingSource: slice the current top-level statement's
  *      source with the eval call's span replaced by the marker.
- *      For safe-flavor (`evalSafe` / `agentSafe`) calls, also wrap
+ *      For safe variants (`evalSafe` / `@evalSafeLike`), also wrap
  *      the marker in `Eval.handleCompileError(...)` so the inner
  *      verify compile lifts the body's `T` to `EvalResult[T]`.
  *
@@ -110,8 +108,8 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
    *  - `ctorFactory` set: a `__evalNew_<C>__$<i>` synthetic carrying
    *    a factory closure `(args…) => new C(args…)` for constructor
    *    `i` of the local class. The closure closes over `C`'s captured
-   *    environment, so LambdaLift does the env plumbing and the
-   *    wrapper can construct instances of the *original* class.
+   *    environment, so LambdaLift supplies the captured parameters and
+   *    the wrapper can construct instances of the *original* class.
    *  - `isModuleRef` set: a `__evalModule_<M>__` synthetic carrying
    *    the live module instance of a local `object M` (including the
    *    synthesized companion of a local class). The wrapper routes
@@ -159,10 +157,9 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
   private enum TopKind:
     case Unknown, Definition, Expression
 
-  /** Pipeline-level category an Apply call belongs to. Determined
-   *  purely by symbol identity (for `Eval.eval` / `Eval.evalSafe`)
-   *  or by `@evalLike` / `@evalSafeLike` annotation (for
-   *  user-defined generators such as `agent`). Never by name match.
+  /** Pipeline-level category of an Apply call. Classification uses symbol
+   *  identity for `Eval.eval` / `Eval.evalSafe` and annotations for custom
+   *  `@evalLike` / `@evalSafeLike` wrappers, never a name match.
    */
   private enum EvalKind:
     case NotEval, PlainEval, PlainEvalSafe, EvalLike, EvalSafeLike
@@ -302,7 +299,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
      *
      *  All three are empty in a REPL compile (the REPL passes its
      *  session imports to the adapter at runtime instead), so REPL
-     *  slices are byte-identical to the pre-standalone behaviour.
+     *  slices are byte-identical to the pre-standalone behavior.
      */
     private var fileImports: List[(Int, String)] = Nil
     private var packageImports: List[String] = Nil
@@ -381,7 +378,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
           String.valueOf(content, span.start, span.end - span.start)
         else ""
 
-    /** True for the modules the eval machinery synthesises itself:
+    /** True for the modules the eval machinery synthesizes itself:
      *  REPL line wrappers (`rs$line$N`) and the inner compile's
      *  `__EvalWrapper…` modules. Their members get lexical context
      *  from the runtime adapter, not from compile-time imports.
@@ -523,10 +520,9 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
                 isLazy = vd.symbol.is(Flags.Lazy),
                 isInlined = true) :: Nil
             case _ =>
-              // DefDef bindings (by-name argument proxies) are not
-              // captured: their eta-expansion plumbing is not worth
-              // the rarity, and ExtractEvalBody diagnoses an
-              // unmatched reference cleanly.
+              // DefDef bindings (by-name argument proxies) are not captured.
+              // Supporting their eta expansion would add disproportionate
+              // complexity; ExtractEvalBody diagnoses unmatched references.
               Nil
           }
           withScope(inlinedCaps)(super.transform(tree))
@@ -651,7 +647,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
             }
           }
           // Switch ctx.owner to the def's symbol so any new symbols
-          // we synthesise inside its body (anon-fun closures for
+          // we synthesize inside its body (anon-fun closures for
           // bindVar's get/set, etc.) get the right enclosure for
           // LambdaLift's free-var analysis. The (symbol, declared
           // result type) pair is pushed on the method stack so eval
@@ -912,13 +908,12 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
      *    - `__evalNew_C__$<i>` → a factory closure per reachable
      *      constructor (primary first, secondaries in source order).
      *      The closure body is an ordinary `new C(…)`, so LambdaLift
-     *      threads `C`'s captured environment through the closure:
-     *      exactly the synthetic plumbing the wrapper can't
-     *      reconstruct on its own.
+     *      threads `C`'s captured environment through the closure, which the
+     *      wrapper cannot reconstruct independently.
      *
      *  Traits and abstract classes contribute only the `classOf`
-     *  binding. Private constructors are skipped (the factory
-     *  closure would trip the JVM access check after lifting).
+     *  binding. Private constructors are skipped because a lifted factory
+     *  closure would fail the JVM access check.
      */
     private def localClassBundle(cls: ClassSymbol)(using Context): List[CapturedSym] =
       val src = cls.name.toString
@@ -1071,12 +1066,9 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
             case _ => false
         }
 
-    /** Fill the synthetic args at the call site. Three by-name slots
-     *  (`bindings`, `expectedType`, `enclosingSource`) are located by
-     *  matching the method's parameter names against the recognised
-     *  alias sets ([[BindingsParamNames]] etc.). The user's other
-     *  positional parameters — including a trailing `maxAttempts` on
-     *  agent-style generators — are left untouched.
+    /** Fill the synthetic arguments at the call site. The `bindings`,
+     *  `expectedType`, and `enclosingSource` parameters are located by their
+     *  exact names. Other parameters on custom wrappers are left untouched.
      *
      *  Plain `Eval.eval` / `Eval.evalSafe`: the synthetic slots sit
      *  at the canonical positions 1/2/3.
@@ -1298,7 +1290,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
     /** True for a typer-supplied default-arg accessor call (i.e.
      *  `myEval$default$3`). Using
      *  [[NameKinds.DefaultGetterName.matches]] instead of a string-
-     *  ends-with check so the recogniser stays robust to dotty's
+     *  ends-with check so the recognizer stays robust to dotty's
      *  internal naming convention.
      *
      *  Under named-argument lifting the typer hoists each argument
@@ -1461,8 +1453,8 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
      *  their instances, transitively. Anything that did not resolve
      *  to a concrete type (an uninstantiated variable, a raw
      *  `TypeParamRef`, a skolem from dependent-method typing) makes
-     *  the whole pt unusable: bail to `NoType` rather than render a
-     *  type the splice cannot re-typecheck.
+     *  the prototype unusable, so return `NoType` rather than rendering a type
+     *  the splice cannot re-typecheck.
      */
     private def resolveRecordedProto(pt: Type)(using Context): Type =
       if !pt.exists then NoType
@@ -1490,6 +1482,29 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
         val widened = tpe.widen
         widened.exists && !widened.isError && !EvalRewriteTyped.isUselessType(widened)
       }
+
+    /** Find a source-level marker identifier already present in the
+     *  enclosing statement, excluding the eval call that is about to
+     *  be replaced. The original untyped tree is intentional: it
+     *  distinguishes identifiers from the same text in strings and
+     *  comments, and still sees a bare member reference before
+     *  PostTyper rewrites it to `This(...).select(...)`.
+     */
+    private def preExistingMarker(evalSpan: Span)(using Context): untpd.Ident | Null =
+      var found: untpd.Ident | Null = null
+      val finder = new untpd.UntypedTreeTraverser:
+        override def traverse(tree: untpd.Tree)(using Context): Unit =
+          if found == null then tree match
+            case id: untpd.Ident
+                if id.name.toString == EvalContext.placeholder
+                  && id.span.exists
+                  && id.span.start >= topLevelStart
+                  && id.span.end <= topLevelEnd
+                  && !evalSpan.contains(id.span) =>
+              found = id
+            case _ => traverseChildren(tree)
+      finder.traverse(ctx.compilationUnit.untpdTree)
+      found
 
     /** Slice the current top-level statement's source text, replacing
      *  the eval-call's span with `EvalBodyPlaceholder.Marker`. The
@@ -1520,6 +1535,14 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       if topLevelStart < 0 || !evalSpan.exists || sourceFile == null then return ""
       val src = sourceFile.content
       if topLevelEnd > src.length || topLevelStart >= topLevelEnd then return ""
+      val existing = preExistingMarker(evalSpan)
+      if existing != null then
+        report.error(
+          s"eval cannot capture its enclosing statement because the reserved identifier " +
+            s"`${EvalContext.placeholder}` occurs outside this eval call; rename that identifier",
+          existing.srcPos
+        )
+        return ""
       val relStart = evalSpan.start - topLevelStart
       val relEnd = evalSpan.end - topLevelStart
       val topLen = topLevelEnd - topLevelStart
@@ -1549,7 +1572,7 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
         case TopKind.Expression => withContextImports(s"val __unused__ : Any = { $withMarker }")
         case TopKind.Unknown => ""
 
-    private def composeChainedEncl(innerSpan: Span, outerBody: String, outerEncl: String): String =
+    private def composeChainedEncl(innerSpan: Span, outerBody: String, outerEncl: String)(using Context): String =
       if !innerSpan.exists then return ""
       val s = innerSpan.start
       val e = innerSpan.end
@@ -1558,6 +1581,26 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       // direct slice above.
       val outerBodyWithInnerMarker =
         outerBody.substring(0, s) + EvalBodyPlaceholder.Marker + " " + outerBody.substring(e)
+      def markerCount(text: String): Int =
+        val marker = EvalBodyPlaceholder.Marker
+        var count = 0
+        var from = 0
+        var idx = text.indexOf(marker, from)
+        while idx >= 0 do
+          count += 1
+          from = idx + marker.length
+          idx = text.indexOf(marker, from)
+        count
+      // Chained composition has only strings, not the original source AST.
+      // Refuse an ambiguous splice rather than globally replacing marker text
+      // in a user identifier, string, or comment and verifying the wrong code.
+      if markerCount(outerEncl) != 1 || markerCount(outerBodyWithInnerMarker) != 1 then
+        report.error(
+          s"nested eval cannot compose its enclosing source because reserved marker text " +
+            s"`${EvalBodyPlaceholder.Marker}` occurs outside the nested eval call",
+          ctx.source.atSpan(innerSpan)
+        )
+        return ""
       outerEncl.replace(
         EvalBodyPlaceholder.Marker,
         EvalBodyPlaceholder.emit(outerBodyWithInnerMarker)
@@ -1585,11 +1628,8 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
       ref(EvalRewriteTyped.withInheritedHandlesSym)
         .appliedTo(Literal(Constant(enclosingDefsObjectName)), arr)
         .withSpan(span)
-        // Under capture checking the method's `Array` result picks up
-        // a fresh mutability capture the pure `bindings` parameter
-        // type cannot accept; the array is inert plumbing, so its
-        // result is assumed pure — the same posture the bare literal
-        // had before the wrap.
+        // The wrapper method adds a mutability capture to its Array result, but
+        // this internal array has the same pure semantics as the original literal.
         .withAttachment(CheckCaptures.AssumePure, ())
 
     /** The name of the `topLevel` defs object this call site is
@@ -1672,10 +1712,11 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
     /** Dispatch a `CapturedSym` to its appropriate binding builder:
      *
      *    - `isVar`         → `Eval.bindVar(name, Eval.varRef(get, set))`
-     *    - `isGiven`       → `Eval.bindGiven(name, value)`
      *    - `isByName`      → `Eval.bind(name, () => name)` (Function0 thunk
      *                        so the body's post-ElimByName `apply()` lines
-     *                        up; see [[buildBindByName]]).
+     *                        up; a by-name given uses `bindGiven` to retain
+     *                        its contextual metadata; see [[buildBindByName]]).
+     *    - `isGiven`       → `Eval.bindGiven(name, value)`
      *    - `isDef`         → `Eval.bind(name, eta-expansion)`
      *    - `localClassOf`  → `Eval.bindSynthetic(name, classOf[C])`
      *    - `ctorFactory`   → `Eval.bindSynthetic(name, (args…) => new C(args…))`
@@ -1695,8 +1736,8 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
      */
     private def buildBind(c: CapturedSym, span: Span)(using Context): Tree =
       if c.isVar then buildBindVar(c, span)
-      else if c.isGiven then buildBindGiven(c, span)
       else if c.isByName then buildBindByName(c, span)
+      else if c.isGiven then buildBindGiven(c, span)
       else if c.isDef then buildBindDef(c, span)
       else if c.localClassOf.isDefined then buildBindClassOf(c, span)
       else if c.ctorFactory.isDefined then buildBindCtorFactory(c, span)
@@ -1833,8 +1874,8 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
      *  `withDiscardedUses`, i.e. without recording captured-reference
      *  uses into enclosing environments.
      *
-     *  Why this is needed: at every `eval` / `agent` call site the
-     *  rewriter emits `Eval.bind("x", x)` for each captured local. The
+     *  At every `eval` or `@evalLike` call site, the rewriter emits
+     *  `Eval.bind("x", x)` for each captured local. The
      *  reference to `x` carries `x`'s capture set; without suppression
      *  the use is recorded into every enclosing function literal —
      *  including a surrounding lambda whose expected capture set forbids
@@ -1892,10 +1933,13 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
           .appliedTo(nameLit, readRef(c, span), bindingTpeLit(c.sym.info, span))
           .withSpan(span)
 
-    /** `Eval.bind(name, () => name)` for a by-name parameter capture.
+    /** `Eval.bind*(name, () => name)` for a by-name parameter capture.
      *  In the wrapper compile, ElimByName will lower the body's
      *  `name` references into `name.apply()` on a `Function0[T]`;
      *  the binding must store something `apply()` can be called on.
+     *  Contextual by-name parameters use `bindGiven`, preserving the
+     *  metadata used to distinguish given bindings without changing
+     *  the thunk representation.
      *
      *  Constructed via [[tpd.Lambda]] which produces a `Function0[T]`
      *  closure post-PostTyper.
@@ -1907,10 +1951,13 @@ class EvalRewriteTyped(maybeConfig: Option[EvalCompilerConfig] = None, alwaysEna
         case other => other
       val methTpe = MethodType(Nil, resultTpe)
       val fn = Lambda(methTpe, _ => readRef(c, span)).withSpan(span)
+      val bindFn =
+        if c.isGiven then EvalRewriteTyped.bindGivenSym
+        else EvalRewriteTyped.bindSym
       // The recorded type is the by-name result type: that's what
       // the body's bare `name` reference has.
       discardUses:
-        ref(EvalRewriteTyped.bindSym)
+        ref(bindFn)
           .appliedTo(nameLit, fn, bindingTpeLit(resultTpe, span))
           .withSpan(span)
 

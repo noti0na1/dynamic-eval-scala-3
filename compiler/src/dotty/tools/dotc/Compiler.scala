@@ -40,7 +40,7 @@ class Compiler {
     List(new sbt.ExtractDependencies) :: // Sends information on classes' dependencies to sbt via callbacks
     List(new semanticdb.ExtractSemanticInfo) :: // Extract info into .semanticdb files
     List(new PostTyper) ::          // Additional checks and cleanups after type checking
-    List(new eval.EvalRewriteTyped) :: // Fill synthetic args of dynamic `eval` calls (only with -Xdynamic-eval)
+    List(new eval.EvalRewriteTyped) :: // Fill synthetic arguments to dynamic eval calls (with -Xdynamic-eval)
     List(new UnrollDefinitions) ::  // Unroll annotated methods if detected in PostTyper
     List(new sjs.PrepJSInterop) ::  // Additional checks and transformations for Scala.js (Scala.js only)
     List(new SetRootTree) ::        // Set the `rootTreeOrProvider` on class symbols
@@ -61,7 +61,7 @@ class Compiler {
 
   /** Phases dealing with the transformation from pickled trees to backend trees */
   protected def transformPhases: List[List[Phase]] =
-    List(new eval.EvalCaptureInlined) :: // Append inliner-introduced bindings to dynamic `eval` calls (only with -Xdynamic-eval)
+    List(new eval.EvalCaptureInlined) :: // Capture values introduced by inlining around dynamic eval calls
     List(new InstrumentCoverage) ::  // Perform instrumentation for code coverage (if -coverage-out is set)
     List(new CrossVersionChecks,     // Check issues related to deprecated and experimental
          new FirstTransform,         // Some transformations to put trees into a canonical form

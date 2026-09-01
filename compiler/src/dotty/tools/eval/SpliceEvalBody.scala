@@ -6,51 +6,28 @@ import dotty.tools.dotc.core.Constants.*
 import dotty.tools.dotc.core.Contexts.*
 import dotty.tools.dotc.core.Decorators.*
 import dotty.tools.dotc.core.Flags.*
+import dotty.tools.dotc.core.NameKinds.UniqueName
 import dotty.tools.dotc.core.Names.*
 import dotty.tools.dotc.core.Phases.Phase
 import dotty.tools.dotc.core.StdNames.nme
 import dotty.tools.dotc.parsing.Parsers
 import dotty.tools.dotc.report
+import dotty.tools.dotc.util.Property
 import dotty.tools.dotc.util.SourceFile
 import dotty.tools.dotc.util.Spans.Span
 import dotty.tools.dotc.util.SrcPos
 
-/** Parser-stage phase that splices the eval body into the enclosing
- *  source at the marker position and appends a synthesised
- *  `__Expression` class to the same package.
+/** Parses and inserts an eval body at [[EvalContext.placeholder]], then appends
+ *  the generated expression class to the compilation unit.
  *
- *  The marker is a valid identifier ([[EvalContext.placeholder]] =
- *  `__evalBodyPlaceholder__`), so after parsing it appears as
- *  `Ident(<marker>)` exactly where the user's `eval(...)` call stood.
+ *  The marker is a valid identifier, allowing tree-level replacement without
+ *  modifying occurrences in strings or comments. The replacement is a block
+ *  containing a marked result value, an opaque no-op that prevents constant
+ *  folding, and a read of the result.
  *
- *  Input:
- *  {{{
- *  object EnclosingTest:
- *    def f(): Int = ({ __evalBodyPlaceholder__ })
- *  }}}
- *
- *  Output:
- *  {{{
- *  object EnclosingTest:
- *    def f(): Int = ({
- *      val __evalResult: Int = { <parsed body> }
- *      Eval.__noFold__()  // suppress constant folding
- *      __evalResult
- *    })
- *
- *  class __Expression(thisObject: Object | Null,
- *                     bindings: Array[Eval.Binding])
- *      extends EvalExpressionBase(thisObject, bindings):
- *    def evaluate(): Any = ()
- *    // reflective accessor helpers are inherited from the base
- *  }}}
- *
- *  [[ExtractEvalBody]] later drains the spliced val's rhs into
- *  `__Expression.evaluate`, and [[ResolveEvalAccess]] lowers
- *  outer-scope references to reflective accessor calls.
- *
- *  Each compilation should hit exactly one marker. Extras are an
- *  error in test mode, a warning otherwise.
+ *  [[ExtractEvalBody]] later moves the result's right-hand side into `evaluate`,
+ *  and [[ResolveEvalAccess]] lowers outer references. A compilation is expected
+ *  to contain exactly one marker.
  */
 private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
   import SpliceEvalBody.*
@@ -58,16 +35,10 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
   override def phaseName: String = SpliceEvalBody.name
   override def isCheckable: Boolean = false
 
-  /** Sticky for the duration of the run: true once the marker has been
-   *  found and replaced. Read by the post-run "marker missing" check.
-   */
+  /** Whether this run found and replaced a marker. */
   private var spliced = false
 
-  /** Sticky for the duration of the run, like [[spliced]]: latches
-   *  once the `__Expression` class has been appended, so it lands in
-   *  exactly one package (the first containing a splice) even if the
-   *  compilation unit has multiple PackageDefs.
-   */
+  /** Whether the expression class has been appended to a package in this run. */
   private var expressionAppended = false
 
   protected def run(using Context): Unit =
@@ -75,36 +46,24 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
     expressionAppended = false
     privateFieldsByThis = Map.empty
     privateMethodsByThis = Map.empty
+    overloadedPrivateMethodsByThis = Map.empty
     liftedDefParamNames = Set.empty
     bodyThisReceiver = termName(EvalNames.ThisBinding)
     liftedScopeReceivers = Map.empty
     selfAliasReceivers = Map.empty
     bareLookupLayers = Nil
-    // Pre-pass: lift each marker-bearing method out of its enclosing
-    // class or nested `object`. Otherwise the wrapper's compile emits
-    // a second class under the same source name as the already-loaded
-    // copy: instances crossing the two loaders fail `checkcast`
-    // ("X cannot be cast to X (different loaders)"), and for an
-    // `object` the body's reads and writes land on the re-elaborated
-    // module's fresh state instead of the live one.
+    // Lift marker-bearing methods out of classes and nested modules to avoid
+    // creating wrapper copies with different class identity or module state.
     //
-    // Gated on `import rs$line$N.{*}` (REPL) or `config.standalone`:
-    // the lift drops the declaration, so it's only safe when the
-    // class/object is reachable elsewhere, either as the REPL
-    // session's compiled copy or (standalone) as the program's own
-    // classes on the runtime classpath. Bridge-test fixtures have
-    // neither and rely on the wrapper to be the only source of the
-    // class.
+    // Dropping declarations is safe only when the original classes are reachable
+    // through a REPL session import or the standalone runtime classpath.
     val hasReplSessionImport = sourceImportsReplSession(ctx.compilationUnit.untpdTree)
     val extractor = new ClassMethodExtractor
     val lifted =
       if hasReplSessionImport || config.standalone then extractor.transform(ctx.compilationUnit.untpdTree)
       else ctx.compilationUnit.untpdTree
-    // Lifted methods have no enclosing `This` for the original class,
-    // so rewrite plain `this` in the body to the injected `__this__`
-    // param. Private member accesses also need reflective indirection:
-    // `import __this__.*` doesn't expose privates, and the typer
-    // rejects a direct `__this__.v` Select for private `v`.
+    // Lifted methods receive explicit enclosing instances. Private and protected
+    // members are not imported, so their accesses use reflection helpers.
     val parsedBody =
       if extractor.didLift then rewritePrivateAccessInBody(rewriteThisInBody(parseBody))
       else parseBody
@@ -116,59 +75,35 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
       if needsHelpers then injectReflectionHelpers(lifted) else lifted
     val splicer = new Splicer(parsedBody, expressionClass)
     ctx.compilationUnit.untpdTree = splicer.transform(withReflectionHelpers)
-    // Always an error: with no marker, no `__Expression` class is
-    // appended and the adapter would fail much later with an opaque
-    // `ClassNotFoundException`. A missing marker means the
-    // enclosing-source slice was corrupted, not a user mistake.
+    // Report a missing marker here instead of failing later while loading the
+    // expression class.
     if !spliced then
       report.error(
         s"eval body marker `${config.marker}` not found in enclosing source",
         ctx.compilationUnit.untpdTree.srcPos
       )
 
-  /** Walk the parsed body and redirect references to private class
-   *  members through the synthesised reflection helpers. Three
-   *  helpers cover all access patterns:
+  /** Redirects private and protected member access in a lifted body through
+   *  reflection helpers:
    *
    *    - `__refl_get__(qual, name)` for private field reads
    *    - `__refl_set__(qual, name, rhs)` for private field writes
    *    - `__refl_call__(qual, name, args)` for private method calls
    *
-   *  `qual` is the lifted-def parameter that captured the relevant
-   *  `this`: `__this__` for the innermost class, `__this__<OuterName>`
-   *  for each enclosing scope (matching what
-   *  [[rewriteThisInBody]] produces from `OuterName.this`). The
-   *  body-shape patterns recognised:
-   *
-   *    Field reads:
-   *      - `__this__.x`  →  `__refl_get__(__this__, "x").asInstanceOf[T]`
-   *      - bare `x`      →  same (only if the innermost scope owns `x`
-   *                         and no method param shadows it)
-   *
-   *    Field writes:
-   *      - `__this__.x = rhs`        →  `__refl_set__(__this__, "x", rhs)`
-   *
-   *    Method calls:
-   *      - `__this__.m(args)`        →  `__refl_call__(__this__, "m",
-   *                                       Array(args*)).asInstanceOf[R]`
-   *      - bare `m(args)`            →  same (innermost-scope only,
-   *                                       not shadowed by a param)
-   *      - `__this__.m`/bare `m`     →  same with empty args (for
-   *                                       parens-omitted nullary defs)
-   *
-   *  Known shape gaps (the typer rejects these with a private-access
-   *  error rather than mis-rewriting): curried private calls
-   *  (`m(a)(b)`), explicit type application (`m[T](x)`), overloaded
-   *  private methods (the name-keyed map keeps one return type per
-   *  name), and fully-qualified `A.B.x` paths.
+   *  The qualifier identifies the captured enclosing instance. Bare names use
+   *  the nearest dropped scope unless a body-local definition or parameter
+   *  shadows them.
+ *
+   *  Curried calls, explicit type applications, and fully qualified nested paths
+   *  are left for the typer to reject. Overloaded methods are diagnosed when the
+   *  body refers to them because the parser-stage rewrite cannot preserve static
+   *  overload selection.
    */
   private def rewritePrivateAccessInBody(body: Tree)(using Context): Tree =
     if privateFieldsByThis.isEmpty && privateMethodsByThis.isEmpty then body
     else
       val rewriter = new ShadowTrackingMap:
-        /** Bare-name candidate: a term name neither re-bound by the
-         *  body itself nor shadowed by a lifted-def param.
-         */
+        /** Whether a bare term name is not shadowed by body or method bindings. */
         private def bareCandidate(name: Name): Boolean =
           name.isTermName
             && !shadowed.contains(name.asTermName)
@@ -178,38 +113,37 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
           qual.isTermName && !shadowed.contains(qual.asTermName)
 
         override def transform(tree: Tree)(using Context): Tree = tree match
-          // Write: `qual.name = rhs` for any qual we know about.
+          // Qualified field write.
           case Assign(Select(Ident(qual), name), rhs)
               if name.isTermName && knownQual(qual)
                 && privateFieldsByThis.get(qual.toTermName).exists(_.contains(name.toTermName)) =>
             mkReflSet(qual.toTermName, name.toTermName, transform(rhs)).withSpan(tree.span)
 
-          // Write: bare `name = rhs` for a private field of a dropped
-          // layer (innermost-wins, like lexical scoping).
+          // Bare field write, resolved from the innermost dropped scope.
           case Assign(Ident(name), rhs) if bareCandidate(name) =>
             lookupBareMember(name.toTermName) match
               case Some((receiver, _, false)) =>
                 mkReflSet(receiver, name.toTermName, transform(rhs)).withSpan(tree.span)
               case _ => super.transform(tree)
 
-          // Method call: `qual.m(args*)`.
+          // Qualified method call.
           case Apply(Select(Ident(qual), name), args)
               if name.isTermName && knownQual(qual)
                 && privateMethodsByThis.get(qual.toTermName).exists(_.contains(name.toTermName)) =>
             val q = qual.toTermName
             val n = name.toTermName
+            reportUnsupportedOverload(q, n, tree.srcPos)
             mkReflCall(q, n, args.map(transform), privateMethodsByThis(q)(n)).withSpan(tree.span)
 
-          // Method call: bare `m(args*)`.
+          // Bare method call.
           case Apply(Ident(name), args) if bareCandidate(name) =>
             lookupBareMember(name.toTermName) match
               case Some((receiver, tpt, true)) =>
+                reportUnsupportedOverload(receiver, name.toTermName, tree.srcPos)
                 mkReflCall(receiver, name.toTermName, args.map(transform), tpt).withSpan(tree.span)
               case _ => super.transform(tree)
 
-          // Field read or parens-omitted method reference:
-          // `qual.name` (post-This-rewrite, qual is `__this__`,
-          // `__this__<Outer>`, or a lifted module's name).
+          // Qualified field read or parameterless method call.
           case Select(Ident(qual), name) if name.isTermName && knownQual(qual) =>
             val q = qual.toTermName
             val n = name.toTermName
@@ -217,30 +151,42 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
               case Some(tpt) => mkReflGet(q, n, tpt).withSpan(tree.span)
               case None =>
                 privateMethodsByThis.get(q).flatMap(_.get(n)) match
-                  case Some(tpt) => mkReflCall(q, n, Nil, tpt).withSpan(tree.span)
+                  case Some(tpt) =>
+                    reportUnsupportedOverload(q, n, tree.srcPos)
+                    mkReflCall(q, n, Nil, tpt).withSpan(tree.span)
                   case None => super.transform(tree)
 
-          // Bare `name`: private field read or nullary private
-          // method call against the innermost dropped layer that
-          // declares the name.
+          // Bare field read or parameterless method call.
           case id @ Ident(name) if bareCandidate(name) =>
             lookupBareMember(name.toTermName) match
               case Some((receiver, tpt, false)) =>
                 mkReflGet(receiver, name.toTermName, tpt).withSpan(id.span)
               case Some((receiver, tpt, true)) =>
+                reportUnsupportedOverload(receiver, name.toTermName, id.srcPos)
                 mkReflCall(receiver, name.toTermName, Nil, tpt).withSpan(id.span)
               case None => id
 
           case _ => transformScoped(tree)
       rewriter.transform(body)
 
-  /** Resolve a bare term reference against the dropped layers,
-   *  innermost-first, mirroring lexical scoping at the original
-   *  position. Stops at the first layer declaring the name at all:
-   *  a private (or protected) declaration reroutes through that
-   *  layer's receiver, a public one resolves through the wildcard
-   *  import and needs no rewrite. Returns
-   *  `(receiver, declared type tree, isMethod)`.
+  /** Reports unsupported private or protected overloads only when referenced by
+   *  the eval body, so unrelated declarations do not reject the call.
+   */
+  private def reportUnsupportedOverload(
+      receiver: TermName,
+      method: TermName,
+      pos: SrcPos
+  )(using Context): Unit =
+    if overloadedPrivateMethodsByThis.get(receiver).exists(_.contains(method)) then
+      report.error(
+        s"dynamic eval does not support overloaded private/protected method `$method`; " +
+          "the selected static signature cannot be preserved by the reflective lift",
+        pos
+      )
+
+  /** Resolves a bare name from inner to outer dropped scopes. Public declarations
+   *  stop the search without a rewrite; inaccessible declarations return their
+   *  receiver, type tree, and method flag.
    */
   private def lookupBareMember(name: TermName): Option[(TermName, Tree, Boolean)] =
     var layers = bareLookupLayers
@@ -256,14 +202,9 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
       layers = layers.tail
     None
 
-  /** UntypedTreeMap that tracks term names the body re-binds (block
-   *  locals, params, pattern binders, members of body-local
-   *  classes), so name-based rewrite cases in subclasses can skip
-   *  them: a body-local `v` must not be redirected at a same-named
-   *  member of a dropped class layer. A block's bindings shadow for
-   *  the *whole* block: at the original position a reference before
-   *  the definition is a forward-reference error, never a read of
-   *  the outer member.
+  /** Tracks source-level bindings so name-based rewrites preserve shadowing.
+   *  Block bindings shadow the entire block because an earlier reference is a
+   *  forward-reference error, not a reference to the outer member.
    */
   private abstract class ShadowTrackingMap extends UntypedTreeMap:
     protected var shadowed: Set[TermName] = Set.empty
@@ -275,9 +216,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
         shadowed ++= names
         try op finally shadowed = saved
 
-    /** Scope-introducing shapes, shared by every body rewriter.
-     *  Subclasses route their default case here.
-     */
+    /** Handles scope-introducing trees for all body rewriters. */
     protected final def transformScoped(tree: Tree)(using Context): Tree = tree match
       case bk: Block =>
         withShadowed(blockBinders(bk.stats))(super.transform(bk))
@@ -287,11 +226,8 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
         withShadowed(paramBinders(dd.paramss))(super.transform(dd))
       case cd: CaseDef =>
         withShadowed(patternBinders(cd.pat))(super.transform(cd))
-      // Over-approximation for `for` comprehensions: all generator
-      // binders shadow the whole tree, including the first
-      // generator's rhs (where the original scope would still see
-      // the outer name). The error mode is a visible typer error,
-      // not a silent wrong-receiver rewrite.
+      // Conservatively treat all for-comprehension binders as visible throughout
+      // the tree. This may preserve a typer error but cannot select a wrong receiver.
       case fy: ForYield =>
         withShadowed(enumBinders(fy.enums))(super.transform(fy))
       case fd: ForDo =>
@@ -321,9 +257,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
   private def paramBinders(paramss: List[ParamClause]): Set[TermName] =
     paramss.flatMap(_.collect { case vd: ValDef => vd.name }).toSet
 
-  /** Term names bound by a pattern: `x @ ...` binds and a lowercase
-   *  unquoted ident is a variable pattern.
-   */
+  /** Collects binders and variable identifiers from a pattern. */
   private def patternBinders(pat: Tree)(using Context): Set[TermName] =
     val acc = collection.mutable.Set.empty[TermName]
     val finder = new UntypedTreeTraverser:
@@ -348,12 +282,8 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
     case tmpl: Template => templateMemberNames(tmpl)
     case _ => Set.empty
 
-  /** `__refl_get__(__this__, "name").asInstanceOf[T]`. The cast hands
-   *  the reflective `Any` back at the field's declared type so the
-   *  surrounding expression keeps its type. The `tpt` is duplicated
-   *  to avoid sharing tree nodes with the dropped class declaration.
-   *  With no recoverable type (inferred declaration, non-literal
-   *  initializer) the cast is skipped and the read types as `Any`.
+  /** Builds a reflective field read and restores its declared type when known.
+   *  The type tree is copied because the original class declaration is dropped.
    */
   private def mkReflGet(thisName: TermName, fieldName: TermName, tpt: Tree)(using Context): Tree =
     val call = Apply(
@@ -363,12 +293,8 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
     if tpt.isEmpty then call
     else TypeApply(Select(call, termName("asInstanceOf")), List(freshTypeTree(tpt)))
 
-  /** Fresh copy of an untyped type tree, recursively duplicating the
-   *  common `Ident`/`AppliedTypeTree`/`Select` shapes so those nodes'
-   *  identity is not shared with the original ClassDef's tparam list.
-   *  Other shapes (function types, tuples, refinements) are returned
-   *  as-is: sharing them has not been observed to break the typer,
-   *  and a full deep copy would have to handle every untpd node.
+  /** Copies type-tree shapes whose identity must not be shared with a dropped
+   *  class declaration. Other untyped shapes are safe to reuse.
    */
   private def freshTypeTree(tpt: Tree)(using Context): Tree = tpt match
     case Ident(n) => Ident(n).withSpan(tpt.span)
@@ -384,17 +310,12 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
       List(Ident(thisName), Literal(Constant(fieldName.toString)), rhs)
     )
 
-  /** `__refl_call__(qual, "name", Array[Object](args*)).asInstanceOf[R]`.
-   *  Method args are wrapped in an `Object` array; primitives get
-   *  cast to `AnyRef` so Scala auto-boxes them on the way in. The
-   *  outer cast hands the reflective `Any` back at the method's
-   *  declared return type.
+  /** Builds a reflective method call, boxing arguments and restoring the
+   *  declared return type when known.
    */
   private def mkReflCall(qual: TermName, methodName: TermName, args: List[Tree], retTpt: Tree)(using Context): Tree =
     val boxedArgs = args.map { a =>
-      // `arg.asInstanceOf[Object]` triggers Scala's value-class
-      // boxing for primitives so `Int` arrives as `java.lang.Integer`
-      // (which Method.invoke expects for an `Int` parameter).
+      // Casting to Object boxes primitives for Method.invoke.
       TypeApply(Select(a, termName("asInstanceOf")), List(Ident(typeName("Object"))))
     }
     val argArray =
@@ -410,14 +331,8 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
     if retTpt.isEmpty then rawCall
     else TypeApply(Select(rawCall, termName("asInstanceOf")), List(freshTypeTree(retTpt)))
 
-  /** Inject typer-only stubs of `__refl_get__/_set__/_call__` into the
-   *  wrapper module. The bodies are `???` because no one ever calls
-   *  these at runtime: `ExtractEvalBody.retargetReflHelpers` rewrites
-   *  every body reference to point at the inherited copies on
-   *  [[EvalExpressionBase]] (which delegate to `getField` / `setField` /
-   *  `callMethod` with an empty className). The stubs exist purely so
-   *  the body type-checks against the wrapper's lifted def at typer
-   *  time, when the body still lives in the wrapper's scope.
+  /** Injects typer-only reflection stubs into the wrapper. Extraction retargets
+   *  all references to [[EvalExpressionBase]], so these bodies never run.
    */
   private def injectReflectionHelpers(tree: Tree)(using Context): Tree =
     val helpersSrc =
@@ -433,8 +348,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
     val parsed = parser.parse().asInstanceOf[PackageDef]
     val helpersModule = parsed.stats.head.asInstanceOf[ModuleDef]
     val helperMethods = helpersModule.impl.body
-    // Place the methods at the top of the wrapper module's body so
-    // they're in scope wherever the marker lands.
+    // Place helpers before the enclosing source so every splice site sees them.
     val rewriter = new UntypedTreeMap:
       override def transform(t: Tree)(using Context): Tree = t match
         case mod: ModuleDef =>
@@ -476,20 +390,12 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
    *    - a declared self alias → its layer's receiver
    *      ([[selfAliasReceivers]]).
    *
-   *  Inside a class/object the body itself declares, the plain-`this`
-   *  rewrite is suspended (that `this` belongs to the body-local
-   *  type) while the qualified and alias rewrites still apply, so a
-   *  body-defined `class B` can reach the dropped `A` via `A.this.x`.
+   *  Inside a type declared by the body, plain `this` remains local to that type,
+   *  while qualified references and aliases to dropped scopes are still rewritten.
    */
   private def rewriteThisInBody(body: Tree)(using Context): Tree =
     val rewriter = new ShadowTrackingMap:
-      /** Inside a class/object declared by the body itself (named,
-       *  anonymous, or a module). Plain `this` (and a qualified
-       *  `this` naming that body-local type) belongs to the
-       *  body-local type and stays; a qualified `this` naming a
-       *  *dropped* enclosing layer still rewrites, as do self
-       *  aliases.
-       */
+      /** Whether plain `this` belongs to a type declared by the eval body. */
       private var inBodyLocalClass = false
 
       private def suspendingThis(binders: Set[TermName], tree: Tree)(using Context): Tree =
@@ -500,34 +406,21 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
 
       override def transform(tree: Tree)(using Context): Tree = tree match
         case t @ This(qual) if qual.name.isEmpty =>
-          // `__this__` after a class lift; the object's own name
-          // after a module lift (a singleton's `this` IS the module).
+          // Class lifts use __this__; module lifts use the singleton name.
           if inBodyLocalClass then t
           else Ident(bodyThisReceiver).withSpan(t.span)
         case t @ This(qual) if liftedScopeReceivers.contains(qual.name.toTypeName) =>
-          // Qualified `OuterName.this` of a dropped layer — point at
-          // that layer's receiver: `__this__` for the innermost
-          // lifted class, the `__this__<OuterName>` parameter for an
-          // outer class (matching the binding names
-          // `EvalRewriteTyped` emits), the object itself for a
-          // lifted static module.
+          // Redirect qualified this to the receiver recorded for its dropped scope.
           Ident(liftedScopeReceivers(qual.name.toTypeName)).withSpan(t.span)
         case t: This =>
-          // Qualified `this` of a body-local type (or of a class the
-          // lift never touched): leave it for the typer.
+          // Other qualified this references retain their original owner.
           t
-        // A declared self alias of a dropped class/object layer is
-        // another name for that layer's `this`; redirect it at the
-        // matching receiver, unless the body re-binds the name.
+        // Redirect unshadowed self aliases of dropped scopes.
         case id @ Ident(name)
             if name.isTermName && !shadowed.contains(name.asTermName)
               && selfAliasReceivers.contains(name.toTermName) =>
           Ident(selfAliasReceivers(name.toTermName)).withSpan(id.span)
-        // Descend into a body-local class/object/anonymous class
-        // with the plain-`this` rewrite suspended: its `this` refers
-        // to that nested type, but qualified `this` naming a dropped
-        // layer (`A.this.x` inside a body-defined `class B`) still
-        // needs the receiver redirect.
+        // Suspend plain-this rewriting inside types declared by the body.
         case td: TypeDef if td.isClassDef =>
           suspendingThis(templateBinders(td.rhs), td)
         case mod: ModuleDef =>
@@ -542,12 +435,8 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
       tree match
         case pkg: PackageDef =>
           val transformed = super.transform(pkg).asInstanceOf[PackageDef]
-          // Append the synthesised __Expression class as a sibling
-          // of the enclosing source. We append to the first PackageDef
-          // that contains a splice; subsequent PackageDefs (rare) are
-          // left alone. `expressionAppended` is kept distinct from
-          // `spliced` so the latter stays a sticky "did the marker
-          // ever appear" signal for the post-run check.
+          // Append the expression class to the first package containing a splice.
+          // Keep this state separate from marker detection for the final check.
           if spliced && !expressionAppended then
             expressionAppended = true
             cpy.PackageDef(transformed)(
@@ -556,36 +445,19 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
             )
           else transformed
 
-        // Block containing the marker (as its trailing expression or
-        // as a statement): splice the body in *and* hoist a copy of
-        // any sibling `given` declared before the marker into the
-        // eval body. Without the hoist, the typer compiles the
-        // givens at the def's top-level scope but ExtractEvalBody
-        // only moves the eval body to evaluate, so the body's
-        // `summon[T]` references a given that lives outside
-        // evaluate's scope at runtime; the bindings array's
-        // synthetic `__given_<n>` name doesn't match the typer's
-        // `given_<T>` synthesised name, and the lookup fails.
-        // Folding a copy into the spliced body keeps resolution
-        // self-contained: the body's summon picks the inner copy,
-        // while sibling statements keep resolving the original
-        // (the enclosing def is typechecked but never run, so the
-        // initializer doesn't execute twice).
+        // Copy preceding givens into the inserted body so they move with it to
+        // evaluate. The original enclosing method is checked but never run, so
+        // this does not evaluate an initializer twice.
         case bk @ Block(stats, expr) if isMarkerIdent(expr) || stats.exists(isMarkerIdent) =>
           val markerIdx =
             if isMarkerIdent(expr) then stats.length else stats.indexWhere(isMarkerIdent)
-          // Only givens *preceding* the marker are in scope for the
-          // body at the original position (given vals cannot be
-          // forward-referenced).
+          // Given values are visible only after their declaration.
           val hoistedGivens: List[Tree] = stats.take(markerIdx).collect {
             case vd: ValDef if vd.mods.flags.is(Given) => vd
             case dd: DefDef if dd.mods.flags.is(Given) => dd
           }
-          // Sibling defs declared without parens (`def g = 42`):
-          // strip any `g()` use in the body to a bare `g`. Otherwise
-          // the typer rejects the empty-Apply since the actual def
-          // doesn't take parameters. Defs *can* be forward-referenced,
-          // so all stats count.
+          // A parameterless sibling def may be referenced as g() in generated
+          // text; normalize it to g. Defs may be forward-referenced.
           val parenslessDefNames = stats.collect {
             case dd: DefDef if dd.name != nme.CONSTRUCTOR && !dd.name.isEmpty && dd.paramss.isEmpty =>
               dd.name
@@ -602,91 +474,55 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
             else transform(expr)
           cpy.Block(bk)(newStats, newExpr)
 
-        // Marker found at expression position. Replace with the spliced
-        // block. The marker name comes from `EvalContext.placeholder`
-        // by default; configurable via `EvalCompilerConfig.marker`.
+        // Replace a marker in any remaining expression position.
         case id: Ident if id.name.toString == config.marker =>
           mkExprBlock(body, id)
 
         case _ => super.transform(tree)
 
-  /** Per-`__this__` qualifier maps for each lifted class's private
-   *  members. Keys are the lifted def's parameter name — `__this__`
-   *  for the innermost class, `__this__<OuterName>` for each outer
-   *  scope. Drive the body rewriter when redirecting `__this__.v`
-   *  / bare-name references to reflective helpers. Reset per `run`.
+  /** Inaccessible members grouped by the receiver introduced for each dropped
+   *  scope. Reset for every run.
    */
   private var privateFieldsByThis: Map[TermName, Map[TermName, Tree]] = Map.empty
   private var privateMethodsByThis: Map[TermName, Map[TermName, Tree]] = Map.empty
+  private var overloadedPrivateMethodsByThis: Map[TermName, Set[TermName]] = Map.empty
 
-  /** Receiver for plain `this` in the body after a lift: `__this__`
-   *  when the marker-bearing def was lifted out of a class, the
-   *  object's own (statically reachable) name when it was lifted
-   *  out of a static module. Reset per `run`.
+  /** Receiver replacing plain `this` after a class or module lift.
    */
   private var bodyThisReceiver: TermName = termName(EvalNames.ThisBinding)
 
-  /** Scope-name → receiver-term mapping for every class/object layer
-   *  a lift dropped. Drives the qualified `<Name>.this` body rewrite:
-   *  the innermost lifted class maps to `__this__`, outer class
-   *  layers to their `__this__<Name>` parameter, module layers to
-   *  the object's own name. Innermost-wins on name collisions.
-   *  Reset per `run`.
+  /** Receiver for each dropped class or module scope. Inner scopes take
+   *  precedence when source names collide.
    */
   private var liftedScopeReceivers: Map[TypeName, TermName] = Map.empty
 
-  /** Declared self-alias name → receiver-term mapping for the
-   *  class/object layers a lift dropped (`class A: self =>` makes
-   *  `self` another name for `A.this`). The body rewrite redirects
-   *  bare references to the alias at the matching receiver. Reset
-   *  per `run`.
+  /** Receiver for each self alias declared by a dropped scope.
    */
   private var selfAliasReceivers: Map[TermName, TermName] = Map.empty
 
-  /** Value-param names on the lifted def. The body rewriter consults
-   *  this to avoid shadowing a method param with a same-named private
-   *  class member. Reset per `run`.
+  /** Parameters that shadow inaccessible members after lifting.
    */
   private var liftedDefParamNames: Set[TermName] = Set.empty
 
-  /** Dropped layers in innermost-first order, each with the receiver
-   *  term reaching it (`__this__`, `__this__<Name>`, or a module's
-   *  own name). Drives [[lookupBareMember]]'s lexical walk for bare
-   *  references to private members of *any* dropped layer. Reset per
-   *  `run`.
+  /** Dropped scopes in lexical lookup order with their runtime receivers.
    */
   private var bareLookupLayers: List[(TermName, OuterScope)] = Nil
 
-  /** Innermost-scope privates — those reachable without an explicit
-   *  `this.` qualifier in the original class or object body.
-   */
+  /** Inaccessible members reachable without an explicit receiver. */
   private def privateFieldsInScope: Map[TermName, Tree] =
     privateFieldsByThis.getOrElse(bodyThisReceiver, Map.empty)
   private def privateMethodsInScope: Map[TermName, Tree] =
     privateMethodsByThis.getOrElse(bodyThisReceiver, Map.empty)
 
-  /** Pre-pass that lifts each marker-bearing method out of its
-   *  enclosing class:
+  /** Lifts marker-bearing methods out of their enclosing classes and modules.
    *
-   *    - The DefDef is hoisted to the surrounding scope.
-   *    - For non-singleton classes, a `__this__: <ClassName>`
-   *      parameter is prepended and the body is wrapped in
-   *      `import __this__.*` so unqualified member references
-   *      resolve through it.
-   *    - Singletons need no `__this__`: they're reachable via
-   *      `import rs$line$N.X.*`.
-   *    - The class declaration itself is dropped — the REPL session
-   *      already has it compiled, and a duplicate would mint a
-   *      second `X.class` under a different fully-qualified JVM name,
-   *      breaking `checkcast`.
-   *
-   *  Sibling methods that don't carry the marker are also dropped:
-   *  only `__Expression.evaluate` runs at runtime.
+   *  Class methods receive explicit enclosing-instance parameters; modules use
+   *  their static paths. Dropping the copied declaration prevents duplicate JVM
+   *  class identities. Non-marker siblings are unnecessary because only
+   *  `evaluate` runs.
    */
   private class ClassMethodExtractor extends UntypedTreeMap:
-    /** True once any class-method lift has fired during the walk.
-     *  Used by [[run]] to gate the `this` → `__this__` body rewrite.
-     */
+    /** Whether the body requires receiver and inaccessible-member rewriting. */
     var didLift: Boolean = false
 
     override def transform(tree: Tree)(using Context): Tree = tree match
@@ -714,8 +550,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
         // template-level statement, a parent argument): keep the
         // re-elaborated class so the splice lands in place. The
         // typed path still threads `this` through the captured
-        // owner chain; only the duplicate-class minting is not
-        // avoided.
+        // owner chain; only duplicate class generation remains.
         List(td)
       case dd: DefDef if containsMarker(dd) =>
         // Top-level marker-bearing def: rename it so the wrapper's
@@ -723,8 +558,8 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
         // compiled version. Body code calling the def by its
         // original name resolves to the session-level one — which
         // is essential for recursive eval (the body re-enters the
-        // *real* function, not the wrapper's stub whose RHS gets
-        // drained into `__Expression.evaluate` by ExtractEvalBody).
+        // *real* function, not the wrapper stub whose RHS moves into
+        // `__Expression.evaluate` in ExtractEvalBody).
         List(renameTopLevelDef(dd))
       case mod: ModuleDef
           if containsMarker(mod) && !isWrapperModule(mod) && moduleLiftable(mod) =>
@@ -745,7 +580,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
         // Marker inside a top-level extension method: rename the
         // marker-bearing member like a top-level def, so a recursive
         // call in the body resolves through the session import to
-        // the live extension instead of the wrapper's drained stub.
+        // the live extension instead of the wrapper's emptied stub.
         List(ExtMethods(ext.paramss, ext.methods.map {
           case m: DefDef if containsMarker(m) => renameTopLevelDef(m)
           case m => m
@@ -753,7 +588,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
       case other => List(other)
   end ClassMethodExtractor
 
-  /** The synthesised `__EvalWrapper_<uuid>` module that hosts the
+  /** The synthesized `__EvalWrapper_<uuid>` module that hosts the
    *  spliced enclosing source. It always contains the marker but must
    *  never be dropped by the module lift.
    */
@@ -817,7 +652,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
    *  `object` (every enclosing layer up to the wrapper is also an
    *  object). The runtime module is reachable on the classpath (or
    *  through the REPL session imports), so instead of re-elaborating
-   *  the object (which would mint a second module class whose state
+   *  the object (which would create a second module class whose state
    *  is fresh and whose nested classes duplicate the originals), we:
    *
    *    - drop the object declaration entirely;
@@ -840,6 +675,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
     val scope = OuterScope(
       modName.toTypeName, Ident(modName), Nil,
       templateMemberNames(tmpl), templatePrivateFields(tmpl), templatePrivateMethods(tmpl),
+      templateOverloadedPrivateMethods(tmpl),
       isModule = true,
       imports = templateImports(tmpl), typeMemberNames = templateTypeMemberNames(tmpl))
     val newOuters = scope :: outerScopes
@@ -848,6 +684,8 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
     // and (as the innermost receiver) bare member references.
     privateFieldsByThis = privateFieldsByThis.updated(modName, scope.privateFields)
     privateMethodsByThis = privateMethodsByThis.updated(modName, scope.privateMethods)
+    overloadedPrivateMethodsByThis =
+      overloadedPrivateMethodsByThis.updated(modName, scope.overloadedPrivateMethods)
     liftedScopeReceivers = liftedScopeReceivers.updated(mod.name.toTypeName, modName)
     templateSelfAlias(tmpl).foreach { alias =>
       selfAliasReceivers = selfAliasReceivers.updated(alias, modName)
@@ -888,7 +726,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
    *  splice still has a place to land. The `Given` flag is stripped:
    *  a renamed given would still win implicit search over the
    *  session's live copy (a local given beats an imported one), and
-   *  its rhs is the drained stub, so a body `summon` would observe
+   *  its rhs is the emptied stub, so a body `summon` would observe
    *  the stub instead of the live instance.
    */
   private def renameTopLevelDef(dd: DefDef)(using Context): DefDef =
@@ -947,8 +785,8 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
   /** Lift each marker-bearing DefDef out of the given ClassDef.
    *  Returns the lifted defs, with the original class declaration
    *  dropped. The class is reachable via the wrapper's
-   *  `import rs$line$N.{*}`, so dropping the local declaration is
-   *  the whole point of the rewrite.
+   *  `import rs$line$N.{*}`; dropping the local declaration prevents a
+   *  duplicate runtime class.
    */
   private def liftClassMethods(td: TypeDef)(using Context): List[Tree] =
     liftClassMethodsRec(td, outerScopes = Nil)
@@ -979,7 +817,9 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
     val members = classMemberNames(td)
     val privateFields = classPrivateFields(td)
     val privateMethods = classPrivateMethods(td)
+    val overloadedPrivateMethods = classOverloadedPrivateMethods(td)
     val scope = OuterScope(td.name, typeRef, tparams, members, privateFields, privateMethods,
+      overloadedPrivateMethods,
       selfAlias = templateSelfAlias(tmpl),
       imports = templateImports(tmpl), typeMemberNames = templateTypeMemberNames(tmpl))
     val newOuters = scope :: outerScopes
@@ -995,6 +835,8 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
       bareLookupLayers = (innermostThis, scope) :: outerScopes.map(s => (receiverName(s), s))
       privateFieldsByThis = privateFieldsByThis.updated(innermostThis, privateFields)
       privateMethodsByThis = privateMethodsByThis.updated(innermostThis, privateMethods)
+      overloadedPrivateMethodsByThis =
+        overloadedPrivateMethodsByThis.updated(innermostThis, overloadedPrivateMethods)
       templateSelfAlias(tmpl).foreach { alias =>
         selfAliasReceivers = selfAliasReceivers.updated(alias, innermostThis)
       }
@@ -1004,6 +846,8 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
         val q = receiverName(s)
         privateFieldsByThis = privateFieldsByThis.updated(q, s.privateFields)
         privateMethodsByThis = privateMethodsByThis.updated(q, s.privateMethods)
+        overloadedPrivateMethodsByThis =
+          overloadedPrivateMethodsByThis.updated(q, s.overloadedPrivateMethods)
         liftedScopeReceivers = liftedScopeReceivers.updated(s.name, q)
         s.selfAlias.foreach { alias =>
           selfAliasReceivers = selfAliasReceivers.updated(alias, q)
@@ -1044,7 +888,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
    *
    *  `privateFields` carries the names of private val/var members
    *  (with their declared type tree) so the body rewriter can
-   *  redirect references to them through the synthesised reflective
+   *  redirect references to them through the synthesized reflective
    *  accessors — `import __this__.*` doesn't expose private members,
    *  and the typer rejects direct `__this__.v` accesses when v is
    *  private. Reflection sidesteps both checks.
@@ -1056,6 +900,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
       memberNames: Set[TermName],
       privateFields: Map[TermName, Tree],
       privateMethods: Map[TermName, Tree],
+      overloadedPrivateMethods: Set[TermName],
       isModule: Boolean = false,
       selfAlias: Option[TermName] = None,
       imports: List[Tree] = Nil,
@@ -1150,11 +995,14 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
 
   /** Map of private method names → declared return type tree.
    *  Mirrors [[classPrivateFields]] for `def`s, so the body rewriter
-   *  can route private method calls through the synthesised
+   *  can route private method calls through the synthesized
    *  `__refl_call__` helper.
    */
   private def classPrivateMethods(td: TypeDef)(using Context): Map[TermName, Tree] =
     templatePrivateMethods(td.rhs.asInstanceOf[Template])
+
+  private def classOverloadedPrivateMethods(td: TypeDef)(using Context): Set[TermName] =
+    templateOverloadedPrivateMethods(td.rhs.asInstanceOf[Template])
 
   private def templatePrivateMethods(tmpl: Template)(using Context): Map[TermName, Tree] =
     val builder = collection.mutable.LinkedHashMap.empty[TermName, Tree]
@@ -1166,6 +1014,23 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
       case _ =>
     }
     builder.toMap
+
+  /** Private/protected names that participate in an overload set. The count
+   *  includes public members of the same name because they are candidates in
+   *  the original static overload resolution too.
+   */
+  private def templateOverloadedPrivateMethods(tmpl: Template)(using Context): Set[TermName] =
+    val methodCounts = tmpl.body.collect {
+      case dd: DefDef if dd.name != nme.CONSTRUCTOR && !dd.name.isEmpty => dd.name.asTermName
+    }.groupMapReduce(identity)(_ => 1)(_ + _)
+    tmpl.body.collect {
+      case dd: DefDef
+          if dd.mods.flags.isOneOf(Private | Protected)
+            && dd.name != nme.CONSTRUCTOR
+            && !dd.name.isEmpty
+            && methodCounts.getOrElse(dd.name.asTermName, 0) > 1 =>
+        dd.name.asTermName
+    }.toSet
 
   /** Term-member names of `td` (ctor val/var params and body
    *  val/var/def names). Drives the lifted def's `import __this__.*`:
@@ -1408,7 +1273,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
       rewriter.transform(tree)
 
   /** Parse `config.body` as a block expression. Spans on the result
-   *  are relative to `config.body`. Inner `eval` / `agent` calls
+   *  are relative to `config.body`. Inner `eval` and `@evalLike` calls
    *  inside the body have their `enclosingSource` argument filled in
    *  by [[EvalRewriteTyped]] (which receives `config` so it can
    *  compose the chained slice when needed). No rewrite happens here.
@@ -1419,7 +1284,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
     val parser = Parsers.Parser(source)(using newCtx)
     parser.block()
 
-  /** Parse the synthesised __Expression class declaration. Returns the
+  /** Parse the synthesized __Expression class declaration. Returns the
    *  list of top-level stats from the synthetic source, suitable for
    *  appending to a PackageDef's stats.
    */
@@ -1429,14 +1294,14 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
     val parser = Parsers.Parser(source)(using newCtx)
     parser.parse().asInstanceOf[PackageDef].stats
 
-  /** Source for the synthesised `__Expression` class.
+  /** Source for the synthesized `__Expression` class.
    *
    *  The class is a thin subclass of [[EvalExpressionBase]] — all
    *  reflection helpers (`getValue`, `getField`, `setField`,
    *  `callMethod`, `getOuter`, `reflectEval`, …) live on the
    *  pre-compiled `@caps.assumeSafe` base, so a safe-mode REPL
    *  session can extend it without re-checking the helpers'
-   *  `@rejectSafe` reflection calls. The synthesised subclass only
+   *  `@rejectSafe` reflection calls. The synthesized subclass only
    *  carries `evaluate()`, which [[ExtractEvalBody]] later fills in
    *  with the typed user body.
    */
@@ -1491,7 +1356,10 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
       val valTpt: Tree =
         if config.expectedType.isEmpty then TypeTree()
         else parseTypeFromString(config.expectedType, span)
-      val valDef = ValDef(EvalResultName, valTpt, effectiveBody).withSpan(span)
+      val resultName = UniqueName.fresh(EvalResultName)
+      val valDef = ValDef(resultName, valTpt, effectiveBody)
+        .withSpan(span)
+        .withAttachment(EvalResultTree, ())
       // `Eval.__noFold__()`, a no-op on the `@caps.assumeSafe` `Eval` module:
       // an opaque side-effecting call that prevents the surrounding expression
       // from being constant-folded before `ExtractEvalBody` drains the spliced
@@ -1500,7 +1368,7 @@ private[eval] class SpliceEvalBody(config: EvalCompilerConfig) extends Phase:
         SpliceEvalBody.selectFqn("dotty.tools.eval.Eval.__noFold__", span),
         Nil
       ).withSpan(span)
-      val tail = Ident(EvalResultName).withSpan(span)
+      val tail = Ident(resultName).withSpan(span)
       Block(List(valDef, effect), tail).withSpan(span)
 
   /** Parse a type-source string into an untyped Tree. Wraps the
@@ -1549,8 +1417,15 @@ private[eval] object SpliceEvalBody:
       Select(acc, part.toTermName).withSpan(span)
     }
 
-  /** Name of the val we splice the body's value into. The
-   *  [[ExtractEvalBody]] phase identifies the spliced val by this name
-   *  and drains its rhs into `__Expression.evaluate`.
+  /** Name of the val we splice the body's value into. This is only a
+   *  readable implementation name: [[ExtractEvalBody]] identifies the
+   *  generated val by [[EvalResultTree]], so a user val with the same
+   *  name cannot be mistaken for the splice anchor.
    */
   val EvalResultName: TermName = termName("__evalResult")
+
+  /** Marks the generated eval-result val across parser and typer tree
+   *  copies. A sticky attachment is needed because extraction runs on
+   *  the typed tree, several phases after the untyped splice.
+   */
+  val EvalResultTree: Property.StickyKey[Unit] = Property.StickyKey()

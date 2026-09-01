@@ -8,20 +8,18 @@ import dotty.tools.dotc.core.Symbols.*
 import dotty.tools.dotc.core.Types.*
 import dotty.tools.dotc.util.NameTransformer
 
-/** Encode dotty types and symbols to the JVM-level names that
- *  reflective `Class.getDeclaredField` / `getDeclaredMethod` lookups
- *  expect. Adapted from `dotty.tools.debug.JavaEncoding`, narrowed to
- *  what the eval reflective helpers need (Field, FieldAssign,
- *  MethodCall).
+/** Encodes compiler types and symbols as names used by JVM reflection.
+ *  Adapted from `dotty.tools.debug.JavaEncoding` for eval field and method
+ *  access.
  */
 private[eval] object JavaEncoding:
 
-  /** Encode a type to the form matched by `Class.getName`:
+  /** Encodes a type in the form returned by `Class.getName`:
    *    - primitives: `int`, `boolean`, ...
    *    - reference types: `java.lang.String`, `pkg.A$B`
    *    - arrays: `[Lpkg.A;`, `[I` for primitive arrays
    *
-   *  Used for parameter and return types of `callMethod` lookups.
+   *  The runtime uses this representation to select reflected methods.
    */
   def encode(tpe: Type)(using Context): String =
     tpe.widenDealias match
@@ -30,13 +28,13 @@ private[eval] object JavaEncoding:
       case AnnotatedType(t, _) => encode(t)
       case _ => "java.lang.Object"
 
-  /** Encode a type symbol — class or primitive — to its JVM name. */
+  /** Encodes a class or primitive type symbol as its JVM name. */
   def encode(sym: TypeSymbol)(using Context): String =
     if !sym.isClass then "java.lang.Object"
     else if sym.isPrimitiveValueClass then primitiveName(sym)
     else className(sym)
 
-  /** Encode a term name as it appears in JVM bytecode. */
+  /** Encodes a term name as it appears in JVM bytecode. */
   def encode(name: TermName)(using Context): String =
     NameTransformer.encode(name.toSimpleName).toString
 

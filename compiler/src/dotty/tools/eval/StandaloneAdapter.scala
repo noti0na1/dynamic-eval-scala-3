@@ -1,30 +1,21 @@
 package dotty.tools
 package eval
 
-/** Self-initialising [[Eval.Adapter]] used when no driver has
- *  installed one via [[Eval.withAdapter]], i.e. when `eval(...)`
- *  runs inside an ordinary Scala program compiled with
- *  `-Xdynamic-eval`, outside any REPL session.
+/** [[Eval.Adapter]] used by programs compiled with `-Xdynamic-eval` when no
+ *  REPL driver has installed an adapter.
  *
- *  The inner compile's classloader is the *caller's* classloader
- *  (found by walking the stack past the eval infrastructure frames):
- *  by definition it can see the program's classes, which both the
- *  inner compile's classpath synthesis and the wrapper's parent
- *  loader need.
+ *  The nearest caller classloader supplies the program classes needed by the
+ *  compiler classpath and generated wrapper.
  *
- *  Optional configuration comes from system properties, since a
- *  compiled program no longer knows its compile-time flags:
+ *  Optional configuration is read from these system properties:
  *
  *    - `dotty.tools.eval.settings`: whitespace-separated compiler
  *      options forwarded to the inner compile (e.g.
  *      `-Yexplicit-nulls -language:experimental.captureChecking`).
- *      Pass the same language options the program was compiled with
- *      so eval bodies are checked under the same rules. There is no
- *      quoting: an option value containing spaces cannot be
- *      expressed here. Path-valued configuration has dedicated
- *      properties (`…classpath`, `…logDir`), which are read whole.
+ *      Values are split on whitespace, so options containing spaces are not
+ *      supported. Use the dedicated properties for paths.
  *    - `dotty.tools.eval.classpath`: classpath for the inner
- *      compile. When unset, one is synthesised from the caller's
+ *      compile. When unset, one is synthesized from the caller's
  *      classloader chain plus `java.class.path`.
  *    - `dotty.tools.eval.logDir`: per-invocation log directory
  *      (same files as the REPL's `-Xrepl-eval-log-dir`).
@@ -78,10 +69,8 @@ private[eval] object StandaloneAdapter:
     if raw.isEmpty then Array.empty[String]
     else raw.split("\\s+").nn.map(_.nn)
 
-  /** Classloader of the nearest stack frame outside the eval
-   *  infrastructure (and the JDK). Falls back to the thread context
-   *  classloader, then to the loader of the eval infrastructure
-   *  itself.
+  /** Finds the nearest caller classloader, falling back to the thread context
+   *  loader and then the eval infrastructure loader.
    */
   private def callerClassLoader(): ClassLoader =
     def isInfraFrame(className: String): Boolean =

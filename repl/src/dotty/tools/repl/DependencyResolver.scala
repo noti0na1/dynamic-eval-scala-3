@@ -5,7 +5,7 @@ import java.net.{URL, URLClassLoader}
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 
-import dotty.tools.repl.AbstractFileClassLoader
+import dotty.tools.repl.AbstractFileClassLoader.InterruptInstrumentation
 
 import coursierapi.{Dependency, IvyRepository, MavenRepository, Repository}
 
@@ -98,7 +98,6 @@ object DependencyResolver:
     import dotty.tools.dotc.core.SymbolLoaders
     import dotty.tools.dotc.core.Symbols.defn
     import dotty.tools.io.{AbstractFile, ClassPath}
-    import dotty.tools.repl.ScalaClassLoader.fromURLsParallelCapable
 
     // Create a classloader with all the resolved JAR files
     val urls = files.map(_.toURI.toURL).toArray
@@ -116,7 +115,10 @@ object DependencyResolver:
     new AbstractFileClassLoader(
       prevOutputDir,
       depsClassLoader,
-      AbstractFileClassLoader.InterruptInstrumentation.fromString(ctx.settings.XreplInterruptInstrumentation.value)
+      InterruptInstrumentation.fromString(ctx.settings.XreplInterruptInstrumentation.value),
+      prevClassLoader match
+        case previous: AbstractFileClassLoader => previous
+        case _ => null
     )
 
 end DependencyResolver

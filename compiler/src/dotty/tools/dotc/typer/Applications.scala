@@ -1561,7 +1561,7 @@ trait Applications extends Compatibility {
         app1
     }
     val app3 = ConstFold(app2)
-    eval.EvalRewriteTyped.recordEvalProto(app3, pt) // support for -Xdynamic-eval, no-op for other calls
+    eval.EvalRewriteTyped.recordEvalProto(app3, pt) // Records expected types for dynamic eval calls.
     app3
   }
 

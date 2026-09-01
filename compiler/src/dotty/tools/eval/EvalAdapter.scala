@@ -6,39 +6,21 @@ import java.util.UUID
 import dotty.tools.dotc.core.StdNames.str
 import dotty.tools.io.{AbstractFile, virtualDirectory}
 
-/** REPL-side implementation of [[Eval.Adapter]]. Wraps a call's
- *  inputs (code, classloader, bindings, REPL session imports +
- *  output dir, compiler settings, expected type, enclosing source)
- *  into an [[EvalCompilerConfig]], drives an [[EvalCompilerBridge]]
- *  compile, loads the synthesised `__Expression` class, instantiates
- *  it with the captured this + bindings, and calls `evaluate()`.
+/** In-process implementation of [[Eval.Adapter]]. It compiles a generated
+ *  expression class, loads it with the captured session context, and invokes
+ *  `evaluate()`.
  *
- *  Distinguishing properties of this pipeline:
- *
- *    - The body is *tree-spliced* at the marker rather than text-
- *      substituted, so comments / string literals containing the
- *      marker substring don't get corrupted.
- *    - Each binding's source type comes from the typer
- *      ([[EvalRewriteTyped]]), not from `value.getClass`. Soundness
- *      for path-dependent and abstract types is preserved.
- *    - The wrapper is a real class; each eval call instantiates a
- *      fresh `__Expression` and invokes its `evaluate()` method.
- *    - Identical call sites cache the compiled `__Expression` class.
+ *  The body is spliced as a tree and binding types come from the typer.
+ *  Eligible rewritten call sites can reuse a cached wrapper class; each
+ *  invocation still receives a fresh wrapper instance and bindings array.
  */
 class EvalAdapter:
 
-  /** Compile and run one eval call in-process. The REPL session's
-   *  in-memory output dir is forwarded to the inner compile via
-   *  [[EvalCompilerBridge.compile]] so `rs$line$N` modules are
-   *  visible without being materialised to disk.
+  /** Compiles and runs one eval call. The REPL output directory is added to the
+   *  inner classpath so `rs$line$N` modules remain visible in memory.
    *
-   *  When called from the REPL driver, `replClasspath` should be
-   *  `state.context.settings.classpath.value` — using the REPL's
-   *  own classpath verbatim is safer than synthesising one from the
-   *  classloader plus `java.class.path` (which can introduce
-   *  duplicate-stdlib symbol-table corruption). The empty string
-   *  falls back to the synthesised path used by tests / direct
-   *  callers.
+   *  `replClasspath` should be the live platform classpath, including `:jar`
+   *  and `:dep` additions. An empty value requests classloader-based synthesis.
    */
   def evalIsolated(
       code: String,
@@ -53,56 +35,21 @@ class EvalAdapter:
       evalLogDir: String = "",
       standalone: Boolean = false
   ): Either[Eval.CompileFailure, Any] =
-    // The runtime nested-eval rewrite used to happen here: parse
-    // `code`, rewrite inner eval calls, pretty-print the result back
-    // to a string, and pass the string as `config.body`. The
-    // pretty-printer is lossy on a few constructs (interpolated
-    // strings, try/finally without catch, …), so the round-trip
-    // would silently fall back to the un-rewritten body and drop
-    // bindings on inner calls. The rewrite now runs as a tree
-    // transform inside [[SpliceEvalBody]] (after the body parses).
-    // We just hand the original `code` plus the captures (names of
-    // bindings already in the outer scope) and the outer
-    // enclosingSource through `EvalCompilerConfig`.
-    val initialScope: Array[(String, Boolean)] =
-      bindings.map(b => (b.name, b.isVar))
-
-    // `Eval.TopLevel` handles smuggled through synthetic bindings by
-    // `TopLevel.eval`: their compiled defs join this compile's
-    // classpath, an import inside the wrapper object brings them into
-    // scope, and the wrapper load chains their classloaders so every
-    // eval call through one handle shares a single class identity
-    // (and thus one copy of the defs' module state). The bindings
-    // stay in the array; the generated code never reads them, and
-    // their unique names discriminate handles in the cache key via
-    // the bindings fingerprint.
-    // Deduplicated by defs-object name: a nested call can carry the
-    // outer call's handle binding (propagated with the outer scope)
-    // plus its own appended copy, and a doubled wildcard import of
-    // the same object would make every defs name ambiguous.
+    // Nested eval calls are rewritten after parsing by SpliceEvalBody. Preserve
+    // the original source here and pass the outer scope through the config.
+    // Top-level handles arrive as synthetic bindings. Their output and loaders
+    // extend this compilation, preserving class identity and module state.
+    // Deduplication avoids ambiguous duplicate wildcard imports in nested evals.
     val topLevelHandles: Array[Eval.TopLevel] = topLevelHandlesIn(bindings)
 
-    // Cache key spans everything that affects the synthesised
-    // bytecode: the body, its lexical context, the session imports,
-    // the compiler settings, and the session classloader
-    // (identity-based, scoping entries to one REPL session).
+    // Include every input that can change generated bytecode. The session
+    // loader is compared by identity and prevents reuse across REPL sessions.
     //
-    // The bindings *array contents* are NOT in the key — only the
-    // names, captured via `bindingsKey`. The names appear in the body
-    // as identifier references already, but a defensive fingerprint
-    // helps catch the rare case where two call sites have the same
-    // body+enclosing but the rewriter chose different captures. The
-    // binding *values* differ across calls (that's the point of
-    // caching) and aren't part of compile output.
+    // Binding values deliberately do not participate: cached code receives the
+    // current array on each invocation. Names and binding kinds do affect code.
     //
-    // Skip caching when `enclosingSource` is empty: that's either a
-    // direct caller (no rewriter) or a runtime-rewritten nested eval,
-    // and we don't have a tight enough discriminator to cache safely.
-    // `expectedType` is part of the key: the marker erases the call's
-    // `[T]` argument from the enclosing-source slice, so two call
-    // sites can share (code, enclosingSource, ...) yet pin different
-    // expected types, and the expected type shapes the wrapper's
-    // `val __evalResult: <tpe>` ascription.
+    // Without enclosing source, there is no reliable call-site discriminator.
+    // The expected type stays in the key because it shapes the result ascription.
     val cacheKey: EvalAdapter.WrapperKey | Null =
       if enclosingSource.isEmpty then null
       else EvalAdapter.WrapperKey(
@@ -112,9 +59,7 @@ class EvalAdapter:
         bindingsKey = EvalAdapter.bindingsFingerprint(bindings),
         importsKey = replWrapperImports.mkString("\n"),
         settingsKey = compilerSettings.mkString(" "),
-        // Constant per REPL session (the loader already scopes the
-        // key), but in standalone mode it comes from a system
-        // property read per call, so a change must miss the cache.
+        // Standalone code can change this system-property value between calls.
         classpathKey = replClasspath,
         sessionLoader = classLoader,
         standalone = standalone
@@ -123,43 +68,18 @@ class EvalAdapter:
     if cacheKey != null then
       EvalAdapter.cache.get(cacheKey) match
         case null => () // miss; fall through
-        case Left(failure) => return Left(failure)
+        case Left(failure) => return Left(EvalAdapter.copyFailure(failure))
         case Right(compiled) => return invokeCached(compiled, bindings)
 
-    // Per-compile log files (when `-Xrepl-eval-log-dir` is set):
-    // capture the enclosing source, the body the user submitted,
-    // the synthesised wrapper module, and (on failure) the
-    // diagnostics. Useful for inspecting what the eval driver
-    // actually compiled. Written after the cache lookup: a cache
-    // hit recompiles nothing, so it logs nothing new either.
-    // Failure-tolerant: any IO error in the logger is reported via
-    // stderr and the eval call continues.
+    // A cache hit performs no compilation and therefore writes no new logs.
+    // Logging failures are reported without failing the eval call.
     val logTimestamp =
       if evalLogDir.isEmpty then ""
       else writeEvalLogStart(evalLogDir, enclosingSource, code)
 
-    // When invoked from a live REPL session, prefix the synthesised
-    // class names with `rs$line$` so `NameOps.isReplWrapperName` flags
-    // them as REPL wrappers — dotty's `PlainPrinter`, `CheckCaptures`,
-    // and `CheckUnused` then treat them as user-invisible (capture
-    // errors / unused warnings that originate inside the wrapper
-    // don't leak `__EvalExpression_<uuid>` into user-facing
-    // diagnostics). Detect REPL context by looking for any
-    // `rs$line$N` import in the live session's wrapper-imports list:
-    // those are emitted only by `ReplDriver.evalDynamic`.
-    //
-    // Direct callers of the bridge (unit tests, standalone use of
-    // `EvalAdapter`) don't supply `rs$line$` imports, so we fall
-    // back to the marker-free `__EvalExpression_<uuid>` name. There
-    // diagnostics still surface the wrapper name verbatim, which is
-    // the right choice for debugging the bridge itself.
-    //
-    // Putting `rs$line$` at the front is safe because the wrapper
-    // class is loaded only through the dedicated [[WrapperLoader]]
-    // (whose `findClass` looks in `outDir` first). The session
-    // [[AbstractFileClassLoader]]'s `rs$line$<...>`-routing case
-    // applies only when the *session* loader is asked for a name,
-    // and we never go through it for our own wrapper class.
+    // REPL-style names keep generated wrappers out of user-facing diagnostics.
+    // Only the dedicated WrapperLoader loads these classes, so the session
+    // loader's rs$line$ routing does not intercept them.
     val inReplSession = replWrapperImports.exists(_.contains(str.REPL_SESSION_LINE))
     val uuid = UUID.randomUUID().toString.replace('-', '_')
     val outputClassName =
@@ -169,41 +89,36 @@ class EvalAdapter:
       if inReplSession then s"${str.REPL_SESSION_LINE}${uuid}$$__EvalWrapper"
       else s"__EvalWrapper_${uuid}"
 
-    // Always import the `Eval.{eval, evalSafe}` bridge. It's needed for
-    // any nested `eval(...)` call inside the body or alongside the
-    // marker in the enclosing source, and harmless when the wrapper
-    // never references `eval`.
-    val evalImport = "import _root_.dotty.tools.eval.Eval.{eval, evalSafe}\n"
-    val importBlock =
-      if replWrapperImports.isEmpty then evalImport
-      else evalImport + replWrapperImports.mkString("", "\n", "\n")
+    // Keep built-in eval methods available to nested bodies. When no TopLevel
+    // handle is present, imports inside the wrapper can shadow these names as
+    // they would at the original prompt.
+    val evalImport =
+      "import _root_.dotty.tools.eval.Eval.{eval, evalSafe, topLevel, topLevelSafe}\n"
+    val contextImports =
+      if replWrapperImports.isEmpty then ""
+      else replWrapperImports.mkString("", "\n", "\n")
 
-    // No enclosing-source slice (a direct call to `Eval.eval`, or a
-    // call site compiled without the rewriter, e.g. without
-    // `-Xdynamic-eval`). Fall back to a minimal context so the body
-    // still has a marker to land in; it compiles without the call
-    // site's lexical scope, so only globally reachable names resolve.
+    // Direct calls without rewritten enclosing source get an isolated marker.
+    // Only globally accessible names resolve in this fallback context.
     val effectiveEnclosing =
       if enclosingSource.nonEmpty then enclosingSource
       else s"val __evalUnused__ : Any = { ${EvalContext.placeholder} }"
 
-    // Wrap the enclosing source in a synthesised object so the
-    // top-level statements (typically a `def` or `val`) become valid
-    // module-body members. The marker stays as an Ident for the
-    // tree-level splice phase.
-    //
-    // Handle imports sit at the top of the wrapper object: inner to
-    // the file-level session imports, so a handle def wins a name
-    // collision with a session definition (like a nearer import), and
-    // outer to the enclosing statement, so call-site locals shadow
-    // the handle's defs. (An import inside the body instead would
-    // turn the local collision into a "defined and imported
-    // subsequently" ambiguity rather than choosing the local.)
+    // Wrapping makes top-level statements valid members while retaining an
+    // identifier marker for tree splicing. Import placement enforces the
+    // intended precedence: call-site locals, then handle definitions, then the
+    // session context.
     val topLevelImports =
       topLevelHandles.map(h => s"import ${h.objectName}.{given, *}\n").mkString
+    // Without a handle, session imports can live in the wrapper and shadow the
+    // outer built-ins. With a handle, keep the session outside and the handle
+    // inside to preserve the three-level precedence above.
+    val (outerContextImports, innerContextImports) =
+      if topLevelHandles.isEmpty then ("", contextImports)
+      else (contextImports, "")
     val wrappedSource =
-      s"""${importBlock}object $wrapperName {
-         |$topLevelImports$effectiveEnclosing
+      s"""$evalImport${outerContextImports}object $wrapperName {
+         |$innerContextImports$topLevelImports$effectiveEnclosing
          |}
          |""".stripMargin
 
@@ -212,7 +127,7 @@ class EvalAdapter:
       outputClassName = outputClassName,
       body = code,
       expectedType = expectedType,
-      initialScope = initialScope,
+      initialBindingNames = bindings.map(_.name),
       outerEnclosingSource = enclosingSource,
       evalLogDir = evalLogDir,
       evalLogTimestamp = logTimestamp,
@@ -223,17 +138,14 @@ class EvalAdapter:
     val topLevelDirs = topLevelHandles.map(_.outputDir.asInstanceOf[AbstractFile]).toList
     bridge.compile(wrappedSource, outDir, classLoader, replOutDir, compilerSettings, replClasspath, config, topLevelDirs) match
       case Left(errors) =>
-        // Splice the body into the placeholder for display: a wrapper
-        // showing `def f(...) = __evalBodyPlaceholder__` is opaque
-        // about which body the user submitted.
+        // Show the submitted body rather than an unhelpful placeholder.
         val displaySource = EvalAdapter.spliceBodyForDisplay(wrappedSource, code)
         val failure = new Eval.CompileFailure(errors.toArray, displaySource)
         if logTimestamp.nonEmpty then writeEvalLogError(evalLogDir, logTimestamp, failure)
-        // Don't cache transient compiler-internal errors — a stray
-        // classpath blip or assertion failure inside dotc shouldn't
-        // become a permanent "this body doesn't compile".
+        // Internal failures may be transient and should not poison the cache.
         val isTransient = errors.exists(_.startsWith("Internal compiler error:"))
-        if cacheKey != null && !isTransient then EvalAdapter.cache.put(cacheKey, Left(failure))
+        if cacheKey != null && !isTransient then
+          EvalAdapter.cache.put(cacheKey, Left(EvalAdapter.copyFailure(failure)))
         Left(failure)
       case Right(()) =>
         val loadParent =
@@ -243,32 +155,16 @@ class EvalAdapter:
         if cacheKey != null then EvalAdapter.cache.put(cacheKey, Right(compiled))
         invokeCached(compiled, bindings)
 
-  /** Compile `Eval.topLevel` definitions once. The defs are wrapped
-   *  in a fresh top-level object and compiled through the standard
-   *  pipeline (no splice, no marker) against the session's classpath,
-   *  imports, and settings. The returned handle owns the output dir
-   *  and a dedicated classloader parented on the session loader;
-   *  every later eval call that carries the handle compiles against
-   *  the dir and loads through the loader, so the defs keep one JVM
-   *  identity for the handle's lifetime (shared module state, stable
-   *  class identity across calls).
+  /** Compiles [[Eval.topLevel]] definitions into a fresh object. The returned
+   *  handle owns its output and classloader, preserving class identity and
+   *  module state across later evaluations.
    *
-   *  `contextHeader` is the file-level import context of the
-   *  `topLevel` call site (standalone mode); in the REPL it is empty
-   *  and the session imports arrive via `replWrapperImports`.
+   *  `contextHeader` supplies standalone file-level imports. REPL imports arrive
+   *  through `replWrapperImports`.
    *
-   *  All imports — the context header and the defs' own leading
-   *  import lines — are placed at the FILE level of the synthesised
-   *  unit, not inside the object. Same resolution for the defs
-   *  themselves, but file-level imports are what the rewriter records
-   *  into an enclosing-source slice: an eval-like call *inside* the
-   *  defs is rewritten like any other (the defs compile runs the
-   *  rewrite phase unconditionally, see
-   *  `EvalCompilerBridge.compileDefs`), and its captured slice must
-   *  re-resolve those imports when a later eval splices against it.
-   *  The capture re-attaches this object's handle at runtime through
-   *  the registry (`Eval.withInheritedHandles`), which is what puts
-   *  the defs back on that later eval's classpath.
+   *  Imports are placed at file level so eval calls inside `defs` record them in
+   *  their enclosing-source slices. Such calls recover this handle through
+   *  [[Eval.withInheritedHandles]].
    */
   def compileTopLevel(
       defs: String,
@@ -282,15 +178,15 @@ class EvalAdapter:
   ): Either[Eval.CompileFailure, Eval.TopLevel] =
     val uuid = UUID.randomUUID().toString.replace('-', '_')
     val objectName = s"${EvalNames.TopLevelObjectPrefix}$uuid"
-    val evalImport = "import _root_.dotty.tools.eval.Eval.{eval, evalSafe}\n"
+    val evalImport =
+      "import _root_.dotty.tools.eval.Eval.{eval, evalSafe, topLevel, topLevelSafe}\n"
     val importBlock =
       if replWrapperImports.isEmpty then evalImport
       else evalImport + replWrapperImports.mkString("", "\n", "\n")
     val headerBlock = if contextHeader.isEmpty then "" else s"$contextHeader\n"
     val (defsImports, defsBody) = splitLeadingImports(defs)
     val importsBlock = if defsImports.isEmpty then "" else s"$defsImports\n"
-    // Plain concatenation, no stripMargin: user defs lines may begin
-    // with `|` (e.g. inside pattern matches) and must survive.
+    // Do not use stripMargin: a user line may legitimately begin with `|`.
     val source =
       importBlock + headerBlock + importsBlock +
         s"object $objectName {\n" + defsBody + "\n}\n"
@@ -310,50 +206,26 @@ class EvalAdapter:
         Eval.registerTopLevel(handle)
         Right(handle)
 
-  /** The leading blank/`import` lines of a defs string, split off so
-   *  they can sit at file level of the synthesised unit. */
+  /** Separates leading imports so they can remain at file level. */
   private def splitLeadingImports(defs: String): (String, String) =
     val lines = defs.linesWithSeparators.toList
     val (imports, rest) = lines.span(l => l.trim.isEmpty || l.trim.startsWith("import "))
     (imports.mkString.strip, rest.mkString)
 
-  /** The [[Eval.TopLevel]] handles smuggled through a bindings array
-   *  by `TopLevel.eval` (or re-attached by a capture), deduplicated
-   *  by defs object: a nested call can carry the outer call's handle
-   *  binding plus its own appended copy, and a doubled wildcard
-   *  import of the same object would make every defs name ambiguous. */
+  /** Extracts top-level handles from synthetic bindings and removes duplicates
+   *  that would otherwise create ambiguous wildcard imports. */
   private def topLevelHandlesIn(bindings: Array[Eval.Binding]): Array[Eval.TopLevel] =
     bindings.collect {
       case b if b.isSynthetic && b.name.startsWith(EvalNames.TopLevelBindingPrefix) =>
         b.value.asInstanceOf[Eval.TopLevel]
     }.distinctBy(_.objectName)
 
-  /** Load `__Expression` from the in-memory output dir and snapshot
-   *  its constructor + `evaluate` method. The loader is rooted at
-   *  `outDir` (so it can find the wrapper class) and delegates
-   *  everything else to the session classloader's *1-arg* `loadClass`,
-   *  which is what the REPL [[AbstractFileClassLoader]] override
-   *  implements its `dotty.tools.eval.*` → app-loader routing on. A
-   *  vanilla `AbstractFileClassLoader` (in either Enabled or Disabled
-   *  mode) ends up delegating via the JVM's protected
-   *  `loadClass(name, resolve)` machinery, which bypasses that
-   *  override and lets `Eval.Binding` get redefined by the
-   *  compiler-classpath URLClassLoader — producing
-   *  `LinkageError: loader constraint violation`. With `Enabled`
-   *  there's a second symptom: every user-defined type referenced by
-   *  the wrapper (e.g. an `IOCap` capability flowing through bindings)
-   *  gets re-read from the parent's bytes and re-defined locally with
-   *  bytecode instrumentation, minting a fresh `Class` identity. The
-   *  binding instance — created against the parent loader's `IOCap` —
-   *  then fails the wrapper's `asInstanceOf[IOCap]` check with
-   *  "cannot be cast to IOCap (different loaders)". This dedicated
-   *  loader sidesteps both: the wrapper class itself is defined here,
-   *  every other lookup goes through `parent.loadClass(name)`, and
-   *  the parent's existing special-cases handle the rest.
+  /** Loads the generated expression and records its constructor and evaluator.
+   *  [[EvalAdapter.WrapperLoader]] defines generated classes from `outDir`;
+   *  other classes go through the parent's public `loadClass` so the REPL's
+   *  identity routing remains effective.
    *
-   *  The returned [[EvalAdapter.CompiledExpression]] is cacheable:
-   *  it pins the classloader (so the class can't be unloaded) and
-   *  the reflected handles are reused across invocations.
+   *  The returned object retains the classloader and reusable reflection handles.
    */
   private def loadCompiled(
       outDir: AbstractFile,
@@ -364,49 +236,37 @@ class EvalAdapter:
     val cls = cl.loadClass(outputClassName)
     val ctor = cls.getDeclaredConstructor(classOf[Object], classOf[Array[Eval.Binding]])
     val evaluate = cls.getMethod("evaluate")
-    new EvalAdapter.CompiledExpression(cls, ctor, evaluate, cl)
+    new EvalAdapter.CompiledExpression(ctor, evaluate, cl)
 
-  /** Instantiate the cached expression class with the call's bindings
-   *  and invoke `evaluate()`. Runtime exceptions — from `evaluate()`
-   *  or from the wrapper's constructor — surface as their cause
-   *  (reflection wraps them in `InvocationTargetException`).
+  /** Instantiates and invokes a cached expression. Reflection wrappers are
+   *  removed so constructor and body exceptions propagate as their causes.
    */
   private def invokeCached(
       compiled: EvalAdapter.CompiledExpression,
       bindings: Array[Eval.Binding]
   ): Either[Eval.CompileFailure, Any] =
     val thisObject = extractThisObject(bindings)
-    // While the wrapper body runs, its handles are "active" on this
-    // thread: a capture the body takes (a nested eval-like call
-    // building a bindings array) re-attaches them through
-    // `Eval.withInheritedHandles`, so a bindings array that outlives
-    // this call keeps the defs linked. Restored in a finally — the
-    // stack nests with recursive evals.
+    // Active handles are inherited by nested captures and restored for recursive
+    // evals. The wrapper loader is also the context loader while user code runs.
     val handles = topLevelHandlesIn(bindings)
     val savedHandles = Eval.currentActiveHandles
+    val thread = Thread.currentThread()
+    val savedContextClassLoader = thread.getContextClassLoader
     if handles.nonEmpty then Eval.setActiveHandles(handles.toList ::: savedHandles)
     try
-      val instance = compiled.ctor.newInstance(thisObject, bindings).asInstanceOf[AnyRef]
-      Right(compiled.evaluate.invoke(instance))
-    catch case e: java.lang.reflect.InvocationTargetException =>
-      val cause = e.getCause
-      if cause != null then throw cause else throw e
+      thread.setContextClassLoader(compiled.classLoader)
+      try
+        val instance = compiled.ctor.newInstance(thisObject, bindings).asInstanceOf[AnyRef]
+        Right(compiled.evaluate.invoke(instance))
+      catch case e: java.lang.reflect.InvocationTargetException =>
+        val cause = e.getCause
+        if cause != null then throw cause else throw e
+      finally thread.setContextClassLoader(savedContextClassLoader)
     finally
       if handles.nonEmpty then Eval.setActiveHandles(savedHandles)
 
-  /** Write the per-invocation log files for an eval call:
-   *
-   *    - `eval_<timestamp>_enclosingSource.scala`: the source of the
-   *      enclosing top-level statement at the call site, with the
-   *      eval call's span replaced by a placeholder. Useful for
-   *      replaying the call's lexical context.
-   *    - `eval_<timestamp>_code.scala`: the body string the user
-   *      submitted to `eval(...)`.
-   *
-   *  Returns the timestamp used in the filenames so the wrapper /
-   *  error log files (written later) can share it. Returns the
-   *  empty string when logging fails for any reason — we don't want
-   *  logging IO errors to fail the eval call itself.
+  /** Writes enclosing-source and submitted-code logs. Returns their shared file
+   *  suffix, or an empty string if logging fails.
    */
   private def writeEvalLogStart(evalLogDir: String, enclosingSource: String, code: String): String =
     try
@@ -430,10 +290,7 @@ class EvalAdapter:
       System.err.println(s"[eval-log] WARNING: failed to write log files under '$evalLogDir': ${e.getMessage}")
       ""
 
-  /** Write the diagnostic + offending source that the eval driver's
-   *  compile rejected. Only fires on compile failure — the success
-   *  path doesn't produce an error log.
-   */
+  /** Writes diagnostics and generated source after a compilation failure. */
   private def writeEvalLogError(evalLogDir: String, timestamp: String, failure: Eval.CompileFailure): Unit =
     try
       val sb = new StringBuilder
@@ -451,11 +308,7 @@ class EvalAdapter:
       )
     catch case scala.util.control.NonFatal(_) => ()
 
-  /** Pull the `__this__` binding out of the bindings array. The
-   *  [[EvalRewriteTyped]] rewriter inserts it whenever the eval call
-   *  sits inside a class method, so its presence indicates the
-   *  captured outer instance.
-   */
+  /** Returns the captured enclosing instance, if present. */
   private def extractThisObject(bindings: Array[Eval.Binding]): AnyRef | Null =
     val it = bindings.iterator
     while it.hasNext do
@@ -467,31 +320,18 @@ end EvalAdapter
 
 object EvalAdapter:
 
-  /** Class loader for one compiled eval wrapper. Holds the wrapper
-   *  class file in `outDir` and routes everything else to the parent's
-   *  *1-arg* `loadClass`. The 1-arg form is what the REPL
-   *  [[AbstractFileClassLoader]] override consults — the one that
-   *  routes `dotty.tools.eval.*` to the dotty-loaded copy and
-   *  delegates user/library classes to its own already-loaded
-   *  instances. Going through `parent.loadClass(name, false)` (the
-   *  JVM's standard delegation primitive) bypasses that override and
-   *  ends up redefining classes via the compiler-classpath
-   *  URLClassLoader, breaking cross-loader identity.
-   *
-   *  The wrapper class is defined locally without bytecode
-   *  instrumentation. Eval bodies aren't independently interruptable —
-   *  a Ctrl-C reaches them indirectly via the surrounding REPL
-   *  command, which still gets instrumented through the session
-   *  loader.
+  /** Copies mutable diagnostics so callers cannot alter a cached failure.
    */
-  /** Extends `URLClassLoader` (with no URLs of its own; `findClass`
-   *  serves the wrapper class from the in-memory `outDir`) rather
-   *  than plain `ClassLoader` so `ClasspathFromClassloader` can walk
-   *  through it into the parent chain. A nested eval's caller frame
-   *  is a `__EvalExpression` class loaded by this loader; the
-   *  standalone adapter synthesises the inner compile's classpath
-   *  from that loader, and an unrecognised loader type would drop
-   *  the program's own classes from the classpath.
+  private def copyFailure(failure: Eval.CompileFailure): Eval.CompileFailure =
+    new Eval.CompileFailure(failure.errors.clone(), failure.source)
+
+  /** Classloader for one generated wrapper. It defines classes from `outDir`
+   *  and sends all other requests through the parent's public `loadClass`,
+   *  preserving the REPL's class-identity routing.
+   *
+   *  It extends `URLClassLoader` without URLs so classpath discovery can follow
+   *  the parent chain during nested standalone evaluation. Generated wrappers
+   *  are not instrumented independently for interruption.
    */
   private[eval] class WrapperLoader(outDir: AbstractFile, parent: ClassLoader)
       extends java.net.URLClassLoader(Array.empty[java.net.URL], parent):
@@ -509,15 +349,8 @@ object EvalAdapter:
       defineClass(name, bytes, 0, bytes.length)
 
     override def loadClass(name: String): Class[?] =
-      // Cached `CompiledExpression`s share this loader across calls
-      // (and threads). Lock so two threads resolving the same
-      // wrapper-referenced class can't race into a duplicate
-      // `defineClass` (`LinkageError: duplicate class definition`).
-      // Since this loader isn't registered parallel-capable (Scala
-      // can't run `registerAsParallelCapable()` in a static
-      // initializer), `getClassLoadingLock` degenerates to one lock
-      // for the whole loader; that coarseness is fine here: the
-      // loader serves a single wrapper class plus parent delegation.
+      // Cached expressions can share this loader across threads. Serializing
+      // resolution prevents duplicate definitions.
       getClassLoadingLock(name).synchronized {
         val loaded = findLoadedClass(name)
         if loaded != null then loaded
@@ -526,16 +359,9 @@ object EvalAdapter:
           catch case _: ClassNotFoundException => parent.loadClass(name)
       }
 
-  /** Parent chain for wrapper loads that link `Eval.topLevel`
-   *  handles. Classes belonging to a handle's defs object (the object
-   *  class and everything nested under it, all named
-   *  `<objectName>` / `<objectName>$…`) resolve through that handle's
-   *  own long-lived loader, so every eval call through the handle
-   *  shares one `Class` identity, and thus one copy of the defs'
-   *  module state. Everything else delegates to the session loader.
-   *  Extends `URLClassLoader` with no URLs for the same
-   *  `ClasspathFromClassloader`-walkability reason as
-   *  [[WrapperLoader]].
+  /** Loader chain for [[Eval.TopLevel]] handles. A definition and its nested
+   *  classes resolve through the handle's persistent loader; other names go to
+   *  the session loader. The URLClassLoader base keeps the chain discoverable.
    */
   private[eval] class TopLevelChainLoader(
       handles: Array[Eval.TopLevel],
@@ -548,36 +374,22 @@ object EvalAdapter:
         if name == h.objectName || name.startsWith(h.objectName + "$") then
           return h.loader.loadClass(name)
         i += 1
-      // Delegate through the parent's *1-arg* `loadClass`, exactly as
-      // [[WrapperLoader]] does: `super.loadClass` would take the JVM's
-      // protected 2-arg delegation path, bypassing the session
-      // [[AbstractFileClassLoader]]'s routing override and redefining
-      // `dotty.tools.eval.*` via the compiler-classpath URLClassLoader
-      // (`LinkageError: loader constraint violation` on `Eval$Binding`).
+      // Use the public overload so the session loader's routing remains active.
       parent.loadClass(name)
 
-  /** Replace the first `__evalBodyPlaceholder__` in `wrappedSource`
-   *  with `body` so compile-error messages show the actual code that
-   *  triggered the failure rather than the placeholder. We replace
-   *  only the first occurrence: the placeholder marks the splice
-   *  site, while later occurrences (rare) might be inside a string
-   *  literal in the body itself.
+  /** Replaces a unique marker for diagnostic display. Multiple occurrences are
+   *  left unchanged because one may be user text rather than the splice site.
    */
   private[eval] def spliceBodyForDisplay(wrappedSource: String, body: String): String =
     val marker = EvalContext.placeholder
     val idx = wrappedSource.indexOf(marker)
-    if idx < 0 then wrappedSource
+    if idx < 0 || wrappedSource.indexOf(marker, idx + marker.length) >= 0 then wrappedSource
     else wrappedSource.substring(0, idx) + body + wrappedSource.substring(idx + marker.length)
 
-  /** Cache key for a compiled `__Expression` class. Two calls with
-   *  the same key produce identical wrapper bytecode (modulo the
-   *  UUID-named output class), so the second reuses the first's
-   *  loaded class + reflected handles.
+  /** Cache key for a generated expression class.
    *
-   *  `sessionLoader` scopes entries to the running REPL session by
-   *  reference identity: two sessions can share imports + settings
-   *  yet have different `rs$line$N` definitions, so we treat loaders
-   *  as opaque to prevent cross-session bleed.
+   *  `sessionLoader` uses reference identity to prevent reuse across sessions
+   *  with different `rs$line$N` definitions.
    */
   private[eval] case class WrapperKey(
       code: String,
@@ -591,28 +403,18 @@ object EvalAdapter:
       standalone: Boolean
   )
 
-  /** Cached output of a successful compile. Holds strong refs to the
-   *  classloader + Class so the JVM can't unload them while the entry
-   *  is live. The reflected ctor + `evaluate` method are snapshotted
-   *  once at compile time and reused.
-   */
+  /** Reusable reflection handles and loader from a successful compilation. */
   private[eval] final class CompiledExpression(
-      val cls: Class[?],
       val ctor: java.lang.reflect.Constructor[?],
       val evaluate: java.lang.reflect.Method,
       val classLoader: ClassLoader
   )
 
-  /** Maximum number of distinct call sites we keep wrappers for. Each
-   *  entry pins one classloader + one wrapper class, so this also
-   *  bounds metaspace growth from caching.
-   */
+  /** Bounds the classloaders and wrapper classes retained by the cache. */
   private val cacheCapacity = 128
 
-  /** Access-order LRU. `LinkedHashMap` with `accessOrder=true` reorders
-   *  on every `get`, so all access must be synchronised; the
-   *  `synchronizedMap` wrapper handles per-call locking, which is
-   *  enough since we only do single `get` and `put` operations.
+  /** Access-order LRU. Reads and writes are synchronized because `get` mutates
+   *  the order, and callers perform only individual map operations.
    */
   private[eval] val cache: java.util.Map[WrapperKey, Either[Eval.CompileFailure, CompiledExpression]] =
     java.util.Collections.synchronizedMap(
@@ -623,20 +425,11 @@ object EvalAdapter:
       }
     )
 
-  /** Discard all cached wrappers. Useful for `:reset` and tests.
-   *  Cached classloaders become unreachable and eligible for GC.
-   */
+  /** Discards cached wrappers, allowing their classloaders to be collected. */
   def clearCache(): Unit = cache.clear()
 
-  /** Stable fingerprint of the binding *names* and *kinds* for cache
-   *  keying. Binding values change across calls (that's the point of
-   *  caching) and aren't part of compile output; names and kinds
-   *  (val / var / given / synthetic) are: they shape the wrapper's
-   *  parameter clauses and the linked-class lowering. Synthetic
-   *  binding *values* (classOf, factory closures, module instances,
-   *  the return key) never affect the wrapper bytecode either: the
-   *  lowered code only ever does `getRaw(name)`, so the key stays
-   *  value-free.
+  /** Stable cache fingerprint of binding names and kinds. Values are supplied
+   *  per invocation and do not affect generated bytecode.
    */
   private[eval] def bindingsFingerprint(bindings: Array[Eval.Binding]): String =
     val sb = new StringBuilder
